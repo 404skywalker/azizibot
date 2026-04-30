@@ -392,11 +392,18 @@ async function fireNHOD(ticker,price){
   // All tickers (live + watchlist) must pass the current session tier gates
   const tier=getTier(etMin);
   if(!tier) return;
-  if(gapper.chgPct<tier.minChg){
-    console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
-  }
   if(tier.minVol>0&&gapper.volume<tier.minVol){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(gapper.volume)}<${fmtN(tier.minVol)}`);return;
+  }
+  // In AH, gapper.chgPct is the all-day gain — not the AH move.
+  // A stock up 25% during market hours but flat in AH should NOT fire.
+  // So in AH, skip watchlist-only tickers entirely (they qualified during the day).
+  // Only fire AH alerts for stocks currently in the live topGappers scan.
+  if(tier.name==='AH'&&isWatchOnly){
+    console.log(`[NHOD] ${ticker} skip: AH watchlist-only — ran during day, not a new AH move`);return;
+  }
+  if(!isWatchOnly&&gapper.chgPct<tier.minChg){
+    console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
   }
 
   if(s.lastAlertPrice>0&&price<s.lastAlertPrice*1.075){
