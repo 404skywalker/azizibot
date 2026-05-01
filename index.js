@@ -393,15 +393,17 @@ async function fireNHOD(ticker,price){
   if(tier.minVol>0&&gapper.volume<tier.minVol){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(gapper.volume)}<${fmtN(tier.minVol)}`);return;
   }
-  // In AH: measure move from 4PM close price, not all-day chgPct
-  // Require ≥5% above 4PM close to confirm a real AH move
+  // In AH: measure move from 4PM close price, not all-day chgPct.
+  // Require ≥5% above 4PM close to confirm a real AH move.
+  // If close price not captured yet, block entirely — too early to judge.
   if(tier.name==='AH'){
     const cp=closePrice.get(ticker)||0;
-    if(cp>0){
-      const ahMove=((price-cp)/cp)*100;
-      if(ahMove<5){
-        console.log(`[NHOD] ${ticker} skip: AH move ${ahMove.toFixed(1)}% from close $${cp.toFixed(4)} < 5%`);return;
-      }
+    if(cp===0){
+      console.log(`[NHOD] ${ticker} skip: AH close price not captured yet`);return;
+    }
+    const ahMove=((price-cp)/cp)*100;
+    if(ahMove<5){
+      console.log(`[NHOD] ${ticker} skip: AH move ${ahMove.toFixed(1)}% from close $${cp.toFixed(4)} < 5%`);return;
     }
   } else if(gapper.chgPct<tier.minChg){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
@@ -782,6 +784,7 @@ async function main(){
     const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys()])].filter(t=>!subscribedTickers.has(t));
     if(newT.length) subscribeNewTickers(newT);
     await pollNews();
+    await syncHighsAtTransition(); // capture 4PM close prices within 20s
   },20*1000);
 
   setInterval(async()=>{
