@@ -29,7 +29,7 @@ function getTier(etMin) {
   if(etMin>=420&&etMin<570)  return {name:'LATE-PRE',  minChg:20, minVol:0};
   if(etMin>=570&&etMin<960)  return {name:'MKT',       minChg:10, minVol:5_000_000};
   if(etMin>=960&&etMin<1200) return {name:"AH", minChg:10, minVol:500000};
-  return null;
+  return null; // no alerts after 8PM
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -274,6 +274,7 @@ let topGappers=[];
 const dayWatchlist=new Map();
 const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set()};
 const wsDebounce=new Map();
+const closePrice=new Map(); // ticker → price at 4PM close
 
 // ─── Gapper refresh ───────────────────────────────────────────────────────────
 async function refreshGappers(){
@@ -380,10 +381,7 @@ async function fireNHOD(ticker,price){
 
   const s=state.tickers.get(ticker);
   if(!s)                  {console.log(`[NHOD] ${ticker} skip: no state`);return;}
-  // In AH, require 2% above stored high to avoid firing on tiny ticks
-  const {sess:_sess}=getET();
-  const minAbove = _sess==='AH' ? s.high*1.02 : s.high+0.001;
-  if(price<=minAbove) {console.log(`[NHOD] ${ticker} skip: $${price.toFixed(4)} not enough above high $${s.high.toFixed(4)}`);return;}
+  if(price<=s.high+0.001) {console.log(`[NHOD] ${ticker} skip: $${price.toFixed(4)} not above high $${s.high.toFixed(4)}`);return;}
 
   const {etMin,timeStr}=getET();
   if(price>10)   {console.log(`[NHOD] ${ticker} skip: >$10`);return;}
@@ -395,14 +393,17 @@ async function fireNHOD(ticker,price){
   if(tier.minVol>0&&gapper.volume<tier.minVol){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(gapper.volume)}<${fmtN(tier.minVol)}`);return;
   }
-  // In AH, gapper.chgPct is the all-day gain — not the AH move.
-  // A stock up 25% during market hours but flat in AH should NOT fire.
-  // So in AH, skip watchlist-only tickers entirely (they qualified during the day).
-  // Only fire AH alerts for stocks currently in the live topGappers scan.
-  if(tier.name==='AH'&&isWatchOnly){
-    console.log(`[NHOD] ${ticker} skip: AH watchlist-only — ran during day, not a new AH move`);return;
-  }
-  if(!isWatchOnly&&gapper.chgPct<tier.minChg){
+  // In AH: measure move from 4PM close price, not all-day chgPct
+  // Require ≥5% above 4PM close to confirm a real AH move
+  if(tier.name==='AH'){
+    const cp=closePrice.get(ticker)||0;
+    if(cp>0){
+      const ahMove=((price-cp)/cp)*100;
+      if(ahMove<5){
+        console.log(`[NHOD] ${ticker} skip: AH move ${ahMove.toFixed(1)}% from close $${cp.toFixed(4)} < 5%`);return;
+      }
+    }
+  } else if(gapper.chgPct<tier.minChg){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
   }
 
@@ -563,9 +564,9 @@ async function checkFilings(){
 }
 
 // ─── Session transition sync ──────────────────────────────────────────────────
-// At 4PM (MKT→AH), reset s.high for every tracked ticker to its current live
-// price. This prevents all watchlist tickers firing simultaneously when AH
-// starts just because their stored high is below the current price.
+// At 4PM (MKT→AH), capture the closing price for every tracked ticker.
+// AH alerts only fire if price is ≥5% above the 4PM close price.
+// This ensures only genuine AH movers fire, not stocks that ran during the day.
 let lastTransitionSync = 0;
 async function syncHighsAtTransition() {
   const {etMin} = getET();
@@ -575,7 +576,7 @@ async function syncHighsAtTransition() {
 
   const tickers = [...new Set([...topGappers.map(g=>g.ticker), ...dayWatchlist.keys()])];
   if(!tickers.length) return;
-  console.log(`[Transition] MKT→AH: resetting highs for ${tickers.length} tickers...`);
+  console.log(`[Transition] MKT→AH: capturing close prices for ${tickers.length} tickers...`);
 
   for(const ticker of tickers) {
     try {
@@ -583,18 +584,18 @@ async function syncHighsAtTransition() {
       const td   = snap&&snap.ticker;
       const cur  = (td&&td.lastTrade&&td.lastTrade.p)||(td&&td.day&&td.day.c)||0;
       if(cur > 0) {
+        closePrice.set(ticker, cur);
         const s = state.tickers.get(ticker);
         if(s) {
           state.tickers.set(ticker, {...s, high:cur, nhod:0, lastAlertPrice:0, lastAlertTime:0});
-          console.log(`[Transition] ${ticker} reset high→$${cur.toFixed(4)}`);
         }
+        console.log(`[Transition] ${ticker} close=$${cur.toFixed(4)}`);
       }
     } catch(e) {}
     await sleep(100);
   }
-  // Also reset daily counts so AH is a fresh slate
   state.dailyCounts.clear();
-  console.log(`[Transition] Done — AH slate is clean`);
+  console.log(`[Transition] Done — AH baseline captured`);
 }
 async function checkMorningSnapshot(){
   if(!isMarketDay()) return;
@@ -785,7 +786,7 @@ async function main(){
 
   setInterval(async()=>{
     const {hh,m}=getET();
-    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();console.log('[Daily] Reset');}
+    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();console.log('[Daily] Reset');}
     await checkMorningSnapshot();
     await checkFilings();
     await syncHighsAtTransition();
