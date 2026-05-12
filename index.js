@@ -292,6 +292,9 @@ const dayWatchlist=new Map();
 const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set()};
 const wsDebounce=new Map();
 const closePrice=new Map(); // ticker → price at 4PM close
+// recentRunners: tickers that qualified as gappers in the last 5 days
+// Used to expand news coverage beyond just today's movers
+const recentRunners=new Map(); // ticker → timestamp when last seen as gapper
 
 // ─── Gapper refresh ───────────────────────────────────────────────────────────
 async function refreshGappers(){
@@ -368,6 +371,7 @@ async function refreshGappers(){
         if(!dayWatchlist.has(g.ticker)){
           dayWatchlist.set(g.ticker,{ticker:g.ticker,chgPct:g.chgPct,volume:g.volume,
             rvol:g.rvol,price:g.price,high:g.high,lockedAt:name});
+          recentRunners.set(g.ticker, Date.now());
           console.log(`[Watch] +${g.ticker} +${g.chgPct.toFixed(1)}% vol:${fmtN(g.volume)} [${name}]`);
         }
       }
@@ -508,7 +512,12 @@ async function handleNewsItem(title,tickers,url,published_utc){
   const tier=getTier(etMin);
   const prVolMin = tier ? (tier.name==='MKT' ? 50_000 : 0) : 0;
 
-  for(const ticker of tickers.slice(0,3)){
+  // Filter to only tickers we care about: current gappers, watchlist, or recent runners
+  const tracked=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys()]);
+  const filtered=tickers.filter(t=>tracked.has(t)||tickers.length===1).slice(0,3);
+  if(!filtered.length) return;
+
+  for(const ticker of filtered){
     if(isBadTicker(ticker)||isEtf(ticker)) continue;
     const prId=`${isDrop?'drop':'spike'}_${id}_${ticker}`;
     if(state.sentPR.has(prId)) continue;
@@ -619,7 +628,7 @@ async function checkFilings(){
   if(!isActive()) return;
   if(Date.now()-lastFilingCheck<2*60*1000) return;
   lastFilingCheck=Date.now();
-  const known=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys()]);
+  const known=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys()]);
   if(!known.size) return;
   const {timeStr}=getET();
   for(const ticker of known){
@@ -638,6 +647,70 @@ async function checkFilings(){
       }
     }catch(e){}
     await sleep(200);
+  }
+}
+
+
+// ─── Economic Calendar ────────────────────────────────────────────────────────
+// Posts high-impact events at 4:45AM ET daily, and reminders 5min before each.
+const sentEcoEvents = new Set();
+
+async function checkEconomicCalendar(){
+  if(!FMP_KEY||!isMarketDay()) return;
+  const {hh,m,etMin}=getET();
+
+  // 4:45AM — post daily summary of today's high-impact events
+  if(hh===4&&m===45){
+    const key=`eco_summary_${new Date().toISOString().slice(0,10)}`;
+    if(!sentEcoEvents.has(key)){
+      sentEcoEvents.add(key);
+      try{
+        const today=new Date().toISOString().slice(0,10);
+        const r=await fmpGet(`/api/v3/economic_calendar?from=${today}&to=${today}`);
+        const events=(r||[]).filter(e=>e.impact==='High'||e.impact==='Medium');
+        if(events.length){
+          const rows=events.map(e=>{
+            const impact=e.impact==='High'?'🔴':'🟡';
+            const time=e.date?new Date(e.date).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}):'--';
+            const prev=e.previous!==null&&e.previous!==undefined?` | Prev: ${e.previous}${e.unit||''}` :'';
+            const est=e.estimate!==null&&e.estimate!==undefined?` | Est: ${e.estimate}${e.unit||''}` :'';
+            return`${impact} **${time} ET** — ${e.event}${est}${prev}`;
+          }).join('\n');
+          await post({embeds:[{
+            title:'📅 Today's Economic Events',
+            description:rows,
+            color:0xf0a500,
+            footer:{text:`AziziBot · High & Medium Impact`},
+            timestamp:new Date().toISOString()
+          }]});
+          console.log(`[EcoCalendar] Daily summary posted (${events.length} events)`);
+        }
+      }catch(e){console.error('[EcoCalendar] summary error:',e.message);}
+    }
+  }
+
+  // Check for upcoming events — post reminder 5min before
+  if(etMin>=240&&etMin<960){
+    try{
+      const today=new Date().toISOString().slice(0,10);
+      const r=await fmpGet(`/api/v3/economic_calendar?from=${today}&to=${today}`);
+      const events=(r||[]).filter(e=>e.impact==='High');
+      for(const e of events){
+        if(!e.date) continue;
+        const eventTime=new Date(e.date).getTime();
+        const minsUntil=(eventTime-Date.now())/60000;
+        if(minsUntil>4&&minsUntil<=5){
+          const key=`eco_reminder_${e.event}_${e.date}`;
+          if(!sentEcoEvents.has(key)){
+            sentEcoEvents.add(key);
+            const est=e.estimate!==null&&e.estimate!==undefined?`\n> Est: **${e.estimate}${e.unit||''}**`:'';
+            const prev=e.previous!==null&&e.previous!==undefined?` | Prev: ${e.previous}${e.unit||''}`:'';
+            await post({content:`⚠️ **Economic Event in ~5 min**\n> 🔴 **${e.event}**${est}${prev}`});
+            console.log(`[EcoCalendar] Reminder: ${e.event}`);
+          }
+        }
+      }
+    }catch(e){}
   }
 }
 
@@ -911,10 +984,15 @@ async function main(){
 
   setInterval(async()=>{
     const {hh,m}=getET();
-    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();console.log('[Daily] Reset');}
+    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();
+      // Prune recentRunners older than 5 days
+      const fiveDaysAgo=Date.now()-5*24*60*60*1000;
+      for(const [t,ts] of recentRunners) if(ts<fiveDaysAgo) recentRunners.delete(t);
+      console.log(`[Daily] recentRunners: ${recentRunners.size} tickers kept`);console.log('[Daily] Reset');}
     await checkMorningSnapshot();
     await checkFilings();
     await syncHighsAtTransition();
+    await checkEconomicCalendar();
   },60*1000);
 
   console.log('🤖 AziziBot v8 running.');
