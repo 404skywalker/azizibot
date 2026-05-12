@@ -506,9 +506,6 @@ async function handleNewsItem(title,tickers,url,published_utc){
 
   const {timeStr,etMin}=getET();
   const tier=getTier(etMin);
-  // PR alerts use a much lower vol floor than NHOD alerts.
-  // News can break before volume builds up.
-  // PRE/AH: 0, MKT: 50K (just enough to confirm it's a real stock)
   const prVolMin = tier ? (tier.name==='MKT' ? 50_000 : 0) : 0;
 
   for(const ticker of tickers.slice(0,3)){
@@ -516,22 +513,56 @@ async function handleNewsItem(title,tickers,url,published_utc){
     const prId=`${isDrop?'drop':'spike'}_${id}_${ticker}`;
     if(state.sentPR.has(prId)) continue;
     state.sentPR.add(prId);
+
     const snap=await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
     const td=snap&&snap.ticker;
     const vol=(td&&td.day&&td.day.v)||0;
     const price=(td&&td.lastTrade&&td.lastTrade.p)||(td&&td.day&&td.day.c)||0;
     if(!td||vol<prVolMin||price<0.10||price>10) continue;
-    const [det,fv]=await Promise.all([getTickerDetails(ticker),getFinvizStats(ticker)]);
-    const mc=det.market_cap||0;
-    const mcStr=mc>0?` | MC: ${fmtN(mc)}`:'';
-    const ioStr=fv.io!=='--'?` | IO: ${fv.io}`:'';
-    const siStr=fv.si!=='--'?` | SI: ${fv.si}`:'';
-    const ageMs=Date.now()-new Date(published_utc||Date.now()).getTime();
-    const ageStr=ageMs<60000?`${Math.round(ageMs/1000)}s ago`:ageMs<3600000?`${Math.round(ageMs/60000)} min ago`:`${Math.round(ageMs/3600000)}h ago`;
-    const tLink=url?`[${ticker}](<${url}>)`:`**${ticker}**`;
-    const line1=`\`${timeStr}\` ${isDrop?'↓':'↑'} ${tLink} \`${priceFlag(price)}\` ~ ${flag(ticker)}${mcStr}${ioStr}${siStr}`;
-    const line2=`• ${ageStr} [${isDrop?'PR ↓':'PR'}] ${title.slice(0,200)}${url?` — [Link](<${url}>)`:''}`;
-    await post({content:`${line1}\n${line2}`});
+
+    const [det,fv,prof]=await Promise.all([getTickerDetails(ticker),getFinvizStats(ticker),getFmpProfile(ticker)]);
+    const mc      = det.market_cap||0;
+    const prev    = (td.prevDay&&td.prevDay.c)||0;
+    const chgPct  = price&&prev?((price-prev)/prev)*100:0;
+    const pv2     = (td.prevDay&&td.prevDay.v)||0;
+    const rvol    = pv2>0?(vol*390)/(Math.max(etMin-240,1)*pv2):0;
+    const sector  = prof.sector||'';
+    const industry= prof.industry||'';
+
+    // Age of article
+    const ageMs  = Date.now()-new Date(published_utc||Date.now()).getTime();
+    const ageStr = ageMs<60000?`${Math.round(ageMs/1000)}s`:ageMs<3600000?`${Math.round(ageMs/60000)}m`:`${Math.round(ageMs/3600000)}h`;
+
+    // Emoji indicator
+    const icon = isDrop ? '🔴' : '🟢';
+    const arrow = isDrop ? '↓' : '↑';
+    const typeLabel = isDrop ? 'PR Drop 🩸' : 'PR Spike 🚀';
+
+    // Header line — ticker, price, change, flag, key stats
+    const tLink  = url?`[**${ticker}**](<${url}>)`:`**${ticker}**`;
+    const chgStr = chgPct!==0?` \`${chgPct>=0?'+':''}${chgPct.toFixed(1)}%\``:'';
+    const mcStr  = mc>0?` | MC: **${fmtN(mc)}**`:'';
+    const volStr = vol>0?` | Vol: **${fmtN(vol)}**`:'';
+    const rvolStr= rvol>0?` | RVol: **${fmtRVol(rvol)}**`:'';
+    const floatStr= fv.float!=='--'?` | Float: ${fv.float}`:'';
+    const siStr  = fv.si!=='--'?` | SI: ${fv.si}`:'';
+    const ioStr  = fv.io!=='--'?` | IO: ${fv.io}`:'';
+    const sectStr= sector?`\n> 🏢 ${sector}${industry?` · ${industry}`:''}` :'';
+
+    const header = `${icon} ${arrow} ${tLink} \`${priceFlag(price)}\`${chgStr} ~ ${flag(ticker)}${mcStr}${volStr}${rvolStr}`;
+    const stats  = `${floatStr}${siStr}${ioStr}${sectStr}`;
+    const newsLine = `> 📰 **[${typeLabel}]** · *${ageStr} ago*\n> ${title.slice(0,220)}${url?` — [**Link**](<${url}>)`:''}`;
+    const statsLine = stats?`\n> ${floatStr.replace(/^ \| /,'')}${siStr}${ioStr}`:'';
+
+    const embed = {
+      embeds:[{
+        color: isDrop ? 0xe03e3e : 0x26a641,
+        description: `${header}\n${newsLine}${sectStr}${stats&&!sectStr?'\n> '+[fv.float!=='--'?'Float: '+fv.float:'',fv.si!=='--'?'SI: '+fv.si:'',fv.io!=='--'?'IO: '+fv.io:''].filter(Boolean).join(' | '):''}`,
+        footer:{text:`AziziBot · ${timeStr} ET · ${tier?.name||''}` },
+        timestamp: new Date().toISOString(),
+      }]
+    };
+    await post(embed);
     console.log(`[${timeStr}] ${isDrop?'PR-DROP':'PR-SPIKE'}: ${ticker}`);
   }
   if(state.sentNews.size>500){const a=[...state.sentNews];state.sentNews.clear();a.slice(-200).forEach(x=>state.sentNews.add(x));}
