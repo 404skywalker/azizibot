@@ -6,6 +6,7 @@ const WebSocket = require('ws');
 const POLY_KEY      = process.env.POLY_KEY      || '';
 const BZ_KEY        = process.env.BZ_KEY        || '';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
+const FMP_KEY       = process.env.FMP_KEY        || '';
 const APP_ID        = '1493671812247322624';
 
 const TOP_GAPPERS_WH = 'https://discord.com/api/webhooks/1493250562689597623/57UTSPu2KfLmYNBRVPvPQIa4cSfCQA8wVcqB5d0J8cWYaJf5hlsm1EuRkQ3lolChTNh3';
@@ -138,6 +139,11 @@ function polyGet(path){
   const sep=path.includes('?')?'&':'?';
   return jsonGet(`https://api.polygon.io${path}${sep}apiKey=${POLY_KEY}`);
 }
+function fmpGet(path){
+  const sep=path.includes('?')?'&':'?';
+  return jsonGet(`https://financialmodelingprep.com${path}${sep}apikey=${FMP_KEY}`);
+}
+
 async function postToWebhook(url,payload){
   return new Promise(resolve=>{
     const body=JSON.stringify(payload);
@@ -198,7 +204,7 @@ async function refreshEtfList(){
 function isEtf(t){return etfSet.has(t);}
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
-const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map();
+const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map();
 
 async function getTickerDetails(ticker){
   const c=tickerCache.get(ticker);
@@ -211,6 +217,17 @@ async function getTickerDetails(ticker){
     return data;
   }catch(e){return {};}
 }
+async function getFmpProfile(ticker){
+  const c=fmpProfileCache.get(ticker);
+  if(c&&Date.now()-c.ts<12*60*60*1000) return c.data; // cache 12h
+  try{
+    const r=await fmpGet(`/api/v3/profile/${ticker}`);
+    const data=(r&&r[0])||{};
+    fmpProfileCache.set(ticker,{data,ts:Date.now()});
+    return data;
+  }catch(e){return {};}
+}
+
 async function getNewsUrl(ticker){
   const c=newsCache.get(ticker);
   if(c&&Date.now()-c.ts<15*60*1000) return c.url;
@@ -459,9 +476,15 @@ async function fireNHOD(ticker,price){
   const tLink=newsUrl?`[${ticker}](<${newsUrl}>)`:`**${ticker}**`;
   const pctStr=`+${livePct.toFixed(1)}%`;
   const mcLine=mc>0?` | MC: ${fmtN(mc)}`:'';
+  // Fetch FMP profile for sector tag
+  const prof=await getFmpProfile(ticker).catch(()=>({}));
+  const sector   = prof.sector||'';
+  const industry = prof.industry||'';
+  const sectorStr= sector ? ` · ${sector}${industry?` · ${industry}`:''}` : '';
+
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
   const extraStr=extra?`\n> ${extra}`:'';
-  const line=`\`${timeStr}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${sessLabel}${afterLull}${greenStr} ~ ${flag(ticker)}${mcLine} | RVol: ${fmtRVol(liveRvol)} | Vol: ${fmtN(liveVol)}${regSHO}${rsStr}${prStr}${extraStr}`;
+  const line=`\`${timeStr}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${sessLabel}${afterLull}${greenStr} ~ ${flag(ticker)}${mcLine} | RVol: ${fmtRVol(liveRvol)} | Vol: ${fmtN(liveVol)}${regSHO}${rsStr}${prStr}${sectorStr}${extraStr}`;
   await post({content:line});
   console.log(`[ALERT] posted OK`);
 }
@@ -533,6 +556,24 @@ async function pollNews(){
     for(const n of items){
       if(!n.published_utc||new Date(n.published_utc).getTime()<cutoff) continue;
       await handleNewsItem(n.title||'',(n.tickers||[]).filter(Boolean).map(t=>t.toUpperCase()),n.article_url||'',n.published_utc);
+    }
+  }catch(e){}
+}
+
+// ─── FMP news poll ───────────────────────────────────────────────────────────
+let lastFmpPoll=0;
+async function pollFmpNews(){
+  if(!isActive()||!FMP_KEY) return;
+  if(Date.now()-lastFmpPoll<8000) return; // offset from Polygon poll (5s) → every 8s
+  lastFmpPoll=Date.now();
+  try{
+    const r=await fmpGet('/api/v3/stock_news?limit=50');
+    const items=(r)||[],cutoff=Date.now()-3*60*1000;
+    for(const n of items){
+      if(!n.publishedDate||new Date(n.publishedDate).getTime()<cutoff) continue;
+      const ticker=(n.symbol||'').toUpperCase();
+      if(!ticker) continue;
+      await handleNewsItem(n.title||'',[ticker],n.url||'',n.publishedDate);
     }
   }catch(e){}
 }
@@ -768,7 +809,8 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[Tiers] EARLY-PRE 4-7AM ≥10%/noVol | LATE-PRE 7-9:30AM ≥20%/noVol | MKT ≥10%/5M | AH ≥10%/noVol');
+  console.log('[Tiers] EARLY-PRE 4-7AM ≥10%/noVol | LATE-PRE 7-9:30AM ≥20%/noVol | MKT ≥10%/5M | AH ≥10%/500K');
+  console.log(`[FMP] key: ${FMP_KEY?FMP_KEY.slice(0,8)+'...':'NOT SET — add FMP_KEY to Railway'}}`);
   console.log('[Key]   Vol floor = 0 for all pre-market. % gain is the only pre-market quality gate.');
 
   await refreshEtfList();
@@ -784,12 +826,13 @@ async function main(){
     const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys()])].filter(t=>!subscribedTickers.has(t));
     if(newT.length) subscribeNewTickers(newT);
     await pollNews();
+    await pollFmpNews();
     await syncHighsAtTransition(); // capture 4PM close prices within 20s
   },20*1000);
 
   setInterval(async()=>{
     const {hh,m}=getET();
-    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();console.log('[Daily] Reset');}
+    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();console.log('[Daily] Reset');}
     await checkMorningSnapshot();
     await checkFilings();
     await syncHighsAtTransition();
