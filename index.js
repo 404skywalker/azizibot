@@ -501,11 +501,15 @@ async function handleNewsItem(title,tickers,url,published_utc){
   for(const t of tickers) if(url) newsCache.set(t,{url,ts:Date.now()});
   const isDrop=DROP_RE.test(title);
   const isSpike=!isDrop&&SPIKE_RE.test(title);
+  if(isDrop||isSpike) console.log(`[News] ${isDrop?'DROP':'SPIKE'} match: ${tickers.slice(0,3).join(',')} — ${title.slice(0,80)}`);
   if(!isDrop&&!isSpike) return;
 
   const {timeStr,etMin}=getET();
   const tier=getTier(etMin);
-  const prVolMin=tier?.minVol||0;
+  // PR alerts use a much lower vol floor than NHOD alerts.
+  // News can break before volume builds up.
+  // PRE/AH: 0, MKT: 50K (just enough to confirm it's a real stock)
+  const prVolMin = tier ? (tier.name==='MKT' ? 50_000 : 0) : 0;
 
   for(const ticker of tickers.slice(0,3)){
     if(isBadTicker(ticker)||isEtf(ticker)) continue;
@@ -769,31 +773,69 @@ async function handleCmd(cmd,option,interaction){
 }
 
 // ─── Discord Gateway ──────────────────────────────────────────────────────────
-let wsDiscord=null,discordHB=null,discordSeq=null;
-function connectDiscord(){
+let wsDiscord=null, discordHB=null, discordSeq=null;
+let discordSessionId=null, discordResumeUrl=null, discordHbAck=true;
+
+function connectDiscord(resume=false){
   if(wsDiscord){try{wsDiscord.terminate();}catch(e){}}
-  wsDiscord=new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
-  wsDiscord.on('open',()=>console.log('[Discord] Connected'));
+  const url=(resume&&discordResumeUrl)||'wss://gateway.discord.gg/?v=10&encoding=json';
+  wsDiscord=new WebSocket(url);
+  wsDiscord.on('open',()=>console.log(`[Discord] Connected${resume?' (resume)':''}`));
   wsDiscord.on('message',async data=>{
     try{
       const msg=JSON.parse(data.toString());
       if(msg.s) discordSeq=msg.s;
-      if(msg.op===10){if(discordHB)clearInterval(discordHB);discordHB=setInterval(()=>wsDiscord.send(JSON.stringify({op:1,d:discordSeq})),msg.d.heartbeat_interval);wsDiscord.send(JSON.stringify({op:2,d:{token:DISCORD_TOKEN,intents:(1<<9)|(1<<15),properties:{os:'linux',browser:'azizibot',device:'azizibot'}}}));}
+      if(msg.op===10){
+        // Hello — start heartbeat with jitter then identify or resume
+        if(discordHB) clearInterval(discordHB);
+        discordHbAck=true;
+        const jitter=Math.floor(Math.random()*msg.d.heartbeat_interval);
+        setTimeout(()=>{
+          if(wsDiscord&&wsDiscord.readyState===WebSocket.OPEN)
+            wsDiscord.send(JSON.stringify({op:1,d:discordSeq}));
+          discordHB=setInterval(()=>{
+            if(!discordHbAck){
+              console.log('[Discord] Heartbeat ACK missed — reconnecting');
+              wsDiscord.terminate();
+              return;
+            }
+            discordHbAck=false;
+            if(wsDiscord&&wsDiscord.readyState===WebSocket.OPEN)
+              wsDiscord.send(JSON.stringify({op:1,d:discordSeq}));
+          },msg.d.heartbeat_interval);
+        },jitter);
+
+        if(resume&&discordSessionId&&discordSeq){
+          // Resume existing session
+          wsDiscord.send(JSON.stringify({op:6,d:{token:DISCORD_TOKEN,session_id:discordSessionId,seq:discordSeq}}));
+        } else {
+          // Fresh identify
+          wsDiscord.send(JSON.stringify({op:2,d:{token:DISCORD_TOKEN,intents:(1<<9)|(1<<15),properties:{os:'linux',browser:'azizibot',device:'azizibot'}}}));
+        }
+      }
+      if(msg.op===11) discordHbAck=true; // Heartbeat ACK
+      if(msg.op===7)  { console.log('[Discord] Reconnect requested'); setTimeout(()=>connectDiscord(true),1000); }
+      if(msg.op===9)  { console.log('[Discord] Invalid session'); discordSessionId=null; setTimeout(()=>connectDiscord(false),5000); }
       if(msg.op===0){
-        if(msg.t==='READY') console.log(`[Discord] Ready as ${msg.d.user.username}`);
+        if(msg.t==='READY'){
+          discordSessionId=msg.d.session_id;
+          discordResumeUrl=msg.d.resume_gateway_url;
+          console.log(`[Discord] Ready as ${msg.d.user.username}`);
+        }
+        if(msg.t==='RESUMED') console.log('[Discord] Session resumed');
         if(msg.t==='INTERACTION_CREATE'&&msg.d.type===2){const cmd=msg.d.data.name;const opt=(msg.d.data.options&&msg.d.data.options[0]&&msg.d.data.options[0].value)||'';handleCmd(cmd,opt,msg.d).catch(e=>console.error('[Discord] cmd:',e.message));}
         if(msg.t==='MESSAGE_CREATE'&&!msg.d.author.bot){const m=(msg.d.content||'').trim().match(/^\$?([A-Z]{1,5})$/);if(m)buildQuoteEmbed(m[1]).then(e=>discordRest('POST',`/channels/${msg.d.channel_id}/messages`,e)).catch(()=>{});}
       }
-      if(msg.op===7||msg.op===9) setTimeout(connectDiscord,msg.op===9?5000:1000);
     }catch(e){}
   });
   wsDiscord.on('error',err=>console.error('[Discord] error:',err.message));
   wsDiscord.on('close',code=>{
-    if(discordHB)clearInterval(discordHB);
+    if(discordHB){clearInterval(discordHB);discordHB=null;}
     console.log(`[Discord] closed (${code})`);
-    // 1006 = abnormal closure, often rate limit — back off longer
-    const delay = code===4004?10000:code===1006?15000:5000;
-    setTimeout(connectDiscord, delay);
+    if(code===4004){console.error('[Discord] Bad token — update DISCORD_TOKEN in Railway');setTimeout(()=>connectDiscord(false),30000);return;}
+    // Try to resume on abnormal close, fresh connect otherwise
+    const canResume=discordSessionId&&(code===1006||code===1001||code===4000);
+    setTimeout(()=>connectDiscord(canResume),canResume?3000:10000);
   });
 }
 
