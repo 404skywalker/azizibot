@@ -788,7 +788,13 @@ function connectDiscord(){
     }catch(e){}
   });
   wsDiscord.on('error',err=>console.error('[Discord] error:',err.message));
-  wsDiscord.on('close',code=>{if(discordHB)clearInterval(discordHB);console.log(`[Discord] closed (${code}), reconnecting...`);setTimeout(connectDiscord,5000);});
+  wsDiscord.on('close',code=>{
+    if(discordHB)clearInterval(discordHB);
+    console.log(`[Discord] closed (${code})`);
+    // 1006 = abnormal closure, often rate limit — back off longer
+    const delay = code===4004?10000:code===1006?15000:5000;
+    setTimeout(connectDiscord, delay);
+  });
 }
 
 async function registerCommands(){
