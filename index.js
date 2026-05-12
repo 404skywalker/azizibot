@@ -1,4 +1,4 @@
-'use strict'; // v2
+'use strict';
 const https     = require('https');
 const WebSocket = require('ws');
 
@@ -685,68 +685,6 @@ async function checkFilings(){
 }
 
 
-// ─── Economic Calendar ────────────────────────────────────────────────────────
-// Posts high-impact events at 4:45AM ET daily, and reminders 5min before each.
-const sentEcoEvents = new Set();
-
-async function checkEconomicCalendar(){
-  if(!FMP_KEY||!isMarketDay()) return;
-  const {hh,m,etMin}=getET();
-
-  // 4:45AM — post daily summary of today's high-impact events
-  if(hh===4&&m===45){
-    const key=`eco_summary_${new Date().toISOString().slice(0,10)}`;
-    if(!sentEcoEvents.has(key)){
-      sentEcoEvents.add(key);
-      try{
-        const today=new Date().toISOString().slice(0,10);
-        const r=await fmpGet(`/api/v3/economic_calendar?from=${today}&to=${today}`);
-        const events=(r||[]).filter(e=>e.impact==='High'||e.impact==='Medium');
-        if(events.length){
-          const rows=events.map(e=>{
-            const impact=e.impact==='High'?'🔴':'🟡';
-            const time=e.date?new Date(e.date).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}):'--';
-            const prev=e.previous!==null&&e.previous!==undefined?` | Prev: ${e.previous}${e.unit||''}` :'';
-            const est=e.estimate!==null&&e.estimate!==undefined?` | Est: ${e.estimate}${e.unit||''}` :'';
-            return`${impact} **${time} ET** — ${e.event}${est}${prev}`;
-          }).join('\n');
-          await post({embeds:[{
-            title:"Todays Economic Events",
-            description:rows,
-            color:0xf0a500,
-            footer:{text:"AziziBot - High & Medium Impact"},
-            timestamp:new Date().toISOString()
-          }]});
-          console.log(`[EcoCalendar] Daily summary posted (${events.length} events)`);
-        }
-      }catch(e){console.error('[EcoCalendar] summary error:',e.message);}
-    }
-  }
-
-  // Check for upcoming events — post reminder 5min before
-  if(etMin>=240&&etMin<960){
-    try{
-      const today=new Date().toISOString().slice(0,10);
-      const r=await fmpGet(`/api/v3/economic_calendar?from=${today}&to=${today}`);
-      const events=(r||[]).filter(e=>e.impact==='High');
-      for(const e of events){
-        if(!e.date) continue;
-        const eventTime=new Date(e.date).getTime();
-        const minsUntil=(eventTime-Date.now())/60000;
-        if(minsUntil>4&&minsUntil<=5){
-          const key=`eco_reminder_${e.event}_${e.date}`;
-          if(!sentEcoEvents.has(key)){
-            sentEcoEvents.add(key);
-            const est=e.estimate!==null&&e.estimate!==undefined?`\n> Est: **${e.estimate}${e.unit||''}**`:'';
-            const prev=e.previous!==null&&e.previous!==undefined?` | Prev: ${e.previous}${e.unit||''}`:'';
-            await post({content:`⚠️ **Economic Event in ~5 min**\n> 🔴 **${e.event}**${est}${prev}`});
-            console.log(`[EcoCalendar] Reminder: ${e.event}`);
-          }
-        }
-      }
-    }catch(e){}
-  }
-}
 
 // ─── Session transition sync ──────────────────────────────────────────────────
 // At 4PM (MKT→AH), capture the closing price for every tracked ticker.
@@ -1057,7 +995,6 @@ async function main(){
     await checkMorningSnapshot();
     await checkFilings();
     await syncHighsAtTransition();
-    await checkEconomicCalendar();
   },60*1000);
 
   console.log('🤖 AziziBot v8 running.');
