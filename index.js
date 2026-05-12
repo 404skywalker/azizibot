@@ -474,7 +474,7 @@ async function fireNHOD(ticker,price){
   }
 
   const prData=newsCache.get(ticker);
-  const prStr=prData&&(Date.now()-prData.ts)<15*60*1000?` | [PR+](<${prData.url}>)`:'';
+  const prStr=prData&&(Date.now()-prData.ts)<24*60*60*1000?` | [PR+](<${prData.url}>)`:'';
   const {sess}=getET();
   const sessLabel=nhod===1?(sess==='PRE'?'PMH':sess==='AH'?'AHs':'NSH'):`${nhod} NHOD`;
   const tLink=newsUrl?`[${ticker}](<${newsUrl}>)`:`**${ticker}**`;
@@ -488,7 +488,41 @@ async function fireNHOD(ticker,price){
 
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
   const extraStr=extra?`\n> ${extra}`:'';
-  const line=`\`${timeStr}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${sessLabel}${afterLull}${greenStr} ~ ${flag(ticker)}${mcLine} | RVol: ${fmtRVol(liveRvol)} | Vol: ${fmtN(liveVol)}${regSHO}${rsStr}${prStr}${sectorStr}${extraStr}`;
+
+  // ── Fetch recent news + filings to bundle inline (NuntioBot style) ────────
+  const bulletLines=[];
+  try{
+    // Recent news (last 24h)
+    const newsR=await polyGet(`/v2/reference/news?ticker=${ticker}&limit=5&order=desc&sort=published_utc`);
+    const todayStart=new Date().setHours(0,0,0,0);
+    for(const n of (newsR&&newsR.results||[])){
+      const t=new Date(n.published_utc||0).getTime();
+      if(t<todayStart-24*60*60*1000) break;
+      const ageMs=Date.now()-t;
+      const ageStr=ageMs<3600000?`${Math.round(ageMs/60000)}m ago`:`${Math.round(ageMs/3600000)}h ago`;
+      const isD=DROP_RE.test(n.title||''),isS=SPIKE_RE.test(n.title||'');
+      if(isD||isS){
+        const tag=isD?'PR ↓':'PR';
+        bulletLines.push(`• ${ageStr} \`${tag}\` ${(n.title||'').slice(0,120)}${n.article_url?` — [Link](<${n.article_url}>)`:''}`);
+      }
+    }
+  }catch(e){}
+  try{
+    // Recent filings (last 24h)
+    const filR=await polyGet(`/vX/reference/filings?ticker=${ticker}&limit=5&order=desc&sort=filed_at`);
+    for(const f of (filR&&filR.results||[])){
+      const t=new Date(f.filed_at||0).getTime();
+      if(Date.now()-t>24*60*60*1000) break;
+      const ageMs=Date.now()-t;
+      const ageStr=ageMs<3600000?`${Math.round(ageMs/60000)}m ago`:`${Math.round(ageMs/3600000)}h ago`;
+      const ft=(f.form_type||'').toUpperCase();
+      bulletLines.push(`• ${ageStr} \`SEC\` Form ${ft}${f.filing_url?` — [Link](<${f.filing_url}>)`:''}`);
+    }
+  }catch(e){}
+  const bulletsStr=bulletLines.length?`\n${bulletLines.slice(0,4).join('\n')}` :'';
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const line=`\`${timeStr}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${sessLabel}${afterLull}${greenStr} ~ ${flag(ticker)}${mcLine} | RVol: ${fmtRVol(liveRvol)} | Vol: ${fmtN(liveVol)}${regSHO}${rsStr}${sectorStr}${extraStr}${bulletsStr}`;
   await post({content:line});
   console.log(`[ALERT] posted OK`);
 }
