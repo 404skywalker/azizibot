@@ -913,6 +913,8 @@ async function handleCmd(cmd,option,interaction){
 // ─── Discord Gateway ──────────────────────────────────────────────────────────
 let wsDiscord=null, discordHB=null, discordSeq=null;
 let discordSessionId=null, discordResumeUrl=null, discordHbAck=true;
+let discordFailCount=0, discordLastConnect=0;
+const DISCORD_MAX_BACKOFF=5*60*1000; // 5 min max backoff
 
 function connectDiscord(resume=false){
   if(wsDiscord){try{wsDiscord.terminate();}catch(e){}}
@@ -958,9 +960,11 @@ function connectDiscord(resume=false){
         if(msg.t==='READY'){
           discordSessionId=msg.d.session_id;
           discordResumeUrl=msg.d.resume_gateway_url;
+          discordFailCount=0; // reset backoff on successful connect
+          discordLastConnect=Date.now();
           console.log(`[Discord] Ready as ${msg.d.user.username}`);
         }
-        if(msg.t==='RESUMED') console.log('[Discord] Session resumed');
+        if(msg.t==='RESUMED'){discordFailCount=0;console.log('[Discord] Session resumed');}
         if(msg.t==='INTERACTION_CREATE'&&msg.d.type===2){const cmd=msg.d.data.name;const opt=(msg.d.data.options&&msg.d.data.options[0]&&msg.d.data.options[0].value)||'';handleCmd(cmd,opt,msg.d).catch(e=>console.error('[Discord] cmd:',e.message));}
         if(msg.t==='MESSAGE_CREATE'&&!msg.d.author.bot){const m=(msg.d.content||'').trim().match(/^\$?([A-Z]{1,5})$/);if(m)buildQuoteEmbed(m[1]).then(e=>discordRest('POST',`/channels/${msg.d.channel_id}/messages`,e)).catch(()=>{});}
       }
@@ -972,8 +976,25 @@ function connectDiscord(resume=false){
     console.log(`[Discord] closed (${code})`);
     if(code===4004){console.error('[Discord] Bad token — update DISCORD_TOKEN in Railway');setTimeout(()=>connectDiscord(false),30000);return;}
     // Try to resume on abnormal close, fresh connect otherwise
-    const canResume=discordSessionId&&(code===1006||code===1001||code===4000);
-    setTimeout(()=>connectDiscord(canResume),canResume?3000:10000);
+    // 1000/1001 = clean close → fresh IDENTIFY with backoff
+    // 1006/4000 = abnormal close → RESUME (does NOT burn session limit)
+    // 4004/4014 = auth error → long delay, no resume
+    const canResume = !!(discordSessionId && discordSeq &&
+                      code !== 1000 && code !== 1001 &&
+                      code !== 4004 && code !== 4014);
+
+    if(code===4004){
+      console.error('[Discord] Bad token — update DISCORD_TOKEN in Railway. Pausing 5min.');
+      setTimeout(()=>connectDiscord(false), 5*60*1000);
+      return;
+    }
+
+    // Exponential backoff: 5s, 10s, 20s, 40s... max 5min
+    // RESUME does not count against session_start_limit so backoff only for fresh connects
+    discordFailCount++;
+    const backoff = canResume ? 3000 : Math.min(5000 * Math.pow(2, discordFailCount-1), DISCORD_MAX_BACKOFF);
+    console.log(`[Discord] closed (${code}) → ${canResume?'RESUME':'IDENTIFY (#'+discordFailCount+')'} in ${Math.round(backoff/1000)}s`);
+    setTimeout(()=>connectDiscord(canResume), backoff);
   });
 }
 
@@ -998,6 +1019,16 @@ async function main(){
   console.log('[Tiers] EARLY-PRE 4-7AM ≥10%/noVol | LATE-PRE 7-9:30AM ≥20%/noVol | MKT ≥10%/5M | AH ≥10%/500K');
   console.log(`[FMP] key: ${FMP_KEY?FMP_KEY.slice(0,8)+'...':'NOT SET — add FMP_KEY to Railway'}}`);
   console.log('[Key]   Vol floor = 0 for all pre-market. % gain is the only pre-market quality gate.');
+
+  // Check Discord session_start_limit before connecting
+  try{
+    const gwData = await discordRest('GET', '/gateway/bot');
+    const lim = gwData.session_start_limit;
+    if(lim){
+      console.log(`[Discord] Gateway: sessions remaining=${lim.remaining}/${lim.total} reset_after=${Math.round(lim.reset_after/60000)}min`);
+      if(lim.remaining < 10) console.warn('[Discord] WARNING: session_start_limit nearly depleted!');
+    }
+  }catch(e){}
 
   await refreshEtfList();
   await refreshGappers();
