@@ -426,8 +426,8 @@ async function fireNHOD(ticker,price){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
   }
 
-  if(s.lastAlertPrice>0&&price<s.lastAlertPrice*1.075){
-    console.log(`[NHOD] ${ticker} skip: need 7.5% above $${s.lastAlertPrice.toFixed(4)}`);return;
+  if(s.lastAlertPrice>0&&price<s.lastAlertPrice*1.10){
+    console.log(`[NHOD] ${ticker} skip: need 10% above $${s.lastAlertPrice.toFixed(4)}`);return;
   }
   if(s.lastAlertTime>0&&Date.now()-s.lastAlertTime<5*60*1000){
     console.log(`[NHOD] ${ticker} skip: 5-min cooldown`);return;
