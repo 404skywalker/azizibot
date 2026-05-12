@@ -552,7 +552,7 @@ async function pollNews(){
   lastNewsPoll=Date.now();
   try{
     const r=await polyGet('/v2/reference/news?limit=50&order=desc&sort=published_utc');
-    const items=(r&&r.results)||[],cutoff=Date.now()-3*60*1000;
+    const items=(r&&r.results)||[],cutoff=Date.now()-15*60*1000;
     for(const n of items){
       if(!n.published_utc||new Date(n.published_utc).getTime()<cutoff) continue;
       await handleNewsItem(n.title||'',(n.tickers||[]).filter(Boolean).map(t=>t.toUpperCase()),n.article_url||'',n.published_utc);
@@ -568,7 +568,7 @@ async function pollFmpNews(){
   lastFmpPoll=Date.now();
   try{
     const r=await fmpGet('/api/v3/stock_news?limit=50');
-    const items=(r)||[],cutoff=Date.now()-3*60*1000;
+    const items=(r)||[],cutoff=Date.now()-15*60*1000;
     for(const n of items){
       if(!n.publishedDate||new Date(n.publishedDate).getTime()<cutoff) continue;
       const ticker=(n.symbol||'').toUpperCase();
