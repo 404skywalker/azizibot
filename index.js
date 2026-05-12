@@ -711,7 +711,7 @@ async function checkEconomicCalendar(){
             return`${impact} **${time} ET** — ${e.event}${est}${prev}`;
           }).join('\n');
           await post({embeds:[{
-            title:'📅 Today's Economic Events',
+            title:"Today's Economic Events",
             description:rows,
             color:0xf0a500,
             footer:{text:`AziziBot · High & Medium Impact`},
