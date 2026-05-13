@@ -566,15 +566,16 @@ async function fireNHOD(ticker,price){
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
   const extraStr=extra?` | ${extra}`:'';
 
-  // Exact NuntioBot format:
-  // HH:MM ↗ TICKER <$X +X% · NHOD [after-lull] [· X green bars Xm] ~ FLAG | RVol: Xx | Vol: XXM [| R/S]
-  const isUp     = livePct >= 0;
-  const timeShort= timeStr.slice(0,5); // HH:MM only
-  const afterLullStr = afterLull ? ` after-lull` : '';
-  const greenBarsStr = greenBars>=2 ? ` · **${greenBars} green bars 1m**` : '';
-  const rvolStr  = liveRvol>0 ? ` | RVol: ${fmtRVol(liveRvol)}` : '';
-  const volStr   = liveVol>0  ? ` | Vol: ${fmtN(liveVol)}` : '';
-  const line = `\`${timeShort}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${nhod}${afterLullStr}${greenBarsStr} ~ ${flag(ticker)}${rvolStr}${volStr}${regSHO}${rsStr}`;
+  // NuntioBot exact format:
+  // 10:48 ↗ TICKER `<$2` 67% · 1 · `3 green bars 1m` ~ FLAG | RVol: 15x | Vol: XXM
+  const isUp      = livePct >= 0;
+  const timeShort = timeStr.slice(0,5);
+  const pctPlain  = livePct!==0 ? ` ${Math.abs(livePct).toFixed(1)}%` : '';
+  const afterStr  = afterLull ? ` after-lull` : '';
+  const greenStr2 = greenBars>=2 ? ` · \`${greenBars} green bars 1m\`` : '';
+  const rvolStr   = liveRvol>0 ? ` | RVol: ${fmtRVol(liveRvol)}` : '';
+  const volStr    = liveVol>0  ? ` | Vol: ${fmtN(liveVol)}` : '';
+  const line = `${timeShort} ↗ **${ticker}** \`${priceFlag(price)}\`${pctPlain} · ${nhod}${afterStr}${greenStr2} ~ ${flag(ticker)}${rvolStr}${volStr}${regSHO}${rsStr}`;
 
   await post({embeds:[{
     color: isUp ? 0x26a641 : 0xe03e3e,
