@@ -348,7 +348,7 @@ async function refreshGappers(){
       const rvol   = pv2>0?(vol*390)/(mins*pv2):0;
       const isOTC  = /OTC|GREY|PINK|EXPERT/i.test(t.primaryExchange||'');
       return {ticker:t.ticker,price,prev,chgPct,volume:vol,prevVol:pv2,rvol,
-              high:price,isOTC,
+              high:price, dayHigh:(t.day&&t.day.h)||price, isOTC,
               _lastP:lastP,_dayC:dayC}; // keep raw fields for debug
     };
 
@@ -399,7 +399,10 @@ async function refreshGappers(){
 
     for(const g of topGappers){
       const ex=state.tickers.get(g.ticker)||{high:0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]};
-      state.tickers.set(g.ticker,{...ex,...g,high:Math.max(g.price,ex.high)});
+      // New ticker (ex.high===0): init from day.h to prevent false PMH hours after real peak
+      // Existing ticker: keep max of current price and WS-tracked high
+      const initHigh = ex.high>0 ? Math.max(g.price,ex.high) : Math.max(g.price,g.dayHigh||0);
+      state.tickers.set(g.ticker,{...ex,...g,high:initHigh});
     }
     for(const [ticker,g] of dayWatchlist){
       if(!state.tickers.has(ticker))
