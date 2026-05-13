@@ -576,32 +576,25 @@ async function handleNewsItem(title,tickers,url,published_utc){
     const ageMs  = Date.now()-new Date(published_utc||Date.now()).getTime();
     const ageStr = ageMs<60000?`${Math.round(ageMs/1000)}s`:ageMs<3600000?`${Math.round(ageMs/60000)}m`:`${Math.round(ageMs/3600000)}h`;
 
-    // Emoji indicator
-    const icon = isDrop ? '🔴' : '🟢';
-    const arrow = isDrop ? '↓' : '↑';
-    const typeLabel = isDrop ? 'PR Drop 🩸' : 'PR Spike 🚀';
+    const arrow   = isDrop ? '↓' : '↑';
+    const typeLabel= isDrop ? 'PR Drop' : 'PR Spike';
+    const tLink    = url?`[**${ticker}**](<${url}>)`:`**${ticker}**`;
+    const chgStr   = chgPct!==0?` \`${chgPct>=0?'+':''}${chgPct.toFixed(1)}%\``:'';
+    const mcStr    = mc>0?` | MC: ${fmtN(mc)}`:'';
+    const volStr   = vol>0?` | Vol: ${fmtN(vol)}`:'';
+    const rvolStr  = rvol>0?` | RVol: ${fmtRVol(rvol)}`:'';
+    const sectStr  = sector?`\n> ${sector}${industry?` · ${industry}`:''}` :'';
+    const statsLine= [fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
 
-    // Header line — ticker, price, change, flag, key stats
-    const tLink  = url?`[**${ticker}**](<${url}>)`:`**${ticker}**`;
-    const chgStr = chgPct!==0?` \`${chgPct>=0?'+':''}${chgPct.toFixed(1)}%\``:'';
-    const mcStr  = mc>0?` | MC: **${fmtN(mc)}**`:'';
-    const volStr = vol>0?` | Vol: **${fmtN(vol)}**`:'';
-    const rvolStr= rvol>0?` | RVol: **${fmtRVol(rvol)}**`:'';
-    const floatStr= fv.float!=='--'?` | Float: ${fv.float}`:'';
-    const siStr  = fv.si!=='--'?` | SI: ${fv.si}`:'';
-    const ioStr  = fv.io!=='--'?` | IO: ${fv.io}`:'';
-    const sectStr= sector?`\n> 🏢 ${sector}${industry?` · ${industry}`:''}` :'';
-
-    const header = `${icon} ${arrow} ${tLink} \`${priceFlag(price)}\`${chgStr} ~ ${flag(ticker)}${mcStr}${volStr}${rvolStr}`;
-    const stats  = `${floatStr}${siStr}${ioStr}${sectStr}`;
-    const newsLine = `> 📰 **[${typeLabel}]** · *${ageStr} ago*\n> ${title.slice(0,220)}${url?` — [**Link**](<${url}>)`:''}`;
-    const statsLine = stats?`\n> ${floatStr.replace(/^ \| /,'')}${siStr}${ioStr}`:'';
+    const header  = `\`${timeStr}\` ${arrow} ${tLink} \`${priceFlag(price)}\`${chgStr} ~ ${flag(ticker)}${mcStr}${volStr}${rvolStr}`;
+    const newsLine= `• ${ageStr} ago [${typeLabel}] ${title.slice(0,220)}${url?` — [Link](<${url}>)`:''}`;
+    const extra   = statsLine?`\n> ${statsLine}`:'';
 
     const embed = {
       embeds:[{
         color: isDrop ? 0xe03e3e : 0x26a641,
-        description: `${header}\n${newsLine}${sectStr}${stats&&!sectStr?'\n> '+[fv.float!=='--'?'Float: '+fv.float:'',fv.si!=='--'?'SI: '+fv.si:'',fv.io!=='--'?'IO: '+fv.io:''].filter(Boolean).join(' | '):''}`,
-        footer:{text:`AziziBot · ${timeStr} ET · ${tier?.name||''}` },
+        description: `${header}\n${newsLine}${sectStr}${extra}`,
+        footer:{text:`AziziBot · ${tier?.name||''}`},
         timestamp: new Date().toISOString(),
       }]
     };
