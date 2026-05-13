@@ -441,6 +441,8 @@ async function refreshGappers(){
             rvol:g.rvol,price:g.price,high:g.high,lockedAt:name});
           recentRunners.set(g.ticker, Date.now());
           console.log(`[Watch] +${g.ticker} +${g.chgPct.toFixed(1)}% vol:${fmtN(g.volume)} [${name}]`);
+          // Pre-fetch FMP profile so country flag is ready before first alert
+          getFmpProfile(g.ticker).catch(()=>{});
         }
       }
     }
