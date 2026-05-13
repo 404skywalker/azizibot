@@ -572,12 +572,9 @@ async function handleNewsItem(title,tickers,url,published_utc){
   const tier=getTier(etMin);
   const prVolMin = tier ? (tier.name==='MKT' ? 50_000 : 0) : 0;
 
-  // Filter to only tickers we care about: current gappers, watchlist, or recent runners
-  const tracked=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys(),...permanentWatch]);
-  const filtered=tickers.filter(t=>tracked.has(t)||tickers.length===1).slice(0,3);
-  if(!filtered.length) return;
-
-  for(const ticker of filtered){
+  // Fire for any stock matching keywords — no watchlist filter on news
+  // DROP_RE/SPIKE_RE keywords are specific enough to avoid spam
+  for(const ticker of tickers.slice(0,3)){
     if(isBadTicker(ticker)||isEtf(ticker)) continue;
     const prId=`${isDrop?'drop':'spike'}_${id}_${ticker}`;
     if(state.sentPR.has(prId)) continue;
