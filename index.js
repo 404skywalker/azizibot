@@ -11,7 +11,7 @@ const FMP_KEY       = process.env.FMP_KEY        || '';
 const APP_ID        = '1493671812247322624';
 
 const TOP_GAPPERS_WH = 'https://discord.com/api/webhooks/1493250562689597623/57UTSPu2KfLmYNBRVPvPQIa4cSfCQA8wVcqB5d0J8cWYaJf5hlsm1EuRkQ3lolChTNh3';
-const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1493985046074491060/PVM3ow3kgoSTHV9JGcNppy_eAjcTf-l7Wdf91YOV1VPDtoMIbvrGWPoP4_-I_53ejziZ';
+const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504111128106631359/W9Ky7814ojPziIuN6loeaNgu6l8aFzUMlMtrj8vsf4egXWfiBKFv0sNKu8VO9cclmRKD';
 
 // ─── Session tiers ────────────────────────────────────────────────────────────
 //
