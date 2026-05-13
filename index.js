@@ -867,21 +867,29 @@ function connectDiscord(resume=false){
         // Hello — start heartbeat with jitter then identify or resume
         if(discordHB) clearInterval(discordHB);
         discordHbAck=true;
-        const jitter=Math.floor(Math.random()*msg.d.heartbeat_interval);
-        setTimeout(()=>{
-          if(wsDiscord&&wsDiscord.readyState===WebSocket.OPEN)
-            wsDiscord.send(JSON.stringify({op:1,d:discordSeq}));
-          discordHB=setInterval(()=>{
-            if(!discordHbAck){
-              console.log('[Discord] Heartbeat ACK missed — reconnecting');
-              wsDiscord.terminate();
+        // Send first heartbeat immediately, then on interval
+        const hbInterval = msg.d.heartbeat_interval;
+        let missedAcks = 0;
+        if(discordHB) clearInterval(discordHB);
+        discordHbAck = true;
+        discordHB = setInterval(()=>{
+          if(!discordHbAck){
+            missedAcks++;
+            if(missedAcks>=2){
+              console.log('[Discord] Heartbeat ACK missed twice — reconnecting');
+              missedAcks=0;
+              clearInterval(discordHB);
+              discordHB=null;
+              try{wsDiscord.terminate();}catch(e){}
               return;
             }
-            discordHbAck=false;
-            if(wsDiscord&&wsDiscord.readyState===WebSocket.OPEN)
-              wsDiscord.send(JSON.stringify({op:1,d:discordSeq}));
-          },msg.d.heartbeat_interval);
-        },jitter);
+          } else {
+            missedAcks=0;
+          }
+          discordHbAck=false;
+          if(wsDiscord&&wsDiscord.readyState===WebSocket.OPEN)
+            wsDiscord.send(JSON.stringify({op:1,d:discordSeq}));
+        }, hbInterval);
 
         if(resume&&discordSessionId&&discordSeq){
           // Resume existing session
