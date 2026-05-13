@@ -518,40 +518,7 @@ async function fireNHOD(ticker,price){
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
   const extraStr=extra?`\n> ${extra}`:'';
 
-  // ── Fetch recent news + filings to bundle inline (NuntioBot style) ────────
-  const bulletLines=[];
-  try{
-    // Recent news (last 24h)
-    const newsR=await polyGet(`/v2/reference/news?ticker=${ticker}&limit=5&order=desc&sort=published_utc`);
-    const todayStart=new Date().setHours(0,0,0,0);
-    for(const n of (newsR&&newsR.results||[])){
-      const t=new Date(n.published_utc||0).getTime();
-      if(t<todayStart-24*60*60*1000) break;
-      const ageMs=Date.now()-t;
-      const ageStr=ageMs<3600000?`${Math.round(ageMs/60000)}m ago`:`${Math.round(ageMs/3600000)}h ago`;
-      const isD=DROP_RE.test(n.title||''),isS=SPIKE_RE.test(n.title||'');
-      if(isD||isS){
-        const tag=isD?'PR ↓':'PR';
-        bulletLines.push(`• ${ageStr} \`${tag}\` ${(n.title||'').slice(0,120)}${n.article_url?` — [Link](<${n.article_url}>)`:''}`);
-      }
-    }
-  }catch(e){}
-  try{
-    // Recent filings (last 24h)
-    const filR=await polyGet(`/vX/reference/filings?ticker=${ticker}&limit=5&order=desc&sort=filed_at`);
-    for(const f of (filR&&filR.results||[])){
-      const t=new Date(f.filed_at||0).getTime();
-      if(Date.now()-t>24*60*60*1000) break;
-      const ageMs=Date.now()-t;
-      const ageStr=ageMs<3600000?`${Math.round(ageMs/60000)}m ago`:`${Math.round(ageMs/3600000)}h ago`;
-      const ft=(f.form_type||'').toUpperCase();
-      bulletLines.push(`• ${ageStr} \`SEC\` Form ${ft}${f.filing_url?` — [Link](<${f.filing_url}>)`:''}`);
-    }
-  }catch(e){}
-  const bulletsStr=bulletLines.length?`\n${bulletLines.slice(0,4).join('\n')}` :'';
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const line=`\`${timeStr}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${sessLabel}${afterLull}${greenStr} ~ ${flag(ticker)}${mcLine} | RVol: ${fmtRVol(liveRvol)} | Vol: ${fmtN(liveVol)}${regSHO}${rsStr}${sectorStr}${extraStr}${bulletsStr}`;
+  const line=`\`${timeStr}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${sessLabel}${afterLull}${greenStr} ~ ${flag(ticker)}${mcLine} | RVol: ${fmtRVol(liveRvol)} | Vol: ${fmtN(liveVol)}${regSHO}${rsStr}${sectorStr}${extraStr}`;
   await post({content:line});
   console.log(`[ALERT] posted OK`);
 }
@@ -602,44 +569,45 @@ async function handleNewsItem(title,tickers,url,published_utc){
     const ageMs  = Date.now()-new Date(published_utc||Date.now()).getTime();
     const ageStr = ageMs<60000?`${Math.round(ageMs/1000)}s`:ageMs<3600000?`${Math.round(ageMs/60000)}m`:`${Math.round(ageMs/3600000)}h`;
 
-    // NuntioBot-style: bundle ALL recent news + filings for this ticker in one message
+    // Exact NuntioBot format:
+    // HH:MM ↑ TICKER <$XX ~ FLAG | IO: X% | MC: XB
+    // • X minutes ago [PR] Title - Link
+    // • X minutes ago [SEC] Form XX - Link
     const mcStr  = mc>0?` | MC: ${fmtN(mc)}`:'';
     const ioStr2 = fv.io!=='--'?` | IO: ${fv.io}`:'';
-    const header = `\`${timeStr}\` ${isDrop?'↓':'↑'} **${ticker}** ${priceFlag(price)} ~ ${flag(ticker)}${ioStr2}${mcStr}`;
+    const header = `\`${timeStr.slice(0,5)}\` ${isDrop?'↓':'↑'} **${ticker}** <$${price%1===0?price.toFixed(0):price.toFixed(2)} ~ ${flag(ticker)}${ioStr2}${mcStr}`;
 
-    // Collect bullets: current news item + any other recent news + recent filings
-    const bullets=[];
-    const fmtAge=ms=>ms<3600000?`${Math.round(ms/60000)} minutes ago`:ms<86400000?`${Math.round(ms/3600000)} hours ago`:`${Math.round(ms/86400000)} days ago`;
+    const fmtAge = ms => ms<3600000?`${Math.round(ms/60000)} minutes ago`:`${Math.round(ms/3600000)} hours ago`;
+    const bullets = [];
 
-    // Add current news item
-    bullets.push(`• ${fmtAge(ageMs)} [${isDrop?'PR Drop':'PR'}] ${title.slice(0,200)}${url?` - Link`:''}`);
+    // Current news item
+    bullets.push(`• ${fmtAge(ageMs)} [${isDrop?'PR Drop':'PR'}] ${title.slice(0,200)}${url?' - [Link]('+url+')':''}`);
 
-    // Fetch other recent news for this ticker (last 12h)
+    // Bundle other recent news for same ticker (last 12h, matching keywords)
     try{
       const nr=await polyGet(`/v2/reference/news?ticker=${ticker}&limit=5&order=desc&sort=published_utc`);
       for(const n of (nr&&nr.results||[])){
-        const nId=(n.article_url||n.title||'').slice(0,100);
-        if(nId===id) continue; // skip current item
+        if((n.article_url||n.title||'').slice(0,100)===id) continue;
         const t=new Date(n.published_utc||0).getTime();
         if(Date.now()-t>12*60*60*1000) break;
         const nDrop=DROP_RE.test(n.title||''),nSpike=SPIKE_RE.test(n.title||'');
         if(!nDrop&&!nSpike) continue;
-        bullets.push(`• ${fmtAge(Date.now()-t)} [${nDrop?'PR Drop':'PR'}] ${(n.title||'').slice(0,200)}${n.article_url?` - Link`:''}`);
+        bullets.push(`• ${fmtAge(Date.now()-t)} [${nDrop?'PR Drop':'PR'}] ${(n.title||'').slice(0,200)}${n.article_url?' - [Link]('+n.article_url+')':''}`);
       }
     }catch(e){}
 
-    // Fetch recent SEC filings (last 12h)
+    // Bundle recent SEC filings (last 12h)
     try{
       const fr=await polyGet(`/vX/reference/filings?ticker=${ticker}&limit=5&order=desc&sort=filed_at`);
       for(const f of (fr&&fr.results||[])){
         const t=new Date(f.filed_at||0).getTime();
         if(Date.now()-t>12*60*60*1000) break;
         const ft=(f.form_type||'').toUpperCase();
-        bullets.push(`• ${fmtAge(Date.now()-t)} [SEC] Form ${ft}${f.filing_url?` - Link`:''}`);
+        bullets.push(`• ${fmtAge(Date.now()-t)} [SEC] Form ${ft}${f.filing_url?' - [Link]('+f.filing_url+')':''}`);
       }
     }catch(e){}
 
-    if(bullets.length) await post({content:`${header}\n${bullets.join('\n')}`});
+    if(bullets.length) await post({content:`${header}\n${bullets.slice(0,5).join('\n')}`});
     console.log(`[${timeStr}] ${isDrop?'PR-DROP':'PR-SPIKE'}: ${ticker}`);
   }
   if(state.sentNews.size>500){const a=[...state.sentNews];state.sentNews.clear();a.slice(-200).forEach(x=>state.sentNews.add(x));}
