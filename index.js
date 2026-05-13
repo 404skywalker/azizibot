@@ -564,7 +564,7 @@ async function fireNHOD(ticker,price){
   const sectorStr= sector ? ` · ${sector}${industry?` · ${industry}`:''}` : '';
 
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
-  const extraStr=extra?`\n> ${extra}`:'';
+  const extraStr=extra?` | ${extra}`:'';
 
   // Original NuntioBot-style structure + colored left sidebar
   const isUp = livePct >= 0;
