@@ -1,5 +1,6 @@
 'use strict';
 const https     = require('https');
+const fs        = require('fs');
 const WebSocket = require('ws');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -296,6 +297,25 @@ const closePrice=new Map(); // ticker → price at 4PM close
 // Used to expand news coverage beyond just today's movers
 const recentRunners=new Map(); // ticker → timestamp when last seen as gapper
 
+// permanentWatch: loaded from watchlist.txt — monitored forever, no gates
+const permanentWatch=new Set();
+let lastWatchlistRead=0;
+function loadPermanentWatchlist(){
+  try{
+    const path='/app/watchlist.txt';
+    if(!fs.existsSync(path)){console.log('[Watch] watchlist.txt not found — skipping');return;}
+    const lines=fs.readFileSync(path,'utf8').split('\n');
+    const prev=permanentWatch.size;
+    permanentWatch.clear();
+    for(const line of lines){
+      const t=line.trim().toUpperCase().replace(/[^A-Z]/g,'');
+      if(t&&t.length>=1&&t.length<=5) permanentWatch.add(t);
+    }
+    if(permanentWatch.size!==prev)
+      console.log(`[Watch] Permanent watchlist: ${permanentWatch.size} tickers loaded`);
+  }catch(e){console.error('[Watch] Failed to load watchlist.txt:',e.message);}
+}
+
 // ─── Gapper refresh ───────────────────────────────────────────────────────────
 async function refreshGappers(){
   try{
@@ -385,6 +405,11 @@ async function refreshGappers(){
       if(!state.tickers.has(ticker))
         state.tickers.set(ticker,{high:g.high,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]});
     }
+    // Ensure permanentWatch tickers always have a state entry
+    for(const ticker of permanentWatch){
+      if(!state.tickers.has(ticker))
+        state.tickers.set(ticker,{high:0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]});
+    }
 
     console.log(`[${timeStr}] ${topGappers.length} live | ${dayWatchlist.size} watchlist | ${name}`);
   }catch(e){console.error('[refreshGappers] CRASH:',e.message,e.stack);}
@@ -394,10 +419,11 @@ async function refreshGappers(){
 async function fireNHOD(ticker,price){
   if(!isActive()) return;
 
-  const liveG =topGappers.find(g=>g.ticker===ticker);
-  const watchG=dayWatchlist.get(ticker);
-  const gapper=liveG||watchG;
-  const isWatchOnly=!liveG&&!!watchG;
+  const liveG  =topGappers.find(g=>g.ticker===ticker);
+  const watchG =dayWatchlist.get(ticker);
+  const isPermW=permanentWatch.has(ticker);
+  const gapper =liveG||watchG||(isPermW?{ticker,chgPct:0,volume:0,prevVol:0,rvol:0,price:0}:null);
+  const isWatchOnly=!liveG&&(!!watchG||isPermW);
   if(!gapper) return;
 
   const s=state.tickers.get(ticker);
@@ -408,7 +434,7 @@ async function fireNHOD(ticker,price){
   if(price>10)   {console.log(`[NHOD] ${ticker} skip: >$10`);return;}
   if(price<0.10) {console.log(`[NHOD] ${ticker} skip: <$0.10`);return;}
 
-  // All tickers (live + watchlist) must pass the current session tier gates
+  // All tickers must pass session tier gates (permanentWatch = same as watchlist)
   const tier=getTier(etMin);
   if(!tier) return;
   if(tier.minVol>0&&gapper.volume<tier.minVol){
@@ -443,7 +469,7 @@ async function fireNHOD(ticker,price){
   const nhod=(s.nhod||0)+1;
   state.tickers.set(ticker,{...s,high:price,nhod,lastAlertPrice:price,lastAlertTime:Date.now(),priceHistory:s.priceHistory||[]});
   state.dailyCounts.set(ticker,(state.dailyCounts.get(ticker)||0)+1);
-  console.log(`[ALERT] ↗ ${ticker} $${price.toFixed(4)} x${nhod}${isWatchOnly?' [watch]':''}`);
+  console.log(`[ALERT] ↗ ${ticker} $${price.toFixed(4)} x${nhod}${isPermW?' [PERM]':isWatchOnly?' [watch]':''}`);
 
   // Fresh snapshot for live vol/rvol/chgPct
   const snap=await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
@@ -547,7 +573,7 @@ async function handleNewsItem(title,tickers,url,published_utc){
   const prVolMin = tier ? (tier.name==='MKT' ? 50_000 : 0) : 0;
 
   // Filter to only tickers we care about: current gappers, watchlist, or recent runners
-  const tracked=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys()]);
+  const tracked=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys(),...permanentWatch]);
   const filtered=tickers.filter(t=>tracked.has(t)||tickers.length===1).slice(0,3);
   if(!filtered.length) return;
 
@@ -655,7 +681,7 @@ async function checkFilings(){
   if(!isActive()) return;
   if(Date.now()-lastFilingCheck<2*60*1000) return;
   lastFilingCheck=Date.now();
-  const known=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys()]);
+  const known=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys(),...permanentWatch]);
   if(!known.size) return;
   const {timeStr}=getET();
   for(const ticker of known){
@@ -744,7 +770,7 @@ function connectPriceWS(){
           console.log(`[PriceWS] ${msg.status}: ${msg.message||''}`);
           if(msg.status==='auth_success'){
             subscribedTickers.clear();
-            const keys=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys()]);
+            const keys=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...permanentWatch]);
             const subs=[...keys].map(t=>`T.${t},A.${t}`).join(',');
             if(subs){ws.send(JSON.stringify({action:'subscribe',params:subs}));keys.forEach(t=>subscribedTickers.add(t));}
             console.log(`[PriceWS] Subscribed ${keys.size} (${topGappers.length} live + ${dayWatchlist.size} watch)`);
@@ -756,7 +782,8 @@ function connectPriceWS(){
           if(!price||!ticker) continue;
           const liveG=topGappers.find(x=>x.ticker===ticker);
           const watchG=dayWatchlist.get(ticker);
-          if(!liveG&&!watchG) continue;
+          const permW=permanentWatch.has(ticker);
+          if(!liveG&&!watchG&&!permW) continue;
           if(liveG&&(liveG.price>10||liveG.chgPct<5)) continue;
           const s=state.tickers.get(ticker);
           if(!s) continue;
@@ -969,6 +996,7 @@ async function main(){
     }
   }catch(e){}
 
+  loadPermanentWatchlist();
   await refreshEtfList();
   await refreshGappers();
   connectPriceWS();
@@ -977,9 +1005,11 @@ async function main(){
   await registerCommands();
 
   setInterval(async()=>{
+    // Reload watchlist.txt every 5 minutes to pick up edits without redeploying
+    if(Date.now()-lastWatchlistRead>5*60*1000){loadPermanentWatchlist();lastWatchlistRead=Date.now();}
     await refreshEtfList();
     await refreshGappers();
-    const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys()])].filter(t=>!subscribedTickers.has(t));
+    const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...permanentWatch])].filter(t=>!subscribedTickers.has(t));
     if(newT.length) subscribeNewTickers(newT);
     await pollNews();
     await pollFmpNews();
