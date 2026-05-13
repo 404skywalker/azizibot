@@ -110,7 +110,54 @@ function sleep(ms)   { return new Promise(r=>setTimeout(r,ms)); }
 function fmtN(n)     { if(!n||isNaN(n))return'--'; if(n>=1e9)return(n/1e9).toFixed(2)+'B'; if(n>=1e6)return(n/1e6).toFixed(2)+'M'; if(n>=1e3)return(n/1e3).toFixed(1)+'K'; return String(n); }
 function fmtRVol(r)  { if(!r||isNaN(r)||r===0)return'--'; if(r>=1000)return Math.round(r).toLocaleString()+'x'; if(r>=10)return r.toFixed(0)+'x'; return r.toFixed(1)+'x'; }
 function priceFlag(p){ if(p<0.50)return'<$.50c'; if(p<1)return'<$1'; if(p<2)return'<$2'; if(p<5)return'<$5'; return'<$10'; }
+function countryFlag(country){
+  if(!country) return'🇺🇸';
+  const c=country.toUpperCase();
+  const map={
+    'US':'🇺🇸','UNITED STATES':'🇺🇸',
+    'CN':'🇨🇳','CHINA':'🇨🇳','HK':'🇭🇰','HONG KONG':'🇭🇰',
+    'IL':'🇮🇱','ISRAEL':'🇮🇱',
+    'GB':'🇬🇧','UK':'🇬🇧','UNITED KINGDOM':'🇬🇧',
+    'CA':'🇨🇦','CANADA':'🇨🇦',
+    'AU':'🇦🇺','AUSTRALIA':'🇦🇺',
+    'DE':'🇩🇪','GERMANY':'🇩🇪',
+    'FR':'🇫🇷','FRANCE':'🇫🇷',
+    'JP':'🇯🇵','JAPAN':'🇯🇵',
+    'KR':'🇰🇷','SOUTH KOREA':'🇰🇷',
+    'IN':'🇮🇳','INDIA':'🇮🇳',
+    'BR':'🇧🇷','BRAZIL':'🇧🇷',
+    'SG':'🇸🇬','SINGAPORE':'🇸🇬',
+    'NL':'🇳🇱','NETHERLANDS':'🇳🇱',
+    'SE':'🇸🇪','SWEDEN':'🇸🇪',
+    'CH':'🇨🇭','SWITZERLAND':'🇨🇭',
+    'IE':'🇮🇪','IRELAND':'🇮🇪',
+    'ZA':'🇿🇦','SOUTH AFRICA':'🇿🇦',
+    'MX':'🇲🇽','MEXICO':'🇲🇽',
+    'RU':'🇷🇺','RUSSIA':'🇷🇺',
+    'TW':'🇹🇼','TAIWAN':'🇹🇼',
+    'NO':'🇳🇴','NORWAY':'🇳🇴',
+    'DK':'🇩🇰','DENMARK':'🇩🇰',
+    'FI':'🇫🇮','FINLAND':'🇫🇮',
+    'NZ':'🇳🇿','NEW ZEALAND':'🇳🇿',
+    'GR':'🇬🇷','GREECE':'🇬🇷',
+    'PT':'🇵🇹','PORTUGAL':'🇵🇹',
+    'ES':'🇪🇸','SPAIN':'🇪🇸',
+    'IT':'🇮🇹','ITALY':'🇮🇹',
+    'BE':'🇧🇪','BELGIUM':'🇧🇪',
+    'CY':'🇨🇾','CYPRUS':'🇨🇾',
+    'BM':'🇧🇲','BERMUDA':'🇧🇲',
+    'KY':'🇰🇾','CAYMAN ISLANDS':'🇰🇾',
+    'PA':'🇵🇦','PANAMA':'🇵🇦',
+    'MH':'🇲🇭','MARSHALL ISLANDS':'🇲🇭',
+  };
+  return map[c]||'🇺🇸';
+}
+
 function flag(ticker){
+  // Use FMP profile country if available (more accurate for foreign-listed stocks)
+  // Falls back to Polygon locale
+  const fmpCountry=fmpCountryMap.get(ticker);
+  if(fmpCountry) return countryFlag(fmpCountry);
   const c=countryMap.get(ticker);
   if(c==='IL')return'🇮🇱'; if(c==='CN')return'🇨🇳'; if(c==='GB')return'🇬🇧'; if(c==='CA')return'🇨🇦';
   return'🇺🇸';
@@ -205,7 +252,7 @@ async function refreshEtfList(){
 function isEtf(t){return etfSet.has(t);}
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
-const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map();
+const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map(), fmpCountryMap=new Map();
 
 async function getTickerDetails(ticker){
   const c=tickerCache.get(ticker);
@@ -225,6 +272,7 @@ async function getFmpProfile(ticker){
     const r=await fmpGet(`/api/v3/profile/${ticker}`);
     const data=(r&&r[0])||{};
     fmpProfileCache.set(ticker,{data,ts:Date.now()});
+    if(data.country) fmpCountryMap.set(ticker,data.country);
     return data;
   }catch(e){return {};}
 }
