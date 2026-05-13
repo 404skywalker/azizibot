@@ -28,7 +28,7 @@ const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1493985046074491060/PVM
 
 function getTier(etMin) {
   if(etMin>=240&&etMin<420)  return {name:'EARLY-PRE', minChg:10, minVol:0};
-  if(etMin>=420&&etMin<570)  return {name:'LATE-PRE',  minChg:20, minVol:0};
+  if(etMin>=420&&etMin<570)  return {name:'LATE-PRE',  minChg:10, minVol:0};
   if(etMin>=570&&etMin<960)  return {name:'MKT',       minChg:10, minVol:5_000_000};
   if(etMin>=960&&etMin<1200) return {name:"AH", minChg:10, minVol:500000};
   return null; // no alerts after 8PM
