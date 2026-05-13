@@ -577,10 +577,7 @@ async function fireNHOD(ticker,price){
   const volStr    = liveVol>0  ? ` | Vol: ${fmtN(liveVol)}` : '';
   const line = `${timeShort} ↗ **${ticker}** \`${priceFlag(price)}\`${pctPlain} · ${nhod}${afterStr}${greenStr2} ~ ${flag(ticker)}${rvolStr}${volStr}${regSHO}${rsStr}`;
 
-  await post({embeds:[{
-    color: isUp ? 0x26a641 : 0xe03e3e,
-    description: line,
-  }]});
+  await post({content:line});
   console.log(`[ALERT] posted OK`);
 }
 
