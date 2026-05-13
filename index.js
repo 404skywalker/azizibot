@@ -566,32 +566,13 @@ async function fireNHOD(ticker,price){
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
   const extraStr=extra?`\n> ${extra}`:'';
 
-  // B3 style — embed with colored sidebar, ticker large, dot-separated stats
-  const isUp    = livePct >= 0;
-  const arrow   = isUp ? '↗' : '↘';
-  const tags    = [sessLabel, afterLull?'after-lull':'', greenBars>=2?`${greenBars} green bars`:''].filter(Boolean).join(' · ');
-  const statsRow= [
-    mcLine?`MC ${fmtN(mc)}`:'',
-    liveRvol>0?`RVol ${fmtRVol(liveRvol)}`:'',
-    liveVol>0?`Vol ${fmtN(liveVol)}`:'',
-    fv.float!=='--'?`Float ${fv.float}`:'',
-    fv.si!=='--'?`SI ${fv.si}`:'',
-    fv.io!=='--'?`IO ${fv.io}`:'',
-    rs?rs:'',
-    regSHO?'Reg SHO':'',
-  ].filter(Boolean).join(' · ');
-
-  const desc = [
-    `${arrow} **${ticker}** **${pctStr}** · \`${priceFlag(price)}\` · ${flag(ticker)}${sectorStr}`,
-    tags?`${tags}`:'',
-    statsRow,
-  ].filter(Boolean).join('\n');
+  // Original NuntioBot-style structure + colored left sidebar
+  const isUp = livePct >= 0;
+  const line = `\`${timeStr}\` ↗ ${tLink} \`${priceFlag(price)}\` **${pctStr}** · ${sessLabel}${afterLull}${greenStr} ~ ${flag(ticker)}${mcLine} | RVol: ${fmtRVol(liveRvol)} | Vol: ${fmtN(liveVol)}${regSHO}${rsStr}${sectorStr}${extraStr}`;
 
   await post({embeds:[{
     color: isUp ? 0x26a641 : 0xe03e3e,
-    description: desc,
-    footer:{text:`${timeStr} ET`},
-    timestamp: new Date().toISOString(),
+    description: line,
   }]});
   console.log(`[ALERT] posted OK`);
 }
