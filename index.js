@@ -419,7 +419,7 @@ async function refreshGappers(){
     const newGappers=[...merge.values()].filter(t=>{
       if(t.chgPct <minChg)    {rej.pct++; return false;}
       if(t.price  <0.10)      {rej.pl++;  return false;}
-      if(t.price  >10)        {rej.ph++;  return false;}
+      if(t.price  >10&&t.chgPct<100){rej.ph++;return false;} // allow >$10 if ≥100% gain
       if(minVol>0&&t.volume<minVol){rej.vol++;return false;}
       if(t.isOTC)             {rej.otc++; return false;}
       if(isEtf(t.ticker))     {rej.etf++; return false;}
@@ -482,7 +482,7 @@ async function fireNHOD(ticker,price){
   if(price<=s.high+0.001) {console.log(`[NHOD] ${ticker} skip: $${price.toFixed(4)} not above high $${s.high.toFixed(4)}`);return;}
 
   const {etMin,timeStr}=getET();
-  if(price>10)   {console.log(`[NHOD] ${ticker} skip: >$10`);return;}
+  if(price>10&&gapper.chgPct<100) {console.log(`[NHOD] ${ticker} skip: >$10 (chg ${gapper.chgPct.toFixed(0)}%<100%)`);return;}
   if(price<0.10) {console.log(`[NHOD] ${ticker} skip: <$0.10`);return;}
 
   // All tickers must pass session tier gates (permanentWatch = same as watchlist)
@@ -714,7 +714,8 @@ async function pollFmpNews(){
   lastFmpPoll=Date.now();
   try{
     const r=await fmpGet('/api/v3/stock_news?limit=50');
-    const items=(r)||[],cutoff=Date.now()-15*60*1000;
+    if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,100));return;}
+    const items=r,cutoff=Date.now()-15*60*1000;
     let matched=0;
     for(const n of items){
       if(!n.publishedDate||new Date(n.publishedDate).getTime()<cutoff) continue;
