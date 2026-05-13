@@ -612,7 +612,12 @@ async function handleNewsItem(title,tickers,url,published_utc){
     const td=snap&&snap.ticker;
     const vol=(td&&td.day&&td.day.v)||0;
     const price=(td&&td.lastTrade&&td.lastTrade.p)||(td&&td.day&&td.day.c)||0;
-    if(!td||vol<prVolMin||price<0.10) continue; // no upper price limit for news
+    // Only fire for stocks under $30 and in our tracked universe
+    const isTracked = topGappers.some(g=>g.ticker===ticker)
+                   || dayWatchlist.has(ticker)
+                   || recentRunners.has(ticker)
+                   || permanentWatch.has(ticker);
+    if(!td||vol<prVolMin||price<0.10||price>30||!isTracked) continue;
 
     const [det,fv,prof]=await Promise.all([getTickerDetails(ticker),getFinvizStats(ticker),getFmpProfile(ticker)]);
     const mc      = det.market_cap||0;
