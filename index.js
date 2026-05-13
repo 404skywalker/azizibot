@@ -452,7 +452,8 @@ async function refreshGappers(){
       // New ticker (ex.high===0): init from day.h to prevent false PMH hours after real peak
       // Existing ticker: keep max of current price and WS-tracked high
       const initHigh = ex.high>0 ? Math.max(g.price,ex.high) : Math.max(g.price,g.dayHigh||0);
-      state.tickers.set(g.ticker,{...ex,...g,high:initHigh});
+      const peakVol = Math.max(g.volume||0, ex.peakVol||0);
+      state.tickers.set(g.ticker,{...ex,...g,high:initHigh,peakVol});
     }
     for(const [ticker,g] of dayWatchlist){
       if(!state.tickers.has(ticker))
@@ -490,8 +491,10 @@ async function fireNHOD(ticker,price){
   // All tickers must pass session tier gates (permanentWatch = same as watchlist)
   const tier=getTier(etMin);
   if(!tier) return;
-  if(tier.minVol>0&&gapper.volume<tier.minVol){
-    console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(gapper.volume)}<${fmtN(tier.minVol)}`);return;
+  // Use best available volume — full day peakVol beats stale gapper.volume
+  const checkVol = Math.max(gapper.volume||0, s.peakVol||0);
+  if(tier.minVol>0&&checkVol<tier.minVol){
+    console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(checkVol)}<${fmtN(tier.minVol)}`);return;
   }
   // In AH: measure move from 4PM close price, not all-day chgPct.
   // Require ≥5% above 4PM close to confirm a real AH move.
@@ -715,7 +718,7 @@ async function pollFmpNews(){
   if(Date.now()-lastFmpPoll<8000) return;
   lastFmpPoll=Date.now();
   try{
-    const r=await fmpGet('/api/v3/stock_news?limit=50');
+    const r=await fmpGet('/api/v4/stock-news-sentiments-rss-feed?page=0');
     if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,100));return;}
     const items=r,cutoff=Date.now()-15*60*1000;
     let matched=0;
