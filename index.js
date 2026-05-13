@@ -524,8 +524,8 @@ async function fireNHOD(ticker,price){
 }
 
 // ─── News / PR alerts ─────────────────────────────────────────────────────────
-const DROP_RE =/offering|public offering|convertible|shelf|ATM offering|at-the-market|direct offering|registered direct|dilut|warrant|prospectus|424B|S-1|S-3|secondary offering|note offering|senior notes|debenture|equity financ/i;
-const SPIKE_RE=/collaboration|agreement|partnership|FDA|approval|cleared|grant|award|contract|trial|data|results|positive|breakthrough|milestone|license|acqui|merger|acquisition|joint venture|phase|cohort|study|efficacy|safety/i;
+const DROP_RE =/offering|public offering|convertible|shelf|ATM offering|at-the-market|direct offering|registered direct|dilut|warrant|prospectus|424B|S-1|S-3|secondary offering|note offering|senior notes|debenture|equity financ|private placement|underwritten|priced offering|prices offering/i;
+const SPIKE_RE=/collaboration|agreement|partnership|FDA|approval|cleared|grant|award|contract|trial|data|results|positive|breakthrough|milestone|license|acqui|merger|acquisition|joint venture|\bJV\b|phase|cohort|study|efficacy|safety|quarterly|financial results|earnings|revenue|guidance|raises|secures|closes|signs|launches|wins|receives|completes|announces/i;
 
 async function handleNewsItem(title,tickers,url,published_utc){
   if(!title||!tickers.length) return;
@@ -633,29 +633,35 @@ async function pollNews(){
   try{
     const r=await polyGet('/v2/reference/news?limit=50&order=desc&sort=published_utc');
     const items=(r&&r.results)||[],cutoff=Date.now()-15*60*1000;
+    let matched=0;
     for(const n of items){
       if(!n.published_utc||new Date(n.published_utc).getTime()<cutoff) continue;
       await handleNewsItem(n.title||'',(n.tickers||[]).filter(Boolean).map(t=>t.toUpperCase()),n.article_url||'',n.published_utc);
+      matched++;
     }
-  }catch(e){}
+    if(matched>0) console.log(`[Poly News] ${matched} items processed`);
+  }catch(e){console.error('[Poly News] error:',e.message);}
 }
 
 // ─── FMP news poll ───────────────────────────────────────────────────────────
 let lastFmpPoll=0;
 async function pollFmpNews(){
   if(!isActive()||!FMP_KEY) return;
-  if(Date.now()-lastFmpPoll<8000) return; // offset from Polygon poll (5s) → every 8s
+  if(Date.now()-lastFmpPoll<8000) return;
   lastFmpPoll=Date.now();
   try{
     const r=await fmpGet('/api/v3/stock_news?limit=50');
     const items=(r)||[],cutoff=Date.now()-15*60*1000;
+    let matched=0;
     for(const n of items){
       if(!n.publishedDate||new Date(n.publishedDate).getTime()<cutoff) continue;
       const ticker=(n.symbol||'').toUpperCase();
       if(!ticker) continue;
       await handleNewsItem(n.title||'',[ticker],n.url||'',n.publishedDate);
+      matched++;
     }
-  }catch(e){}
+    if(matched>0) console.log(`[FMP News] ${matched} items processed`);
+  }catch(e){console.error('[FMP News] error:',e.message);}
 }
 
 // ─── SEC filings ──────────────────────────────────────────────────────────────
