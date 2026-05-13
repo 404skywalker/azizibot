@@ -587,7 +587,7 @@ async function handleNewsItem(title,tickers,url,published_utc){
     const td=snap&&snap.ticker;
     const vol=(td&&td.day&&td.day.v)||0;
     const price=(td&&td.lastTrade&&td.lastTrade.p)||(td&&td.day&&td.day.c)||0;
-    if(!td||vol<prVolMin||price<0.10||price>10) continue;
+    if(!td||vol<prVolMin||price<0.10) continue; // no upper price limit for news
 
     const [det,fv,prof]=await Promise.all([getTickerDetails(ticker),getFinvizStats(ticker),getFmpProfile(ticker)]);
     const mc      = det.market_cap||0;
@@ -603,28 +603,20 @@ async function handleNewsItem(title,tickers,url,published_utc){
     const ageStr = ageMs<60000?`${Math.round(ageMs/1000)}s`:ageMs<3600000?`${Math.round(ageMs/60000)}m`:`${Math.round(ageMs/3600000)}h`;
 
     const arrow   = isDrop ? '↓' : '↑';
-    const typeLabel= isDrop ? 'PR Drop' : 'PR Spike';
-    const tLink    = url?`[**${ticker}**](<${url}>)`:`**${ticker}**`;
+    const typeTag  = isDrop ? 'PR Drop' : 'PR';
+    const tLink    = `**${ticker}**`;
     const chgStr   = chgPct!==0?` \`${chgPct>=0?'+':''}${chgPct.toFixed(1)}%\``:'';
     const mcStr    = mc>0?` | MC: ${fmtN(mc)}`:'';
-    const volStr   = vol>0?` | Vol: ${fmtN(vol)}`:'';
-    const rvolStr  = rvol>0?` | RVol: ${fmtRVol(rvol)}`:'';
+    const ioStr2   = fv.io!=='--'?` | IO: ${fv.io}`:'';
     const sectStr  = sector?`\n> ${sector}${industry?` · ${industry}`:''}` :'';
-    const statsLine= [fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
+    const statsLine= [fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:''].filter(Boolean).join(' | ');
 
-    const header  = `\`${timeStr}\` ${arrow} ${tLink} \`${priceFlag(price)}\`${chgStr} ~ ${flag(ticker)}${mcStr}${volStr}${rvolStr}`;
-    const newsLine= `• ${ageStr} ago [${typeLabel}] ${title.slice(0,220)}${url?` — [Link](<${url}>)`:''}`;
+    // NuntioBot-style: ticker header + news bullet
+    const header  = `\`${timeStr}\` ${arrow} ${tLink} \`${priceFlag(price)}\`${chgStr} ~ ${flag(ticker)}${mcStr}${ioStr2}`;
+    const bullet  = `• ${ageStr} ago \`${typeTag}\` ${title.slice(0,200)}${url?` — [Link](<${url}>)`:''}`;
     const extra   = statsLine?`\n> ${statsLine}`:'';
 
-    const embed = {
-      embeds:[{
-        color: isDrop ? 0xe03e3e : 0x26a641,
-        description: `${header}\n${newsLine}${sectStr}${extra}`,
-        footer:{text:`AziziBot · ${tier?.name||''}`},
-        timestamp: new Date().toISOString(),
-      }]
-    };
-    await post(embed);
+    await post({content:`${header}\n${bullet}${sectStr}${extra}`});
     console.log(`[${timeStr}] ${isDrop?'PR-DROP':'PR-SPIKE'}: ${ticker}`);
   }
   if(state.sentNews.size>500){const a=[...state.sentNews];state.sentNews.clear();a.slice(-200).forEach(x=>state.sentNews.add(x));}
