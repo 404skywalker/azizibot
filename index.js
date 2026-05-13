@@ -718,7 +718,7 @@ async function pollFmpNews(){
   if(Date.now()-lastFmpPoll<8000) return;
   lastFmpPoll=Date.now();
   try{
-    const r=await fmpGet('/api/v4/stock-news-sentiments-rss-feed?page=0');
+    const r=await fmpGet('/api/v3/stock_news?limit=50&page=0');
     if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,100));return;}
     const items=r,cutoff=Date.now()-15*60*1000;
     let matched=0;
@@ -770,8 +770,13 @@ async function checkFilings(){
 let lastTransitionSync = 0;
 async function syncHighsAtTransition() {
   const {etMin} = getET();
-  if(etMin < 960 || etMin > 975) return; // 4:00–4:15PM window
+  // Run if in AH window (4-8PM) AND close prices not yet captured
+  const inAH = etMin >= 960 && etMin < 1200;
+  if(!inAH) return;
   if(Date.now() - lastTransitionSync < 60*60*1000) return;
+  // Also run immediately if close prices are missing (e.g. deployment after 4PM)
+  const missingClose = [...dayWatchlist.keys()].some(t=>!closePrice.has(t));
+  if(!missingClose && etMin > 975) return; // outside normal window and all captured
   lastTransitionSync = Date.now();
 
   const tickers = [...new Set([...topGappers.map(g=>g.ticker), ...dayWatchlist.keys()])];
