@@ -1275,6 +1275,177 @@ async function checkFilings(){
   }
 }
 
+// ─── Halt + Resume alerts (NASDAQ RSS) ────────────────────────────────────────
+// NASDAQ Trader publishes a free, real-time RSS feed of all US equity trade
+// halts and resumes — the same source most halt scanners use. We poll every
+// 30s, parse XML, and fire alerts on:
+//   - new halts: tracked tickers OR small-caps under $20 (catches new movers)
+//   - resumes: when the scheduled resume time has passed
+// User directive 2026-05-14: alert on trader-relevant codes only.
+const HALT_ALERT_CODES = new Set(['T1','T2','T5','T12','LUDP','H10','H11']);
+const HALT_REASON = {
+  'T1':  'News Pending',
+  'T2':  'News Released',
+  'T5':  'Volatility Trading Pause',
+  'T12': 'Information Requested',
+  'LUDP':'Volatility Trading Pause',
+  'H10': 'SEC Trading Suspension',
+  'H11': 'Regulatory Concern',
+};
+
+// haltState: composite key → {ticker, code, reason, haltedAt, resumeAt, resumeTimeOriginal, alertedHalt, alertedResume}
+const haltState = new Map();
+let lastHaltPoll = 0;
+
+// Parse "MM/DD/YYYY" + "HH:MM:SS" (NASDAQ publishes everything in ET) into
+// UTC ms for comparison with Date.now(). DST handled approximately — sub-day
+// drift is irrelevant for halt-recency math.
+function parseEtToUtcMs(dateStr, timeStr){
+  if(!dateStr || !timeStr) return 0;
+  try {
+    const [mm, dd, yyyy] = dateStr.split('/').map(Number);
+    const [h, m, s] = timeStr.split(':').map(Number);
+    if(!yyyy || isNaN(h)) return 0;
+    const utcWall = Date.UTC(yyyy, mm-1, dd, h, m||0, s||0);
+    // US Eastern DST: 2nd Sun Mar → 1st Sun Nov. Approximation good to ±a week.
+    const isDST = (mm > 3 && mm < 11) || (mm === 3 && dd >= 14) || (mm === 11 && dd < 7);
+    return utcWall + (isDST ? 4 : 5) * 3600 * 1000;
+  } catch(e){ return 0; }
+}
+
+async function pollHalts(){
+  if(Date.now() - lastHaltPoll < 30_000) return;
+  lastHaltPoll = Date.now();
+  try {
+    const xml = await rawGet('https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts', {
+      'User-Agent': 'AziziBot/1.0',
+      'Accept': 'application/rss+xml, text/xml, */*',
+    });
+    if(!xml || xml.length < 200) return;
+    const items = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
+    let newHalts = 0, dueResumes = 0;
+
+    for(const itemXml of items){
+      const grab = (re) => { const x = itemXml.match(re); return x ? x[1].trim() : ''; };
+      const ticker = grab(/<ndaq:IssueSymbol[^>]*>([^<]+)<\/ndaq:IssueSymbol>/i).toUpperCase();
+      const code = grab(/<ndaq:ReasonCode[^>]*>([^<]+)<\/ndaq:ReasonCode>/i).toUpperCase();
+      if(!ticker || !code) continue;
+      if(!HALT_ALERT_CODES.has(code)) continue;
+
+      const haltDate   = grab(/<ndaq:HaltDate[^>]*>([^<]+)<\/ndaq:HaltDate>/i);
+      const haltTime   = grab(/<ndaq:HaltTime[^>]*>([^<]+)<\/ndaq:HaltTime>/i);
+      const resumeDate = grab(/<ndaq:ResumptionDate[^>]*>([^<]+)<\/ndaq:ResumptionDate>/i);
+      const resumeTime = grab(/<ndaq:ResumptionTradeTime[^>]*>([^<]+)<\/ndaq:ResumptionTradeTime>/i)
+                       || grab(/<ndaq:ResumptionQuoteTime[^>]*>([^<]+)<\/ndaq:ResumptionQuoteTime>/i);
+
+      const haltedAt = parseEtToUtcMs(haltDate, haltTime);
+      const resumeAt = parseEtToUtcMs(resumeDate, resumeTime);
+      const key = `${ticker}_${haltDate}_${haltTime}`;
+      let st = haltState.get(key);
+
+      if(!st){
+        st = {
+          ticker, code,
+          reason: HALT_REASON[code] || `Code ${code}`,
+          haltedAt: haltedAt || Date.now(),
+          resumeAt,
+          resumeTimeOriginal: resumeTime,
+          alertedHalt: false,
+          alertedResume: false,
+        };
+        haltState.set(key, st);
+      } else if(resumeAt > 0 && !st.resumeAt){
+        // Resume time was just announced — store it but don't re-alert on halt
+        st.resumeAt = resumeAt;
+        st.resumeTimeOriginal = resumeTime;
+      }
+
+      // Halt alert (once per halt event)
+      if(!st.alertedHalt){
+        const should = await shouldAlertHalt(ticker);
+        if(should){
+          await fireHaltAlert(st);
+          newHalts++;
+        }
+        st.alertedHalt = true; // mark even if we didn't alert, to avoid re-checking
+      }
+
+      // Resume alert (only if we previously alerted on the halt AND scheduled time has passed)
+      if(st.alertedHalt && st.resumeAt > 0 && !st.alertedResume && Date.now() >= st.resumeAt){
+        await fireResumeAlert(st);
+        st.alertedResume = true;
+        dueResumes++;
+      }
+    }
+
+    if(newHalts || dueResumes) {
+      console.log(`[Halts] ${newHalts} halt(s), ${dueResumes} resume(s)`);
+    }
+    // Prune entries older than 24h
+    const cutoff = Date.now() - 24*60*60*1000;
+    for(const [k, st] of haltState){
+      if((st.haltedAt || 0) < cutoff) haltState.delete(k);
+    }
+  } catch(e){
+    console.error('[Halts] error:', e.message);
+  }
+}
+
+// Tracked tickers always alert. Untracked: only small-caps under $20 (catches new movers).
+async function shouldAlertHalt(ticker){
+  if(topGappers.some(g => g.ticker === ticker) ||
+     dayWatchlist.has(ticker) ||
+     permanentWatch.has(ticker)){
+    return true;
+  }
+  if(isBadTicker(ticker) || isEtf(ticker)) return false;
+  try {
+    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    const td = snap && snap.ticker;
+    if(!td) return false;
+    const isOTC = /OTC|GREY|PINK|EXPERT/i.test(td.primaryExchange || '');
+    if(isOTC) return false;
+    const price = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || 0;
+    return price > 0.10 && price < 20;
+  } catch(e){ return false; }
+}
+
+async function fireHaltAlert(st){
+  const {ticker, code, reason, resumeTimeOriginal} = st;
+  const {timeStr} = getET();
+  const timeShort = timeStr.slice(0, 5);
+  let priceStr = '';
+  try {
+    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    const td = snap && snap.ticker;
+    const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
+    if(price > 0) priceStr = ` ${priceFlag(price)}`;
+  } catch(e){}
+  const resumeNote = resumeTimeOriginal ? ` | Resume: ${resumeTimeOriginal.slice(0,5)} ET` : '';
+  const line = `\`${timeShort}\` 🛑 **${ticker}**${priceStr} ~ ${flag(ticker)} | \`HALT\` \`${code}\` — ${reason}${resumeNote}`;
+  await post({content: line});
+  console.log(`[Halt] 🛑 ${ticker} ${code} ${reason}`);
+}
+
+async function fireResumeAlert(st){
+  const {ticker, code, haltedAt, resumeAt} = st;
+  const {timeStr} = getET();
+  const timeShort = timeStr.slice(0, 5);
+  const durMs = Math.max(0, resumeAt - haltedAt);
+  const durMin = Math.round(durMs / 60_000);
+  let priceStr = '';
+  try {
+    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    const td = snap && snap.ticker;
+    const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
+    if(price > 0) priceStr = ` ${priceFlag(price)}`;
+  } catch(e){}
+  const durStr = durMin > 0 ? ` after ${durMin}min halt` : '';
+  const line = `\`${timeShort}\` ▶️ **${ticker}**${priceStr} ~ ${flag(ticker)} | \`RESUMED\`${durStr} (\`${code}\`)`;
+  await post({content: line});
+  console.log(`[Halt] ▶️ ${ticker} resumed (${code})`);
+}
+
 // ─── Session transition sync ──────────────────────────────────────────────────
 // At 4PM (MKT→AH), capture the closing price for every tracked ticker.
 // AH alerts only fire if price is ≥5% above the 4PM close price.
@@ -1688,6 +1859,7 @@ async function main(){
     const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...permanentWatch])].filter(t=>!subscribedTickers.has(t));
     if(newT.length) subscribeNewTickers(newT);
     await pollNews();
+    await pollHalts();
     await syncHighsAtTransition(); // capture 4PM close prices within 20s
   },20*1000);
 
