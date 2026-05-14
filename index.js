@@ -169,14 +169,85 @@ function countryFlag(country){
   return map[c]||'🇺🇸';
 }
 
+// ─── Foreign ticker overrides ────────────────────────────────────────────────
+// FMP and Polygon both have data quality issues with ADRs — they often return
+// `country: "US"` for Chinese, Israeli, etc. companies listed on US exchanges.
+// This manual map is checked FIRST in flag(), highest confidence.
+// To add: TICKER: 'CC' where CC is the ISO-3166-1 alpha-2 country code.
+// To extend in production without redeploying, move this to foreign_tickers.txt
+// (similar to watchlist.txt) — happy to wire that up if the list grows large.
+const FOREIGN_TICKER_OVERRIDES = {
+  // China
+  'BABA':'CN','BIDU':'CN','NIO':'CN','XPEV':'CN','LI':'CN','JD':'CN','PDD':'CN',
+  'NTES':'CN','IQ':'CN','BILI':'CN','TAL':'CN','EDU':'CN','TIGR':'CN','FUTU':'CN',
+  'MOMO':'CN','HUYA':'CN','VIPS':'CN','TME':'CN','LU':'CN','LX':'CN','FINV':'CN',
+  'YRD':'CN','MNSO':'CN','DAO':'CN','ATAT':'CN','GOTU':'CN','ZH':'CN','VNET':'CN',
+  'KC':'CN','BZUN':'CN','NOAH':'CN','JKS':'CN','CSIQ':'CN','EH':'CN','KNDI':'CN',
+  'ZLAB':'CN','ZTO':'CN','BEKE':'CN','TUYA':'CN','GDS':'CN','HCM':'CN','JOYY':'CN',
+  'NIU':'CN','QFIN':'CN','TCOM':'CN','WB':'CN','XIN':'CN','XYF':'CN','CREG':'CN',
+  'CETX':'CN','CHEK':'CN','FAMI':'CN','FENG':'CN','GLBR':'CN','SDH':'CN','DQ':'CN',
+  'NWTN':'CN','TC':'CN','TIRX':'CN','WIMI':'CN','YQ':'CN','ZW':'CN','LIZI':'CN',
+  'MEGL':'CN','MGRX':'CN','TANH':'CN','AIH':'CN','ATIF':'CN','CMCM':'CN','GHG':'CN',
+  'GSUN':'CN','JFIN':'CN','NCTY':'CN','DDL':'CN','OPRT':'CN','BZ':'CN','LXEH':'CN',
+  'DOYU':'CN','SOL':'CN','EZGO':'CN','TWND':'CN','SY':'CN','ZJYL':'CN','LOBO':'CN',
+  // Hong Kong
+  'PNGAY':'HK','LFC':'HK','CHL':'HK','LI':'CN',
+  // Israel
+  'NRSN':'IL','TEVA':'IL','CHKP':'IL','NICE':'IL','MNDY':'IL','WIX':'IL','SOLY':'IL',
+  'CYBR':'IL','RDWR':'IL','TARO':'IL','TOMI':'IL','GRWG':'IL','ELBT':'IL','PLTK':'IL',
+  'CMCT':'IL','MTNB':'IL','NVMI':'IL','SLDB':'IL','GLBE':'IL','BVS':'IL','MNTS':'IL',
+  // United Kingdom
+  'ARM':'GB','BP':'GB','HSBC':'GB','SHEL':'GB','UL':'GB','AZN':'GB','GSK':'GB',
+  'RIO':'GB','BCS':'GB','LYG':'GB','VOD':'GB',
+  // Canada
+  'SHOP':'CA','BNS':'CA','TD':'CA','BMO':'CA','CM':'CA','RY':'CA','ENB':'CA',
+  'TRP':'CA','CNQ':'CA','CVE':'CA','SU':'CA','ABX':'CA','AEM':'CA','CNI':'CA',
+  'WCN':'CA','MFC':'CA','GIB':'CA','OTEX':'CA','BCE':'CA','TRI':'CA',
+  // Singapore
+  'SE':'SG','GRAB':'SG','ATAT':'SG','GHG':'SG',
+  // Brazil
+  'VALE':'BR','ITUB':'BR','PBR':'BR','ABEV':'BR','BBD':'BR','GGB':'BR','ERJ':'BR',
+  'NU':'BR','XP':'BR','PAGS':'BR','STNE':'BR',
+  // India
+  'INFY':'IN','WIT':'IN','HDB':'IN','IBN':'IN','SIFY':'IN','RDY':'IN','TTM':'IN',
+  // Japan
+  'TM':'JP','HMC':'JP','SONY':'JP','MUFG':'JP','MFG':'JP','NMR':'JP','NTT':'JP',
+  // Korea
+  'KB':'KR','SHG':'KR','KEP':'KR','LPL':'KR',
+  // Taiwan
+  'TSM':'TW','UMC':'TW','ASX':'TW',
+  // Ireland
+  'RYAAY':'IE','GMAB':'IE','SHPG':'IE','PRGO':'IE','SMMT':'IE',
+  // Netherlands
+  'ASML':'NL','NXPI':'NL','ING':'NL','PHG':'NL','RDS':'NL',
+  // Germany
+  'SAP':'DE','PSO':'DE','BAYRY':'DE','SIEGY':'DE',
+  // France
+  'TTE':'FR','SNY':'FR','LVMUY':'FR',
+  // Switzerland
+  'NVS':'CH','ROG':'CH','UBS':'CH','NESN':'CH','ABBN':'CH',
+  // Sweden
+  'ERIC':'SE','SPOT':'SE','VOLV':'SE',
+  // Australia
+  'BHP':'AU','RIO':'AU','TLS':'AU',
+  // Mexico
+  'AMX':'MX','FMX':'MX','KOF':'MX',
+  // Argentina
+  'YPF':'AR','GGAL':'AR','PAM':'AR','TEO':'AR',
+};
+
 function flag(ticker){
-  // Use FMP profile country if available (more accurate for foreign-listed stocks)
-  // Falls back to Polygon locale
-  const fmpCountry=fmpCountryMap.get(ticker);
+  if(!ticker) return '🇺🇸';
+  // 1) Manual override map — highest confidence, used to fix FMP/Polygon ADR data quality issues
+  const ov = FOREIGN_TICKER_OVERRIDES[ticker];
+  if(ov) return countryFlag(ov);
+  // 2) FMP profile country (accurate for most non-ADR foreign companies)
+  const fmpCountry = fmpCountryMap.get(ticker);
   if(fmpCountry) return countryFlag(fmpCountry);
-  const c=countryMap.get(ticker);
+  // 3) Polygon locale (least granular — only knows US vs global)
+  const c = countryMap.get(ticker);
   if(c==='IL')return'🇮🇱'; if(c==='CN')return'🇨🇳'; if(c==='GB')return'🇬🇧'; if(c==='CA')return'🇨🇦';
-  return'🇺🇸';
+  return '🇺🇸';
 }
 function isBadTicker(t) {
   if(!t||t.length<2)return true;
@@ -347,7 +418,7 @@ function isRegSHO(ticker){ return regSHOSet.has((ticker||'').toUpperCase()); }
 
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
-const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map(), fmpCountryMap=new Map(), ctbCache=new Map();
+const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map(), fmpCountryMap=new Map(), ctbCache=new Map(), fmpFloatCache=new Map();
 
 async function getTickerDetails(ticker){
   const c=tickerCache.get(ticker);
@@ -365,19 +436,22 @@ async function getFmpProfile(ticker){
   if(c&&Date.now()-c.ts<12*60*60*1000) return c.data;
   if(!FMP_KEY){fmpProfileCache.set(ticker,{data:{},ts:Date.now()});return {};}
   try{
-    // FMP profile endpoint is on v3, NOT v4. v4 returns an error object.
-    const r=await fmpGet(`/api/v3/profile/${ticker}`);
-    if(!r||!Array.isArray(r)||!r[0]){
+    // FMP migrated to /stable/ namespace. With Ultimate plan's Global Coverage,
+    // this endpoint returns correct HQ country for foreign ADRs (vs v3 which often
+    // misreported as US). Still cross-checked against FOREIGN_TICKER_OVERRIDES.
+    const r=await fmpGet(`/stable/profile?symbol=${ticker}`);
+    const arr = Array.isArray(r) ? r : (r ? [r] : []);
+    if(!arr[0]){
       console.log(`[FMP Profile] ${ticker}: bad response → ${JSON.stringify(r)?.slice(0,120)}`);
-      // Short-cache failures (1h) so we retry; long-cache successes (12h).
       fmpProfileCache.set(ticker,{data:{},ts:Date.now()-11*60*60*1000});
       return {};
     }
-    const data=r[0];
+    const data=arr[0];
     fmpProfileCache.set(ticker,{data,ts:Date.now()});
     if(data.country){
       fmpCountryMap.set(ticker,data.country);
-      console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)} | sector: ${data.sector||'--'}`);
+      const adrTag = data.isAdr ? ' [ADR]' : '';
+      console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)}${adrTag} | sector: ${data.sector||'--'}`);
     } else {
       console.log(`[Flag] ${ticker}: no country field (sector=${data.sector||'--'}, exchange=${data.exchangeShortName||'--'})`);
     }
@@ -408,16 +482,52 @@ async function getRecentSplit(ticker){
   }catch(e){}
   return null;
 }
+// FMP shares-float endpoint (Ultimate plan) — reliable structured data,
+// replaces fragile Finviz HTML scraping for float. Cached 12h.
+async function getFmpFloat(ticker){
+  if(!FMP_KEY) return null;
+  const c=fmpFloatCache.get(ticker);
+  if(c&&Date.now()-c.ts<12*60*60*1000) return c.data;
+  try{
+    const r=await fmpGet(`/stable/shares-float?symbol=${ticker}`);
+    const arr=Array.isArray(r)?r:(r?[r]:[]);
+    if(!arr[0]){
+      fmpFloatCache.set(ticker,{data:null,ts:Date.now()-11*60*60*1000});
+      return null;
+    }
+    const d=arr[0];
+    const data={
+      floatShares: +d.floatShares || +d.freeFloat || 0,
+      outstandingShares: +d.outstandingShares || 0,
+      date: d.date || '',
+    };
+    fmpFloatCache.set(ticker,{data,ts:Date.now()});
+    return data;
+  }catch(e){
+    console.error(`[FMP Float] ${ticker} error:`,e.message);
+    return null;
+  }
+}
+
 async function getFinvizStats(ticker){
   const r={si:'--',float:'--',io:'--'};
+  // Try FMP for float first (Ultimate plan — much more reliable than HTML scrape)
+  const fmpFloat=await getFmpFloat(ticker);
+  if(fmpFloat && fmpFloat.floatShares > 0){
+    r.float = fmtNS(fmpFloat.floatShares).trim();
+  }
+  // Finviz still needed for SI and IO (FMP doesn't have SI; IO would need 13F aggregation)
   try{
     const html=await rawGet(`https://finviz.com/quote.ashx?t=${ticker}`,{
       'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept':'text/html','Accept-Language':'en-US,en;q=0.5'
     });
     if(html.length>1000){
-      const fm=html.match(/Shs Float<\/b><\/td>\s*<td[^>]*>([^<]+)<\/td>/i)||html.match(/Shs Float[^<]*<\/td>[^<]*<td[^>]*>([^<]+)<\/td>/i);
-      if(fm&&fm[1]&&fm[1]!=='-') r.float=fm[1].trim();
+      // Only fall back to Finviz float if FMP didn't provide one
+      if(r.float==='--'){
+        const fm=html.match(/Shs Float<\/b><\/td>\s*<td[^>]*>([^<]+)<\/td>/i)||html.match(/Shs Float[^<]*<\/td>[^<]*<td[^>]*>([^<]+)<\/td>/i);
+        if(fm&&fm[1]&&fm[1]!=='-') r.float=fm[1].trim();
+      }
       const sm=html.match(/Short Float[^<]*<\/b><\/td>\s*<td[^>]*>([\d.]+%?)<\/td>/i)||html.match(/Short Float[^<]*<\/td>[^<]*<td[^>]*>([\d.]+%?)<\/td>/i);
       if(sm&&sm[1]&&sm[1]!=='-') r.si=sm[1].includes('%')?sm[1].trim():sm[1].trim()+'%';
       const im=html.match(/Inst Own[^<]*<\/b><\/td>\s*<td[^>]*>([\d.]+%?)<\/td>/i)||html.match(/Inst Own[^<]*<\/td>[^<]*<td[^>]*>([\d.]+%?)<\/td>/i);
@@ -484,7 +594,7 @@ async function getCTB(ticker){
 // ─── State ────────────────────────────────────────────────────────────────────
 let topGappers=[];
 const dayWatchlist=new Map();
-const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set()};
+const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),sentInsider:new Set(),sentGrades:new Set(),morningPosted:new Set()};
 const wsDebounce=new Map();
 const closePrice=new Map(); // ticker → price at 4PM close
 // recentRunners: tickers that qualified as gappers in the last 5 days
@@ -495,43 +605,18 @@ const recentRunners=new Map(); // ticker → timestamp when last seen as gapper
 const permanentWatch=new Set();
 let lastWatchlistRead=0;
 
-// ─── Event aggregation queue ─────────────────────────────────────────────────
-// PR/SEC events for the same ticker arriving within EVENT_BUFFER_MS get batched
-// into a single Discord message with multiple bullets (matches NuntioBot exactly).
-// Solo events still post — they just wait briefly in case a paired event arrives.
-const EVENT_BUFFER_MS = 15_000;
-const eventQueue = new Map(); // ticker → { events: [], timer: timeoutId }
-
-function queueAlertEvent(ticker, event) {
-  let q = eventQueue.get(ticker);
-  if (!q) {
-    q = { events: [], timer: null };
-    eventQueue.set(ticker, q);
-  }
-  q.events.push(event);
-  if (!q.timer) {
-    q.timer = setTimeout(
-      () => flushAlertEvents(ticker).catch(e => console.error(`[flush] ${ticker}:`, e.message)),
-      EVENT_BUFFER_MS
-    );
-  }
-  console.log(`[Queue] ${ticker} +${event.type} (total ${q.events.length}, flush in ${EVENT_BUFFER_MS/1000}s)`);
-}
-
-async function flushAlertEvents(ticker) {
-  const q = eventQueue.get(ticker);
-  if (!q || q.events.length === 0) { eventQueue.delete(ticker); return; }
-  const events = q.events;
-  eventQueue.delete(ticker);
-
+// ─── Instant event alert ─────────────────────────────────────────────────────
+// Posts a single header+bullet message immediately. No buffering, no aggregation.
+// All event types (PR, SEC, INSIDER, GRADE) share this format and gate set.
+async function postEventAlert(ticker, event) {
   // Fresh snapshot for header
   const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
   const td = snap && snap.ticker;
   const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
-  if (price < 0.10) { console.log(`[flush] ${ticker} skip: price ${price}`); return; }
+  if (price < 0.10) { console.log(`[Alert] ${ticker} skip: price ${price}`); return; }
 
   const [det, fv, prof] = await Promise.all([
-    getTickerDetails(ticker), getFinvizStats(ticker), getFmpProfile(ticker),
+    getTickerDetails(ticker), getFinvizStats(ticker), getFmpProfile(ticker).catch(()=>({})),
   ]);
   const mc = det.market_cap || 0;
   const { timeStr } = getET();
@@ -542,17 +627,15 @@ async function flushAlertEvents(ticker) {
   const siStr = fv.si !== '--' ? ` | **SI:** ${fv.si}` : '';
   const header = `\`${timeShort}\` ↗ **${ticker}** ${priceFlag(price)} ~ ${flag(ticker)}${ioStr}${mcStr}${siStr}`;
 
-  const bullets = events.map(e => {
-    const ageMs = Date.now() - new Date(e.publishedTime || Date.now()).getTime();
-    const ageStr = fmtAge(Math.max(ageMs, 0));
-    const typePill = `\`${e.type}\``; // `PR` or `SEC`
-    const titlePart = e.title || '';
-    const linkPart = e.url ? ` - [Link](<${e.url}>)` : '';
-    return `> • \`${ageStr}\` ${typePill} ${titlePart}${linkPart}`;
-  });
+  const ageMs = Date.now() - new Date(event.publishedTime || Date.now()).getTime();
+  const ageStr = fmtAge(Math.max(ageMs, 0));
+  const typePill = `\`${event.type}\``; // `PR` `SEC` `INSIDER` `GRADE`
+  const titlePart = event.title || '';
+  const linkPart = event.url ? ` - [Link](<${event.url}>)` : '';
+  const bullet = `> • \`${ageStr}\` ${typePill} ${titlePart}${linkPart}`;
 
-  await post({ content: `${header}\n${bullets.join('\n')}` });
-  console.log(`[Alert] ${ticker} batch posted: ${events.length} event(s) [${events.map(e => e.type).join(',')}]`);
+  await post({ content: `${header}\n${bullet}` });
+  console.log(`[Alert] ${ticker} ${event.type} posted instantly`);
 }
 
 function loadPermanentWatchlist(){
@@ -856,14 +939,14 @@ async function handleNewsItem(title,tickers,url,published_utc){
                    || permanentWatch.has(ticker);
     if(!td||vol<prVolMin||price<0.10||price>30||!isTracked) continue;
 
-    // Queue for aggregated posting — paired SEC filings within EVENT_BUFFER_MS will batch
-    queueAlertEvent(ticker, {
+    // Post instantly — no aggregation buffer
+    postEventAlert(ticker, {
       type: 'PR',
       title: title.slice(0, 200),
       url,
       publishedTime: published_utc,
       isDrop,
-    });
+    }).catch(e => console.error(`[postEventAlert PR] ${ticker}:`, e.message));
   }
   if(state.sentNews.size>500){const a=[...state.sentNews];state.sentNews.clear();a.slice(-200).forEach(x=>state.sentNews.add(x));}
   if(state.sentPR.size>500){const a=[...state.sentPR];state.sentPR.clear();a.slice(-200).forEach(x=>state.sentPR.add(x));}
@@ -942,14 +1025,14 @@ async function checkFilings(){
         if(filed<=Date.now()-15*60*1000||state.sentFilings.has(id)) continue;
         state.sentFilings.add(id);
         const ft=(f.form_type||'SEC').toUpperCase();
-        // Queue as SEC event — header + bullet built at flush time alongside any paired PR
-        queueAlertEvent(ticker, {
+        // Post instantly — no aggregation buffer
+        postEventAlert(ticker, {
           type: 'SEC',
           title: `Form ${ft}`,
           url: f.filing_url,
           publishedTime: f.filed_at,
           isDrop: false,
-        });
+        }).catch(e => console.error(`[postEventAlert SEC] ${ticker}:`, e.message));
       }
     }catch(e){}
     await sleep(200);
@@ -957,6 +1040,120 @@ async function checkFilings(){
 }
 
 
+
+// ─── Insider trading alerts (FMP Ultimate) ───────────────────────────────────
+// Polls FMP's latest insider trades. Fires only on PURCHASES (P-* transaction
+// types with acquisition flag), since insider BUYING is the signal that matters —
+// sales are routine (taxes, comp, diversification). Same gates as PR alerts.
+let lastInsiderPoll = 0;
+async function pollInsiderTrades(){
+  if(!isActive() || !FMP_KEY) return;
+  if(Date.now() - lastInsiderPoll < 30000) return; // poll every 30s
+  lastInsiderPoll = Date.now();
+  try {
+    const r = await fmpGet('/stable/insider-trading-latest?page=0&limit=100');
+    if(!Array.isArray(r)){console.log('[Insider] unexpected response:',JSON.stringify(r)?.slice(0,160));return;}
+    const cutoff = Date.now() - 15*60*1000; // last 15min
+    let matched = 0;
+    for(const t of r) {
+      const txType = (t.transactionType || '').toUpperCase();
+      const aod = (t.acquistionOrDisposition || t.acquisitionOrDisposition || '').toUpperCase();
+      // Filter: real purchases only (P-Purchase + Acquisition flag).
+      // Skips A-Award, M-Exempt, S-Sale, G-Gift, etc. — those aren't directional signals.
+      if(!txType.startsWith('P-') || aod !== 'A') continue;
+      const ticker = (t.symbol || '').toUpperCase();
+      if(!ticker || isBadTicker(ticker) || isEtf(ticker)) continue;
+      // Only fire for tracked tickers (same as PR alerts)
+      const isTracked = topGappers.some(g=>g.ticker===ticker)
+                     || dayWatchlist.has(ticker)
+                     || recentRunners.has(ticker)
+                     || permanentWatch.has(ticker);
+      if(!isTracked) continue;
+      // Time filter: must be recent
+      const filedTs = new Date(t.filingDate || t.transactionDate || 0).getTime();
+      if(filedTs <= cutoff) continue;
+      // Dedup
+      const id = `${ticker}_${t.reportingCik||''}_${t.transactionDate||''}_${t.securitiesTransacted||0}`;
+      if(state.sentInsider.has(id)) continue;
+      state.sentInsider.add(id);
+
+      const shares = +t.securitiesTransacted || 0;
+      const px = +t.price || 0;
+      const value = shares * px;
+      const who = t.reportingName ? t.reportingName.split(/\s+/).slice(0,3).join(' ') : 'Insider';
+      const role = t.typeOfOwner || 'insider';
+      const valStr = value > 0 ? ` ($${fmtNS(value).trim()})` : '';
+      const title = `${who} (${role}) bought ${fmtN(shares)} shares${valStr}`;
+
+      postEventAlert(ticker, {
+        type: 'INSIDER',
+        title,
+        url: t.link || '',
+        publishedTime: t.filingDate || t.transactionDate,
+        isDrop: false,
+      }).catch(e => console.error(`[postEventAlert INSIDER] ${ticker}:`, e.message));
+      matched++;
+    }
+    if(matched > 0) console.log(`[Insider] ${matched} purchase alerts fired`);
+    if(state.sentInsider.size > 500){const a=[...state.sentInsider];state.sentInsider.clear();a.slice(-200).forEach(x=>state.sentInsider.add(x));}
+  } catch(e) {
+    console.error('[Insider] error:', e.message);
+  }
+}
+
+// ─── Analyst grade change alerts (FMP Ultimate) ──────────────────────────────
+// Polls FMP's latest analyst rating changes. Fires for upgrades, downgrades,
+// and new coverage initiations. Title includes firm + action + grade transition.
+let lastGradesPoll = 0;
+async function pollGrades(){
+  if(!isActive() || !FMP_KEY) return;
+  if(Date.now() - lastGradesPoll < 30000) return; // poll every 30s
+  lastGradesPoll = Date.now();
+  try {
+    const r = await fmpGet('/stable/grades-latest-news?page=0&limit=100');
+    if(!Array.isArray(r)){console.log('[Grades] unexpected response:',JSON.stringify(r)?.slice(0,160));return;}
+    const cutoff = Date.now() - 15*60*1000;
+    let matched = 0;
+    for(const g of r) {
+      const ticker = (g.symbol || '').toUpperCase();
+      if(!ticker || isBadTicker(ticker) || isEtf(ticker)) continue;
+      const isTracked = topGappers.some(x=>x.ticker===ticker)
+                     || dayWatchlist.has(ticker)
+                     || recentRunners.has(ticker)
+                     || permanentWatch.has(ticker);
+      if(!isTracked) continue;
+      const ts = new Date(g.publishedDate || g.date || 0).getTime();
+      if(ts <= cutoff) continue;
+      // Dedup
+      const id = `${ticker}_${g.gradingCompany||''}_${g.publishedDate||g.date||''}`;
+      if(state.sentGrades.has(id)) continue;
+      state.sentGrades.add(id);
+
+      const firm = g.gradingCompany || g.publisher || 'Analyst';
+      const action = (g.action || '').toLowerCase(); // upgrade/downgrade/hold/initiate
+      const newG = g.newGrade || '';
+      const prevG = g.previousGrade || '';
+      let title;
+      if(action === 'upgrade') title = `${firm}: upgraded${prevG?` from ${prevG}`:''} to ${newG}`;
+      else if(action === 'downgrade') title = `${firm}: downgraded${prevG?` from ${prevG}`:''} to ${newG}`;
+      else if(action === 'initiate') title = `${firm}: initiated coverage at ${newG}`;
+      else title = `${firm}: ${newG||'rating update'}`;
+
+      postEventAlert(ticker, {
+        type: 'GRADE',
+        title,
+        url: g.newsURL || g.url || '',
+        publishedTime: g.publishedDate || g.date,
+        isDrop: action === 'downgrade',
+      }).catch(e => console.error(`[postEventAlert GRADE] ${ticker}:`, e.message));
+      matched++;
+    }
+    if(matched > 0) console.log(`[Grades] ${matched} grade alerts fired`);
+    if(state.sentGrades.size > 500){const a=[...state.sentGrades];state.sentGrades.clear();a.slice(-200).forEach(x=>state.sentGrades.add(x));}
+  } catch(e) {
+    console.error('[Grades] error:', e.message);
+  }
+}
 
 // ─── Session transition sync ──────────────────────────────────────────────────
 // At 4PM (MKT→AH), capture the closing price for every tracked ticker.
@@ -1254,14 +1451,12 @@ async function main(){
   // Test FMP connectivity on startup
   if(FMP_KEY){
     try{
-      const testR=await fmpGet('/api/v3/profile/AAPL');
-      if(Array.isArray(testR)&&testR[0]&&testR[0].country){
-        console.log(`[FMP] v3 profile working ✓ (AAPL country: ${testR[0].country})`);
+      const testR=await fmpGet('/stable/profile?symbol=AAPL');
+      const t = Array.isArray(testR) ? testR[0] : testR;
+      if(t&&t.country){
+        console.log(`[FMP] stable/profile working ✓ (AAPL country: ${t.country}, sector: ${t.sector||'--'})`);
       } else {
-        console.log(`[FMP] v3 profile failed: ${JSON.stringify(testR)?.slice(0,120)}`);
-        console.log('[FMP] Trying v4...');
-        const testR4=await fmpGet('/api/v4/profile/AAPL');
-        console.log(`[FMP] v4 response: ${JSON.stringify(testR4)?.slice(0,120)}`);
+        console.log(`[FMP] stable/profile failed: ${JSON.stringify(testR)?.slice(0,160)}`);
       }
     }catch(e){console.error('[FMP] connectivity test failed:',e.message);}
   } else {
@@ -1291,15 +1486,14 @@ async function main(){
     if(newT.length) subscribeNewTickers(newT);
     await pollNews();
     await pollFmpNews();
+    await pollInsiderTrades();
+    await pollGrades();
     await syncHighsAtTransition(); // capture 4PM close prices within 20s
   },20*1000);
 
   setInterval(async()=>{
     const {hh,m}=getET();
-    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();ctbCache.clear();
-      // Flush any pending event queues so timers don't leak
-      for(const [t,q] of eventQueue){ if(q.timer) clearTimeout(q.timer); }
-      eventQueue.clear();
+    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();state.sentInsider.clear();state.sentGrades.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();ctbCache.clear();fmpFloatCache.clear();
       // Prune recentRunners older than 5 days
       const fiveDaysAgo=Date.now()-5*24*60*60*1000;
       for(const [t,ts] of recentRunners) if(ts<fiveDaysAgo) recentRunners.delete(t);
