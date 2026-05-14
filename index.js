@@ -1546,22 +1546,51 @@ async function snapForHalt(ticker){
   } catch(e){ return null; }
 }
 
+// For volatility halts (LUDP/T5/LUDS), direction = which limit band was
+// breached: upper = UP, lower = DOWN. NASDAQ RSS doesn't include this, so
+// we infer from minute-bar price action in the 3 minutes immediately before
+// the halt. This is correct regardless of intraday trend — a stock can be
+// +400% on the day and still halt DOWN if it just dropped through the lower
+// band. Returns 'UP', 'DOWN', or null (ambiguous → no direction shown).
+async function detectHaltDirection(ticker, haltedAtMs){
+  if(!haltedAtMs) return null;
+  const fromMs = haltedAtMs - 3 * 60 * 1000;
+  const toMs = haltedAtMs;
+  try {
+    const url = `/v2/aggs/ticker/${ticker}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=10`;
+    const r = await polyGet(url);
+    if(!r || !r.results || r.results.length === 0) return null;
+    const bars = r.results;
+    const startPrice = bars[0].o;
+    const endPrice   = bars[bars.length - 1].c;
+    if(!startPrice) return null;
+    const pctMove = (endPrice - startPrice) / startPrice * 100;
+    if(Math.abs(pctMove) < 1) return null; // ambiguous — too flat to call
+    return pctMove > 0 ? 'UP' : 'DOWN';
+  } catch(e){
+    console.error(`[Halt] direction detect failed for ${ticker}: ${e.message}`);
+    return null;
+  }
+}
+
 // Format halt alert in NuntioBot style:
 //   `13:39:00` `FCUV` `Halted UP` 🇺🇸 | Volatility → $1.80 · 1.9M vol · Resume 13:44 ET
 // Timestamp = actual halt time from RSS (not detection time).
 async function fireHaltAlert(st){
-  const {ticker, code, reason, haltTimeOriginal, resumeTimeOriginal} = st;
+  const {ticker, code, reason, haltedAt, haltTimeOriginal, resumeTimeOriginal} = st;
   // Use the actual halt time from the RSS feed — accurate to when the stock
   // halted, regardless of when we detected it.
   const timeStr = haltTimeOriginal || getET().timeStr;
   const s = await snapForHalt(ticker);
 
-  // Direction for volatility halts: positive day change = halted at top of
-  // band (UP), negative = halted at bottom (DOWN). Threshold ±0.5%.
+  // Direction for volatility halts: use recent minute-bar price action, NOT
+  // overall day change. A stock can be up huge on the day yet still halt
+  // DOWN on a recent drop into the lower limit band (the FCUV case).
   let haltLabel = 'Halted';
-  if(HALT_DIRECTIONAL.has(code) && s && typeof s.chgPct === 'number'){
-    if(s.chgPct > 0.5) haltLabel = 'Halted UP';
-    else if(s.chgPct < -0.5) haltLabel = 'Halted DOWN';
+  if(HALT_DIRECTIONAL.has(code)){
+    const dir = await detectHaltDirection(ticker, haltedAt);
+    if(dir === 'UP') haltLabel = 'Halted UP';
+    else if(dir === 'DOWN') haltLabel = 'Halted DOWN';
   }
 
   // Compose right-of-pipe content
