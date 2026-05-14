@@ -630,17 +630,31 @@ function resolveCountry(data){
   const addrCountry = (addr.country || '').toLowerCase().trim();
   const phone = (data.phone_number || '').replace(/\s|-/g,'');
 
-  // 1. address.city match — strongest signal. Polygon often has the correct
-  //    city even when address.country wrongly says United States for ADRs.
+  // 1. address.city match — strongest signal when Polygon has the real city.
   if(city){
     for(const r of COUNTRY_RULES){
       if(r.cities.includes(city)) return r.iso;
     }
   }
 
-  // 2. Description has strong HQ phrase: "X-based", "headquartered in X",
-  //    "based in X", "principal offices in X". These are specific enough to
-  //    avoid false positives like "we ship to China."
+  // 2. Description CITY-based HQ patterns: "headquartered in London",
+  //    "London-based", "London-headquartered". CRITICAL for foreign ADRs
+  //    (MRNO/Murano class) where Polygon's address is the US SEC registered
+  //    agent and never says "United Kingdom" — but the description always
+  //    mentions the actual HQ city.
+  for(const r of COUNTRY_RULES){
+    for(const c of r.cities){
+      const cEsc = c.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+      const cityRe = new RegExp(
+        `\\b(?:headquartered|based|located|domiciled)\\s+in\\s+${cEsc}\\b|\\b${cEsc}[\\s-](?:based|headquartered)\\b`,
+        'i'
+      );
+      if(cityRe.test(desc) || cityRe.test(name)) return r.iso;
+    }
+  }
+
+  // 3. Description COUNTRY-name HQ phrases: "headquartered in X",
+  //    "X-based", "is a X company". Catches descriptions without a city.
   for(const r of COUNTRY_RULES){
     for(const n of r.names){
       const nEsc = n.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
@@ -652,9 +666,8 @@ function resolveCountry(data){
     }
   }
 
-  // 3. Description contains country name with strong context — last bullet
-  //    of description for most foreign ADRs reads "... in the People's
-  //    Republic of China." Pattern: country name followed by sentence end.
+  // 4. Description country name with strong context — covers "... in the
+  //    People's Republic of China." style endings.
   for(const r of COUNTRY_RULES){
     for(const n of r.names){
       const nEsc = n.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
@@ -663,7 +676,22 @@ function resolveCountry(data){
     }
   }
 
-  // 4. address.country structured field
+  // 5. Company name suffix — corporate-structure signal that doesn't depend
+  //    on Polygon's description quality. "PLC" is UK/Irish-specific (rare
+  //    elsewhere), "GmbH" is German, "N.V." is Dutch. Catches foreign ADRs
+  //    where Polygon's description is sparse and address.country lists a US
+  //    registered agent (MRNO/Murano class).
+  const nameRaw = data.name || '';
+  if(/\bp\.?l\.?c\.?\s*$/i.test(nameRaw))     return 'GB'; // includes PLC, P.L.C., Plc., plc
+  if(/\bgmbh\.?\s*$/i.test(nameRaw))          return 'DE';
+  if(/\bn\.v\.\s*$/i.test(nameRaw))           return 'NL'; // requires the dots — "NV" alone is too ambiguous (Nevada)
+  if(/\bs\.?p\.?a\.?\s*$/i.test(nameRaw))     return 'IT'; // S.p.A.
+  if(/\boyj\s*$/i.test(nameRaw))              return 'FI'; // Finnish public co
+  if(/\bab\s*$/i.test(nameRaw) && /\b(holding|publ)\b/i.test(nameRaw)) return 'SE'; // Swedish AB
+
+  // 6. address.country — moved AFTER description and name-suffix checks
+  //    because foreign ADRs routinely list a US registered agent address
+  //    here, which corrupts the signal.
   if(addrCountry){
     for(const r of COUNTRY_RULES){
       if(r.addr.includes(addrCountry)) return r.iso;
@@ -671,14 +699,14 @@ function resolveCountry(data){
     if(['united states','usa','us'].includes(addrCountry)) return 'US';
   }
 
-  // 5. Phone country-code prefix
+  // 6. Phone country-code prefix
   if(phone.startsWith('+')){
     for(const r of COUNTRY_RULES){
       if(r.phone && phone.startsWith(r.phone)) return r.iso;
     }
   }
 
-  // 6. Polygon locale fallback (only knows broad us/global distinction)
+  // 7. Polygon locale fallback (only knows broad us/global distinction)
   if(data.locale){
     const loc = data.locale.toUpperCase();
     if(loc !== 'US' && loc !== 'GLOBAL') return loc;
@@ -1191,41 +1219,69 @@ async function fireNHOD(ticker,price){
 const DROP_RE =/offering|public offering|convertible|shelf|ATM offering|at-the-market|direct offering|registered direct|dilut|warrant|prospectus|424B|S-1|S-3|secondary offering|note offering|senior notes|debenture|equity financ|private placement|underwritten|priced offering|prices offering/i;
 const SPIKE_RE=/collaboration|agreement|partnership|FDA|approval|cleared|grant|award|contract|trial|data|results|positive|breakthrough|milestone|license|acqui|merger|acquisition|joint venture|\bJV\b|phase|cohort|study|efficacy|safety|quarterly|financial results|earnings|revenue|guidance|raises|secures|closes|signs|launches|wins|receives|completes|announces/i;
 
+// Qualifier specifically for news/PR alerts. Looser than shouldAlertHalt
+// because news itself is a strong filter (Polygon only carries newsworthy
+// items in the first place). Catches RKDA-class earnings movers that would
+// fail the halt-volume gate (1M shares) but are still trader-relevant.
+const newsQualCache = new Map(); // ticker → {result, ts} — 1-min cache
+async function isQualifyingForNews(ticker){
+  // Tracked tickers always qualify — no API call needed
+  if(topGappers.some(g => g.ticker === ticker) ||
+     dayWatchlist.has(ticker) ||
+     permanentWatch.has(ticker) ||
+     recentRunners.has(ticker)){
+    return true;
+  }
+  if(isBadTicker(ticker) || isEtf(ticker)) return false;
+  // Brief cache to avoid hammering snapshot endpoint when many news items
+  // mention the same ticker in quick succession
+  const cached = newsQualCache.get(ticker);
+  if(cached && Date.now() - cached.ts < 60_000) return cached.result;
+  let result = false;
+  try {
+    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    const td = snap && snap.ticker;
+    if(td){
+      const isOTC = /OTC|GREY|PINK|EXPERT/i.test(td.primaryExchange || '');
+      if(!isOTC){
+        const price   = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || 0;
+        const dayVol  = (td.day && td.day.v) || 0;
+        const chgPct  = (typeof td.todaysChangePerc === 'number') ? td.todaysChangePerc : 0;
+        const dollarVol = dayVol * price;
+        // Wider price band, lower volume bar than halt qualifier
+        result = price >= 0.20 && price <= 100 &&
+                 Math.abs(chgPct) >= 3 &&
+                 dollarVol >= 500_000;
+      }
+    }
+  } catch(e){}
+  newsQualCache.set(ticker, {result, ts: Date.now()});
+  return result;
+}
+
 async function handleNewsItem(title,tickers,url,published_utc){
   if(!title||!tickers.length) return;
   const id=(url||title).slice(0,100);
   if(state.sentNews.has(id)) return;
   state.sentNews.add(id);
   for(const t of tickers) if(url) newsCache.set(t,{url,ts:Date.now()});
-  const isDrop=DROP_RE.test(title);
-  const isSpike=!isDrop&&SPIKE_RE.test(title);
-  if(isDrop||isSpike) console.log(`[News] ${isDrop?'DROP':'SPIKE'} match: ${tickers.slice(0,3).join(',')} — ${title.slice(0,80)}`);
-  if(!isDrop&&!isSpike) return;
 
-  const {etMin}=getET();
-  const tier=getTier(etMin);
-  const prVolMin = tier ? (tier.name==='MKT' ? 50_000 : 0) : 0;
+  // No keyword filter — alert on ANY news for a qualifying ticker. The
+  // ticker-quality check is what filters noise. Earnings, partnerships,
+  // FDA decisions, M&A, etc. all matter even without "soar" / "plunge"
+  // in the headline (the RKDA Q1 earnings case).
+  const isDrop = DROP_RE.test(title); // still used for icon distinction
 
-  // Fire for any stock matching keywords — no watchlist filter on news
-  // DROP_RE/SPIKE_RE keywords are specific enough to avoid spam
   for(const ticker of tickers.slice(0,3)){
     if(isBadTicker(ticker)||isEtf(ticker)) continue;
-    const prId=`${isDrop?'drop':'spike'}_${id}_${ticker}`;
+    const prId = `pr_${id}_${ticker}`;
     if(state.sentPR.has(prId)) continue;
+
+    const should = await isQualifyingForNews(ticker);
+    if(!should) continue;
     state.sentPR.add(prId);
 
-    // Quick gate — make sure ticker is tracked and within price/volume limits
-    const snap=await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-    const td=snap&&snap.ticker;
-    const vol=(td&&td.day&&td.day.v)||0;
-    const price=(td&&td.lastTrade&&td.lastTrade.p)||(td&&td.day&&td.day.c)||0;
-    const isTracked = topGappers.some(g=>g.ticker===ticker)
-                   || dayWatchlist.has(ticker)
-                   || recentRunners.has(ticker)
-                   || permanentWatch.has(ticker);
-    if(!td||vol<prVolMin||price<0.10||price>30||!isTracked) continue;
-
-    // Post instantly — no aggregation buffer
+    // Post the PR alert
     postEventAlert(ticker, {
       type: 'PR',
       title: title.slice(0, 200),
@@ -1233,6 +1289,12 @@ async function handleNewsItem(title,tickers,url,published_utc){
       publishedTime: published_utc,
       isDrop,
     }).catch(e => console.error(`[postEventAlert PR] ${ticker}:`, e.message));
+
+    // PR and 8-K typically drop within seconds of each other (earnings is
+    // the textbook case). Trigger an immediate filings check for this
+    // ticker so the SEC alert fires alongside the PR, even if the ticker
+    // isn't in any tracked set.
+    checkTickerFilings(ticker).catch(e => console.error(`[checkTickerFilings] ${ticker}:`, e.message));
   }
   if(state.sentNews.size>500){const a=[...state.sentNews];state.sentNews.clear();a.slice(-200).forEach(x=>state.sentNews.add(x));}
   if(state.sentPR.size>500){const a=[...state.sentPR];state.sentPR.clear();a.slice(-200).forEach(x=>state.sentPR.add(x));}
@@ -1269,6 +1331,31 @@ async function pollNews(){
 
 // ─── SEC filings ──────────────────────────────────────────────────────────────
 let lastFilingCheck=0;
+// Check recent filings for a single ticker. Shared between the periodic
+// checkFilings() loop and the news-triggered path in handleNewsItem(). PR
+// and SEC filings often drop within seconds of each other (earnings is
+// the canonical example), and the periodic loop runs every 2 minutes which
+// is too slow for that — so handleNewsItem calls this directly.
+async function checkTickerFilings(ticker){
+  try {
+    const r = await polyGet(`/vX/reference/filings?ticker=${ticker}&limit=5&order=desc&sort=filed_at`);
+    for(const f of (r&&r.results||[])){
+      const filed = new Date(f.filed_at||0).getTime();
+      const id = (f.filing_url||f.accession_number||'').slice(0,80);
+      if(filed <= Date.now() - 15*60*1000 || state.sentFilings.has(id)) continue;
+      state.sentFilings.add(id);
+      const ft = (f.form_type||'SEC').toUpperCase();
+      postEventAlert(ticker, {
+        type: 'SEC',
+        title: `Form ${ft}`,
+        url: f.filing_url,
+        publishedTime: f.filed_at,
+        isDrop: false,
+      }).catch(e => console.error(`[postEventAlert SEC] ${ticker}:`, e.message));
+    }
+  } catch(e){}
+}
+
 async function checkFilings(){
   if(!isActive()) return;
   if(Date.now()-lastFilingCheck<2*60*1000) return;
@@ -1276,24 +1363,7 @@ async function checkFilings(){
   const known=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys(),...permanentWatch]);
   if(!known.size) return;
   for(const ticker of known){
-    try{
-      const r=await polyGet(`/vX/reference/filings?ticker=${ticker}&limit=5&order=desc&sort=filed_at`);
-      for(const f of (r&&r.results||[])){
-        const filed=new Date(f.filed_at||0).getTime();
-        const id=(f.filing_url||f.accession_number||'').slice(0,80);
-        if(filed<=Date.now()-15*60*1000||state.sentFilings.has(id)) continue;
-        state.sentFilings.add(id);
-        const ft=(f.form_type||'SEC').toUpperCase();
-        // Post instantly — no aggregation buffer
-        postEventAlert(ticker, {
-          type: 'SEC',
-          title: `Form ${ft}`,
-          url: f.filing_url,
-          publishedTime: f.filed_at,
-          isDrop: false,
-        }).catch(e => console.error(`[postEventAlert SEC] ${ticker}:`, e.message));
-      }
-    }catch(e){}
+    await checkTickerFilings(ticker);
     await sleep(200);
   }
 }
