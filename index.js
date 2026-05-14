@@ -112,7 +112,20 @@ function fmtNS(n)    { if(!n||n<=0)return'--'; if(n>=1e9)return(n/1e9).toFixed(1
 // Age string for bullet lines: "14 minutes ago" / "3 hours ago"
 function fmtAge(ms)  { if(ms<60000)return`${Math.round(ms/1000)} seconds ago`; if(ms<3600000)return`${Math.round(ms/60000)} minutes ago`; if(ms<86400000)return`${Math.round(ms/3600000)} hours ago`; return`${Math.round(ms/86400000)} days ago`; }
 function fmtRVol(r)  { if(!r||isNaN(r)||r===0)return'--'; if(r>=1000)return Math.round(r).toLocaleString()+'x'; if(r>=10)return r.toFixed(0)+'x'; return r.toFixed(1)+'x'; }
-function priceFlag(p){ if(p<0.50)return'<$.50c'; if(p<1)return'<$1'; if(p<2)return'<$2'; if(p<5)return'<$5'; return'<$10'; }
+function priceFlag(p){
+  if(p<0.50)return'<$.50c';
+  if(p<1)return'<$1';
+  if(p<2)return'<$2';
+  if(p<3)return'<$3';   // confirmed POAS @ ~$2.something → <$3
+  if(p<4)return'<$4';   // confirmed MOBX @ ~$3.something → <$4
+  if(p<5)return'<$5';
+  if(p<10)return'<$10';
+  // Above $10: ladder inferred from PCT (image 1) @ ~$11 → <$12.
+  // Best guess until more high-price samples land: $2 increments to $20, $5 to $50, $10 above.
+  if(p<20)return`<$${Math.floor(p/2)*2+2}`;
+  if(p<50)return`<$${Math.floor(p/5)*5+5}`;
+  return`<$${Math.floor(p/10)*10+10}`;
+}
 function countryFlag(country){
   if(!country) return'🇺🇸';
   const c=country.toUpperCase();
@@ -254,8 +267,87 @@ async function refreshEtfList(){
 }
 function isEtf(t){return etfSet.has(t);}
 
+// ─── Reg SHO threshold list ───────────────────────────────────────────────────
+// Daily threshold security lists from NASDAQ and NYSE (combined). Updated by
+// the exchanges after the close each settlement day. We walk back up to 5 days
+// per source to find the most recent available file (handles weekends, holidays,
+// and late publication). Both files use the same pipe-delimited format:
+//   Symbol|Security Name|Market Category|Reg SHO Threshold Flag|Filler|Filler
+// The trailing line is a YYYYMMDDHHMMSS timestamp.
+const regSHOSet = new Set();
+let lastRegSHORefresh = 0;
+const REG_SHO_REFRESH_MS = 23*60*60*1000;
+
+function _ymd(d){ return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; }
+function _ddMmmYyyy(d){
+  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${String(d.getDate()).padStart(2,'0')}-${months[d.getMonth()]}-${d.getFullYear()}`;
+}
+function _parseRegSHOText(text){
+  const out = [];
+  if(!text||!text.includes('|')) return out;
+  for(const raw of text.split(/\r?\n/)){
+    const line = raw.trim();
+    if(!line) continue;
+    if(/^\d{14}$/.test(line)) continue; // timestamp footer
+    if(line.startsWith('Symbol|')) continue; // header
+    const parts = line.split('|');
+    if(parts.length < 4) continue;
+    const sym = (parts[0]||'').trim().toUpperCase();
+    const flag = (parts[3]||'').trim().toUpperCase();
+    if(sym && flag === 'Y') out.push(sym);
+  }
+  return out;
+}
+
+async function refreshRegSHO(){
+  if(Date.now() - lastRegSHORefresh < REG_SHO_REFRESH_MS) return;
+  const found = new Set();
+  const browserUA = {'User-Agent':'Mozilla/5.0 (Linux; Railway) AziziBot/1.0','Accept':'text/plain,application/octet-stream,*/*'};
+
+  // NASDAQ — walk back up to 5 days
+  for(let i=0; i<5; i++){
+    const d = new Date(Date.now() - i*86400000);
+    try {
+      const txt = await rawGet(`https://www.nasdaqtrader.com/dynamic/SymDir/regsho/nasdaqth${_ymd(d)}.txt`, browserUA);
+      const tickers = _parseRegSHOText(txt);
+      if(tickers.length > 0){
+        tickers.forEach(t => found.add(t));
+        console.log(`[RegSHO] NASDAQ ${_ymd(d)}: ${tickers.length} tickers`);
+        break;
+      }
+    } catch(e){}
+  }
+
+  // NYSE — walk back up to 5 days
+  for(let i=0; i<5; i++){
+    const d = new Date(Date.now() - i*86400000);
+    try {
+      const txt = await rawGet(`https://www.nyse.com/api/regulatory/threshold-securities/download?selectedDate=${_ddMmmYyyy(d)}`, browserUA);
+      const tickers = _parseRegSHOText(txt);
+      if(tickers.length > 0){
+        tickers.forEach(t => found.add(t));
+        console.log(`[RegSHO] NYSE ${_ddMmmYyyy(d)}: ${tickers.length} tickers`);
+        break;
+      }
+    } catch(e){}
+  }
+
+  if(found.size > 0){
+    regSHOSet.clear();
+    found.forEach(t => regSHOSet.add(t));
+    lastRegSHORefresh = Date.now();
+    console.log(`[RegSHO] Combined: ${regSHOSet.size} unique threshold tickers`);
+  } else {
+    console.error('[RegSHO] Both sources returned nothing — keeping previous list');
+  }
+}
+
+function isRegSHO(ticker){ return regSHOSet.has((ticker||'').toUpperCase()); }
+
+
 // ─── Caches ───────────────────────────────────────────────────────────────────
-const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map(), fmpCountryMap=new Map();
+const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map(), fmpCountryMap=new Map(), ctbCache=new Map();
 
 async function getTickerDetails(ticker){
   const c=tickerCache.get(ticker);
@@ -342,13 +434,51 @@ async function getFinvizStats(ticker){
   return r;
 }
 async function getGreenBars(ticker){
+  // NuntioBot checks multiple bar timeframes and shows whichever has the most
+  // consecutive green closes. We check 1m and 3m and pick the higher count.
+  const today=new Date().toISOString().slice(0,10);
+  async function checkTf(tf){
+    try{
+      const r=await polyGet(`/v2/aggs/ticker/${ticker}/range/${tf}/minute/${today}/${today}?adjusted=true&sort=desc&limit=10`);
+      const bars=(r&&r.results)||[]; let count=0;
+      for(const bar of bars){if(bar.c>bar.o)count++;else break;}
+      return count;
+    }catch(e){return 0;}
+  }
+  const [c1,c3]=await Promise.all([checkTf(1),checkTf(3)]);
+  // Tie-break to 1m — more responsive signal when both show same count.
+  return c3>c1 ? {count:c3,timeframe:'3m'} : {count:c1,timeframe:'1m'};
+}
+
+// ─── Cost-to-borrow (CTB) ─────────────────────────────────────────────────────
+// Free unofficial API scraping IBKR's stock loan data. Cached 1h.
+// Fee is in % per annum. >20% = High CTB (rough industry threshold).
+async function getCTB(ticker){
+  const c=ctbCache.get(ticker);
+  if(c&&Date.now()-c.ts<60*60*1000) return c.data;
   try{
-    const today=new Date().toISOString().slice(0,10);
-    const r=await polyGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}?adjusted=true&sort=desc&limit=10`);
-    const bars=(r&&r.results)||[]; let count=0;
-    for(const bar of bars){if(bar.c>bar.o)count++;else break;}
-    return count;
-  }catch(e){return 0;}
+    const raw=await rawGet(`https://iborrowdesk.com/api/ticker/${ticker}`,{
+      'User-Agent':'Mozilla/5.0 (Linux; Railway) AziziBot/1.0',
+      'Accept':'application/json',
+    });
+    const j=JSON.parse(raw);
+    const daily=(j&&j.daily)||[];
+    if(daily.length===0){
+      const data={fee:0,available:0,date:''};
+      ctbCache.set(ticker,{data,ts:Date.now()-50*60*1000}); // short-cache empty result, retry in 10min
+      return data;
+    }
+    const latest=daily[daily.length-1];
+    const data={fee:+latest.fee||0, available:+latest.available||0, date:latest.date||''};
+    ctbCache.set(ticker,{data,ts:Date.now()});
+    if(data.fee>=10) console.log(`[CTB] ${ticker} fee:${data.fee.toFixed(2)}% avail:${data.available}`);
+    return data;
+  }catch(e){
+    console.error(`[CTB] ${ticker} error:`,e.message);
+    const data={fee:0,available:0,date:''};
+    ctbCache.set(ticker,{data,ts:Date.now()-50*60*1000});
+    return data;
+  }
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -635,14 +765,16 @@ async function fireNHOD(ticker,price){
   const livePct  = (()=>{const p=livePrice;const pv=(td&&td.prevDay&&td.prevDay.c)||0;return p&&pv?((p-pv)/pv)*100:gapper.chgPct;})();
   const liveRvol = livePrev>0?(liveVol*390)/(Math.max(etMin-240,1)*livePrev):gapper.rvol||0;
 
-  const [newsUrl,rs,det,fv,greenBars]=await Promise.all([
-    getNewsUrl(ticker),getRecentSplit(ticker),getTickerDetails(ticker),getFinvizStats(ticker),getGreenBars(ticker),
+  // Parallel-fetch all enrichment data. FmpProfile + CTB now included here
+  // so the sequential await on line ~680 (FMP) doesn't block alert latency.
+  const [newsUrl,rs,det,fv,greenBars,ctb,prof]=await Promise.all([
+    getNewsUrl(ticker),getRecentSplit(ticker),getTickerDetails(ticker),
+    getFinvizStats(ticker),getGreenBars(ticker),getCTB(ticker),
+    getFmpProfile(ticker).catch(()=>({})),
   ]);
 
   const mc=det.market_cap||0;
   const rsStr=rs?` | ${rs}`:'';
-  const regSHO=fv.si!=='--'&&parseFloat(fv.si)>50?' | 🔴 Reg SHO':'';
-  const greenStr=greenBars>=2?` · **${greenBars} green bars 1m**`:'';
 
   const hist=(state.tickers.get(ticker)||{}).priceHistory||[];
   let afterLull='';
@@ -654,38 +786,33 @@ async function fireNHOD(ticker,price){
     }
   }
 
-  const prData=newsCache.get(ticker);
-  const prStr=prData&&(Date.now()-prData.ts)<24*60*60*1000?` | [PR+](<${prData.url}>)`:'';
-  const {sess}=getET();
-  const sessLabel=nhod===1?(sess==='PRE'?'PMH':sess==='AH'?'AHs':'NSH'):`${nhod} NHOD`;
   // tLink: bold ticker, made clickable when there's a recent news URL
   const tLink=newsUrl?`[**${ticker}**](<${newsUrl}>)`:`**${ticker}**`;
-  const pctStr=`+${livePct.toFixed(1)}%`;
-  const mcLine=mc>0?` | MC: ${fmtN(mc)}`:'';
-  // Fetch FMP profile for sector tag
-  const prof=await getFmpProfile(ticker).catch(()=>({}));
   const sector   = prof.sector||'';
   const industry = prof.industry||'';
   const sectorStr= sector ? ` | ${sector}${industry?` · ${industry}`:''}` : '';
 
-  const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
-  const extraStr=extra?` | ${extra}`:'';
-
   // NuntioBot exact format (verified against 5 screenshots 2026-05-14):
-  // `08:55` ↗ **MOBX** <$3 `47%` · 7 `NHOD` ~ 🇺🇸 | **RVol:** 1.8x | **Vol:** 5.7 M | **SI:** 16.1% | [`PR`↗](url)
-  //   time-pill   bold-ticker  PLAIN-price  pct-pill  · count  label-pill (NHOD OR green-bars, never both, never bare)  ~ flag
-  // Bold ticker becomes clickable [**TICKER**](<url>) when there's recent news.
+  // `09:44` ↗ **CREG** <$.50c · 1 `NHOD` ~ 🇨🇳 | **RVol:** 6.0x | `Reg SHO` | `High CTB`
+  // `08:55` ↗ **MOBX** <$3 `47%` · 7 `3 green bars 1m` ~ 🇺🇸 | **RVol:** 1.8x | **Vol:** 5.7 M | **SI:** 16.1% | [`PR`↗](url)
+  //   time-pill  bold-ticker  PLAIN-price  pct-pill  · count  label-pill  ~ flag  | **labels:** vals | regSHO | CTB | sector | PR
   const timeShort = timeStr.slice(0,5);
   const pctCode   = livePct!==0 ? ` \`${Math.abs(livePct).toFixed(0)}%\`` : '';
   const afterStr  = afterLull ? ` after-lull` : '';
-  // Count is ALWAYS followed by a label pill — green-bars pill takes priority when present.
-  const labelStr  = greenBars>=2 ? `\`${greenBars} green bars 1m\`` : '`NHOD`';
+  // Count is ALWAYS followed by a label pill. Green-bars pill takes priority over NHOD when present.
+  const labelStr  = greenBars.count>=2
+    ? `\`${greenBars.count} green bars ${greenBars.timeframe}\``
+    : '`NHOD`';
   const rvolStr   = liveRvol>0 ? ` | **RVol:** ${fmtRVol(liveRvol)}` : '';
   const volStr    = liveVol>0  ? ` | **Vol:** ${fmtNS(liveVol)}` : '';
   const siStr     = fv.si!=='--' ? ` | **SI:** ${fv.si}` : '';
+  // Reg SHO: authoritative match against the daily NYSE+NASDAQ threshold list
+  const regSHOStr = isRegSHO(ticker) ? ' | `Reg SHO`' : '';
+  // High CTB: borrow fee >= 20% per annum (industry rough threshold for "hard to borrow")
+  const ctbStr    = (ctb && ctb.fee >= 20) ? ' | `High CTB`' : '';
   const prData2   = newsCache.get(ticker);
   const prLink    = prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url ? ` | [\`PR\`↗](<${prData2.url}>)` : '';
-  const line = `\`${timeShort}\` ↗ ${tLink} ${priceFlag(price)}${pctCode} · ${nhod} ${labelStr}${afterStr} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${rsStr}${sectorStr}${prLink}`;
+  const line = `\`${timeShort}\` ↗ ${tLink} ${priceFlag(price)}${pctCode} · ${nhod} ${labelStr}${afterStr} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${regSHOStr}${ctbStr}${rsStr}${sectorStr}${prLink}`;
 
   await post({content:line});
   console.log(`[ALERT] posted OK`);
@@ -778,15 +905,19 @@ async function pollFmpNews(){
   if(Date.now()-lastFmpPoll<8000) return;
   lastFmpPoll=Date.now();
   try{
-    const r=await fmpGet('/api/v4/stock-news-sentiments-rss-feed?page=0');
-    if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,120));return;}
+    // FMP killed v4/stock-news-sentiments-rss-feed in 2025. Migrated to the new
+    // /stable/ namespace. press-releases-latest matches our intent (corporate PRs).
+    const r=await fmpGet('/stable/news/press-releases-latest?page=0&limit=50');
+    if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,160));return;}
     const items=r,cutoff=Date.now()-15*60*1000;
     let matched=0, total=items.length;
     for(const n of items){
-      if(!n.publishedDate||new Date(n.publishedDate).getTime()<cutoff) continue;
-      const ticker=(n.symbol||'').toUpperCase();
+      // /stable/ field names may differ — accept all common variants defensively
+      const pubStr = n.publishedDate || n.published_date || n.date;
+      if(!pubStr || new Date(pubStr).getTime()<cutoff) continue;
+      const ticker = ((n.symbol || (Array.isArray(n.symbols)&&n.symbols[0]) || '')+'').toUpperCase();
       if(!ticker) continue;
-      await handleNewsItem(n.title||'',[ticker],n.url||'',n.publishedDate);
+      await handleNewsItem(n.title||'',[ticker],n.url||n.link||'',pubStr);
       matched++;
     }
     if(matched>0) console.log(`[FMP News] ${matched}/${total} items processed`);
@@ -1138,6 +1269,7 @@ async function main(){
   }
   loadPermanentWatchlist();
   await refreshEtfList();
+  await refreshRegSHO();
   await refreshGappers();
   // If bot starts during AH, capture close prices immediately
   const _startEt = getET();
@@ -1164,7 +1296,7 @@ async function main(){
 
   setInterval(async()=>{
     const {hh,m}=getET();
-    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();
+    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();ctbCache.clear();
       // Flush any pending event queues so timers don't leak
       for(const [t,q] of eventQueue){ if(q.timer) clearTimeout(q.timer); }
       eventQueue.clear();
@@ -1175,6 +1307,7 @@ async function main(){
     await checkMorningSnapshot();
     await checkFilings();
     await syncHighsAtTransition();
+    await refreshRegSHO(); // self-rate-limits to 23h, safe to call every minute
   },60*1000);
 
   console.log('🤖 AziziBot v8 running.');
