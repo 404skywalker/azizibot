@@ -9,21 +9,20 @@ const BZ_KEY        = process.env.BZ_KEY        || '';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
 const APP_ID        = '1493671812247322624';
 
-const TOP_GAPPERS_WH = 'https://discord.com/api/webhooks/1493250562689597623/57UTSPu2KfLmYNBRVPvPQIa4cSfCQA8wVcqB5d0J8cWYaJf5hlsm1EuRkQ3lolChTNh3';
-// All NHOD, PR, and SEC alerts route here. Swapped from #alerts-testing to
-// #Main-chat 2026-05-14 per user directive.
-const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504535425535049738/MbDW1k1ESVMoIRokvaJ6Fg76WhkiSh8K46AHCpZi042jNjGkUn_Y6ybU0mOXZCPMU53w';
-// (Previous alerts-testing webhook, kept commented out for rollback if needed)
-// const MAIN_CHAT_WH = 'https://discord.com/api/webhooks/1504111128106631359/W9Ky7814ojPziIuN6loeaNgu6l8aFzUMlMtrj8vsf4egXWfiBKFv0sNKu8VO9cclmRKD';
-// Halt + resume alerts fan out to BOTH the dedicated #halt-alerts channel
-// AND the main chat for visibility. Add/remove URLs to change broadcast.
-// Env override HALT_ALERTS_WH replaces the entire list (comma-separated).
-const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || [
-  // #halt-alerts (dedicated channel)
-  'https://discord.com/api/webhooks/1504534490821689374/RStoJri7X5g5RTth-2TCEFSIyiyXvXnjx29YbGAn_Bp0tc-DzJ7qADmYI8qTpTChnIXE',
-  // main chat (broadcast for visibility)
-  'https://discord.com/api/webhooks/1504535425535049738/MbDW1k1ESVMoIRokvaJ6Fg76WhkiSh8K46AHCpZi042jNjGkUn_Y6ybU0mOXZCPMU53w',
-].join(',')).split(',').map(s=>s.trim()).filter(Boolean);
+// All Discord webhook URLs come from environment variables — never hardcoded
+// in source. Source is pushed to a public GitHub repo, so any hardcoded
+// secret would be immediately scrapable. Set these in Railway → Variables:
+//   TOP_GAPPERS_WH   — single URL, for the 6/7AM gapper digest
+//   MAIN_CHAT_WH     — single URL, for NHOD/PR/SEC alerts
+//   HALT_ALERTS_WH   — comma-separated URLs (one per channel to broadcast to)
+// If any is missing, the corresponding alert type is suppressed with a
+// startup log message — the bot still runs, just doesn't post that category.
+const TOP_GAPPERS_WH = process.env.TOP_GAPPERS_WH || '';
+const MAIN_CHAT_WH   = process.env.MAIN_CHAT_WH || '';
+// Halt + resume alerts fan out to every URL in HALT_ALERT_WHS in parallel.
+// Pass a comma-separated list in HALT_ALERTS_WH to broadcast to multiple
+// channels (e.g. dedicated #halt-alerts plus the main chat).
+const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || '').split(',').map(s=>s.trim()).filter(Boolean);
 
 // ─── Session tiers ────────────────────────────────────────────────────────────
 //
@@ -323,6 +322,10 @@ async function postToWebhook(url,payload){
   });
 }
 async function post(payload){
+  if(!MAIN_CHAT_WH){
+    console.log('[post] suppressed (MAIN_CHAT_WH env var not set)');
+    return;
+  }
   payload.username='AziziBot';
   await postToWebhook(MAIN_CHAT_WH,payload);
 }
@@ -2096,7 +2099,9 @@ async function main(){
   console.log('🤖 AziziBot v8 starting...');
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
-  console.log(`[Halts] webhooks: ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s) configured` : 'NONE → halt alerts SUPPRESSED'}`);
+  console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/PR/SEC alerts SUPPRESSED'}`);
+  console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
+  console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt/resume alerts SUPPRESSED'}`);
 
   // Check Discord session_start_limit before connecting
   try{
