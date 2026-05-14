@@ -189,8 +189,17 @@ const FOREIGN_TICKER_OVERRIDES = {
   'MEGL':'CN','MGRX':'CN','TANH':'CN','AIH':'CN','ATIF':'CN','CMCM':'CN','GHG':'CN',
   'GSUN':'CN','JFIN':'CN','NCTY':'CN','DDL':'CN','OPRT':'CN','BZ':'CN','LXEH':'CN',
   'DOYU':'CN','SOL':'CN','EZGO':'CN','TWND':'CN','SY':'CN','ZJYL':'CN','LOBO':'CN',
+  // Additional Chinese microcaps (commonly seen in small-cap pump alerts)
+  'AEHL':'CN','DXF':'CN','BIMI':'CN','BTOG':'CN','CAAS':'CN','CBAT':'CN','CCM':'CN',
+  'CETY':'CN','CJET':'CN','CLEU':'CN','CLPS':'CN','CNET':'CN','CNEY':'CN','DDC':'CN',
+  'DOGZ':'CN','GLG':'CN','GMM':'CN','GSMG':'CN','HKD':'CN','HUDI':'CN','IH':'CN',
+  'JFU':'CN','JG':'CN','JZ':'CN','KXIN':'CN','LICN':'CN','MGIH':'CN','MHUA':'CN',
+  'NAAS':'CN','NIPG':'CN','NVFY':'CN','SXTC':'CN','TIAN':'CN','YGMZ':'CN','YOOV':'CN',
+  'AIFU':'CN','XHG':'CN','MFI':'CN','UTSI':'CN','HOLO':'CN','EPOW':'CN','ICCT':'CN',
+  'YIBO':'CN','SISI':'CN','TROO':'CN','QYOU':'CN','WETG':'CN','SUGP':'CN','QUCY':'CN',
+  'BRTX':'CN','TPST':'CN','MTC':'CN','SNAL':'CN','TGL':'CN','GFAI':'CN','BNRG':'CN',
   // Hong Kong
-  'PNGAY':'HK','LFC':'HK','CHL':'HK','LI':'CN',
+  'PNGAY':'HK','LFC':'HK','CHL':'HK',
   // Israel
   'NRSN':'IL','TEVA':'IL','CHKP':'IL','NICE':'IL','MNDY':'IL','WIX':'IL','SOLY':'IL',
   'CYBR':'IL','RDWR':'IL','TARO':'IL','TOMI':'IL','GRWG':'IL','ELBT':'IL','PLTK':'IL',
