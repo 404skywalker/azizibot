@@ -266,18 +266,24 @@ async function getTickerDetails(ticker){
 }
 async function getFmpProfile(ticker){
   const c=fmpProfileCache.get(ticker);
-  if(c&&Date.now()-c.ts<12*60*60*1000) return c.data; // cache 12h
+  if(c&&Date.now()-c.ts<12*60*60*1000) return c.data;
   try{
     const r=await fmpGet(`/api/v3/profile/${ticker}`);
-    const data=(r&&r[0])||{};
+    if(!r||!Array.isArray(r)||!r[0]){
+      console.log(`[FMP Profile] ${ticker}: bad response → ${JSON.stringify(r)?.slice(0,120)}`);
+      fmpProfileCache.set(ticker,{data:{},ts:Date.now()-11*60*60*1000}); // retry in 1h
+      return {};
+    }
+    const data=r[0];
     fmpProfileCache.set(ticker,{data,ts:Date.now()});
     if(data.country){
       fmpCountryMap.set(ticker,data.country);
-      if(data.country.toUpperCase()!=='US'&&data.country.toUpperCase()!=='UNITED STATES')
-        console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)}`);
+      console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)}`);
+    } else {
+      console.log(`[Flag] ${ticker}: no country in FMP response`);
     }
     return data;
-  }catch(e){return {};}
+  }catch(e){console.error(`[FMP Profile] ${ticker} error:`,e.message);return {};}
 }
 
 async function getNewsUrl(ticker){
