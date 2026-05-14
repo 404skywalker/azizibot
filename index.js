@@ -1300,11 +1300,17 @@ async function checkFilings(){
 
 // ─── Halt + Resume alerts (NASDAQ RSS) ────────────────────────────────────────
 // NASDAQ Trader publishes a free, real-time RSS feed of all US equity trade
-// halts. We poll every 30s and fire alerts on:
+// halts. Polled every 5s (own setInterval, decoupled from main loop). Alerts:
 //   - new halts: tracked tickers OR small-caps under $20 (catches new movers)
 //   - resumes: detected two ways — scheduled resume time has passed, OR the
 //     halt entry has DISAPPEARED from the RSS (the feed only lists currently-
 //     halted issues, so disappearance = resumed)
+//
+// Critical correctness fixes 2026-05-14:
+//   - Use haltTime from RSS as the displayed timestamp (not detection time)
+//   - Suppress duplicate resume alert if halt is already over at first sight
+//   - First poll after restart only sets a baseline — no alerts fired for
+//     halts that were already in effect before we came online
 // Format matches NuntioBot style: time-with-seconds + direction (UP/DOWN) for
 // volatility halts. Trader-relevant codes only.
 const HALT_ALERT_CODES = new Set(['T1','T2','T5','T12','LUDP','H10','H11']);
@@ -1321,12 +1327,17 @@ const HALT_REASON_SHORT = {
 // Codes where direction (UP/DOWN) is meaningful — price hit a limit band
 const HALT_DIRECTIONAL = new Set(['T5','LUDP','LUDS']);
 
-// haltState: composite key → {ticker, code, reason, haltedAt, resumeAt, ...}
+// haltState: composite key → {ticker, code, reason, haltedAt, resumeAt,
+//                              haltTimeOriginal, resumeTimeOriginal,
+//                              alertedHalt, alertedResume}
 const haltState = new Map();
-// Tickers currently in the RSS feed (cleared and rebuilt each poll). Used to
-// detect resumes: keys in PREVIOUS set but not in CURRENT set = resumed.
+// Tickers currently in the RSS feed (rebuilt each poll). Used to detect
+// resumes: keys in PREVIOUS set but not in CURRENT set = resumed.
 let currentlyHalted = new Set();
 let lastHaltPoll = 0;
+// First poll after startup just sets a baseline — don't alert on halts that
+// were already in effect before we came online. Prevents restart noise.
+let firstHaltPoll = true;
 
 // Parse "MM/DD/YYYY" + "HH:MM:SS" (NASDAQ publishes everything in ET) into
 // UTC ms for comparison with Date.now(). DST handled approximately — sub-day
@@ -1345,17 +1356,20 @@ function parseEtToUtcMs(dateStr, timeStr){
 }
 
 async function pollHalts(){
-  if(Date.now() - lastHaltPoll < 30_000) return;
+  // Internal throttle: 5s minimum between fetches (matches setInterval cadence)
+  if(Date.now() - lastHaltPoll < 5_000) return;
   lastHaltPoll = Date.now();
   try {
     const xml = await rawGet('https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts', {
       'User-Agent': 'AziziBot/1.0',
       'Accept': 'application/rss+xml, text/xml, */*',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
     });
     if(!xml || xml.length < 200) return;
     const items = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
     const nowHalted = new Set();
-    let newHalts = 0, resumes = 0;
+    let newHalts = 0, resumes = 0, baselined = 0;
 
     // First pass: parse all items, register new halts, fire halt alerts
     for(const itemXml of items){
@@ -1382,10 +1396,22 @@ async function pollHalts(){
           ticker, code,
           reason: HALT_REASON_SHORT[code] || code,
           haltedAt: haltedAt || Date.now(),
-          resumeAt, resumeTimeOriginal: resumeTime,
-          alertedHalt: false, alertedResume: false,
+          resumeAt,
+          haltTimeOriginal: haltTime,      // ← actual halt time string for display
+          resumeTimeOriginal: resumeTime,
+          alertedHalt: false,
+          alertedResume: false,
         };
         haltState.set(key, st);
+
+        // First-poll-after-restart baseline: don't alert on halts that were
+        // already in effect when we came online. Prevents restart noise.
+        if(firstHaltPoll){
+          st.alertedHalt = true;
+          st.alertedResume = true;
+          baselined++;
+          continue;
+        }
       } else if(resumeAt > 0 && !st.resumeAt){
         // Resume time was just announced — store but don't re-alert on halt
         st.resumeAt = resumeAt;
@@ -1398,10 +1424,18 @@ async function pollHalts(){
           await fireHaltAlert(st);
           newHalts++;
         }
-        st.alertedHalt = true; // mark even if we didn't alert
+        st.alertedHalt = true; // mark even if we didn't alert (avoids re-eval)
+
+        // CRITICAL: if the halt is ALREADY over at first detection (we were
+        // late), suppress the resume alert entirely. The halt message already
+        // shows "Resume HH:MM ET" so user knows it's resolved. Without this,
+        // we fire halt + resume back-to-back as the user observed.
+        if(st.resumeAt > 0 && Date.now() >= st.resumeAt){
+          st.alertedResume = true;
+        }
       }
 
-      // Resume alert path 1: scheduled resume time has passed
+      // Resume alert path 1: scheduled resume time passed AFTER halt alert fired
       if(st.alertedHalt && st.resumeAt > 0 && !st.alertedResume && Date.now() >= st.resumeAt){
         await fireResumeAlert(st);
         st.alertedResume = true;
@@ -1409,22 +1443,26 @@ async function pollHalts(){
       }
     }
 
-    // Second pass: items that were in the PREVIOUS poll but NOT this one =
-    // disappeared from RSS = resumed. Fires for any halt we previously alerted
-    // on, even without a scheduled resume time.
-    for(const key of currentlyHalted){
-      if(!nowHalted.has(key)){
-        const st = haltState.get(key);
-        if(st && st.alertedHalt && !st.alertedResume){
-          await fireResumeAlert(st);
-          st.alertedResume = true;
-          resumes++;
+    // Second pass: items in PREVIOUS poll but NOT in this one = disappeared
+    // from RSS = resumed. Catches resumes when the RSS never published a
+    // resume time. Skip on first poll (no prior set to compare against).
+    if(!firstHaltPoll){
+      for(const key of currentlyHalted){
+        if(!nowHalted.has(key)){
+          const st = haltState.get(key);
+          if(st && st.alertedHalt && !st.alertedResume){
+            await fireResumeAlert(st);
+            st.alertedResume = true;
+            resumes++;
+          }
         }
       }
     }
     currentlyHalted = nowHalted;
-
-    if(newHalts || resumes) {
+    if(firstHaltPoll){
+      console.log(`[Halts] startup baseline: ${baselined} pre-existing halt(s) skipped`);
+      firstHaltPoll = false;
+    } else if(newHalts || resumes) {
       console.log(`[Halts] ${newHalts} halt(s), ${resumes} resume(s)`);
     }
     // Prune state older than 24h
@@ -1470,22 +1508,24 @@ async function snapForHalt(ticker){
 }
 
 // Format halt alert in NuntioBot style:
-//   `13:28:35` `AEHL` `Halted DOWN` 🇨🇳 | Volatility → $5.27 · 33.5M vol · Resume 13:33 ET
+//   `13:39:00` `FCUV` `Halted UP` 🇺🇸 | Volatility → $1.80 · 1.9M vol · Resume 13:44 ET
+// Timestamp = actual halt time from RSS (not detection time).
 async function fireHaltAlert(st){
-  const {ticker, code, reason, resumeTimeOriginal} = st;
-  const {timeStr} = getET();
+  const {ticker, code, reason, haltTimeOriginal, resumeTimeOriginal} = st;
+  // Use the actual halt time from the RSS feed — accurate to when the stock
+  // halted, regardless of when we detected it.
+  const timeStr = haltTimeOriginal || getET().timeStr;
   const s = await snapForHalt(ticker);
 
-  // Direction for volatility halts: positive day change = halted at the top
-  // of the band (UP), negative = halted at the bottom (DOWN). Threshold ±0.5%
-  // to avoid mis-labeling halts near flat.
+  // Direction for volatility halts: positive day change = halted at top of
+  // band (UP), negative = halted at bottom (DOWN). Threshold ±0.5%.
   let haltLabel = 'Halted';
   if(HALT_DIRECTIONAL.has(code) && s && typeof s.chgPct === 'number'){
     if(s.chgPct > 0.5) haltLabel = 'Halted UP';
     else if(s.chgPct < -0.5) haltLabel = 'Halted DOWN';
   }
 
-  // Compose the right-of-pipe content
+  // Compose right-of-pipe content
   const after = [];
   let mainPart = reason;
   if(s && s.price > 0){
@@ -1501,17 +1541,18 @@ async function fireHaltAlert(st){
 
   const line = `\`${timeStr}\` \`${ticker}\` \`${haltLabel}\` ${flag(ticker)} | ${after.join(' · ')}`;
   await postHalt({content: line});
-  console.log(`[Halt] 🛑 ${ticker} ${code} ${haltLabel}`);
+  console.log(`[Halt] 🛑 ${ticker} ${code} ${haltLabel} @ ${timeStr}`);
 }
 
 // Format resume alert in NuntioBot style (minimal):
-//   `13:27:59` `AEHL` `Resumed` 🇨🇳
+//   `13:44:00` `FCUV` `Resumed` 🇺🇸
+// Timestamp = scheduled resume time from RSS if known, else current time.
 async function fireResumeAlert(st){
-  const {ticker, code} = st;
-  const {timeStr} = getET();
+  const {ticker, code, resumeTimeOriginal} = st;
+  const timeStr = resumeTimeOriginal || getET().timeStr;
   const line = `\`${timeStr}\` \`${ticker}\` \`Resumed\` ${flag(ticker)}`;
   await postHalt({content: line});
-  console.log(`[Halt] ▶️ ${ticker} resumed (${code})`);
+  console.log(`[Halt] ▶️ ${ticker} resumed (${code}) @ ${timeStr}`);
 }
 
 // ─── Session transition sync ──────────────────────────────────────────────────
@@ -1928,9 +1969,16 @@ async function main(){
     const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...permanentWatch])].filter(t=>!subscribedTickers.has(t));
     if(newT.length) subscribeNewTickers(newT);
     await pollNews();
-    await pollHalts();
     await syncHighsAtTransition(); // capture 4PM close prices within 20s
   },20*1000);
+
+  // Halt polling runs on its OWN 5s interval, decoupled from the main loop.
+  // NASDAQ RSS is a small XML document; 5s polling is conservative and gives
+  // sub-10s detection latency on halt events. Cache-Control headers prevent
+  // any CDN caching at the edge.
+  setInterval(async()=>{
+    try { await pollHalts(); } catch(e){ console.error('[Halts] loop error:', e.message); }
+  }, 5*1000);
 
   setInterval(async()=>{
     const {hh,m}=getET();
