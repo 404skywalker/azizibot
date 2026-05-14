@@ -834,14 +834,17 @@ async function fireNHOD(ticker,price){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
   }
 
-  // Throttle: 5-minute cooldown is the ONLY pacing gate. Per user directive
-  // (2026-05-14): "for hot names so it is not repeated so many times, but if
-  // there is a new HOD move on any stocks, specially top gainers I want alerts
-  // to trigger instantly". 5min cooldown handles hot-name throttling; first
-  // alert on a ticker always fires instantly (lastAlertTime===0). No daily cap,
-  // no minimum price-move gate — every fresh NHOD past cooldown alerts.
-  if(s.lastAlertTime>0&&Date.now()-s.lastAlertTime<5*60*1000){
-    console.log(`[NHOD] ${ticker} skip: 5-min cooldown (last alert ${Math.round((Date.now()-s.lastAlertTime)/1000)}s ago)`);return;
+  // Tiered cooldown: HOT movers (top gainers / unusual volume) get a much
+  // shorter throttle so multiple NHODs in tight succession all fire — MOBX,
+  // FRMI, etc. Regular gappers stay on 5min to prevent noise. "Hot" =
+  // chgPct ≥ 50% OR rvol ≥ 5x. Both criteria capture genuinely abnormal
+  // activity (94% gainers, 5x+ relative volume); ordinary +10–20% movers
+  // on near-average volume don't qualify and stay on the longer cooldown.
+  const isHot = (gapper.chgPct >= 50) || (gapper.rvol >= 5);
+  const cooldownMs = isHot ? 90*1000 : 5*60*1000;
+  if(s.lastAlertTime>0&&Date.now()-s.lastAlertTime<cooldownMs){
+    const ageSec = Math.round((Date.now()-s.lastAlertTime)/1000);
+    console.log(`[NHOD] ${ticker} skip: ${isHot?'90s':'5min'} cooldown (last alert ${ageSec}s ago, hot=${isHot} chg=${gapper.chgPct.toFixed(0)}% rvol=${gapper.rvol.toFixed(1)}x)`);return;
   }
 
   const nhod=(s.nhod||0)+1;
