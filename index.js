@@ -429,6 +429,10 @@ async function refreshGappers(){
     console.log(`[${name}] from ${merge.size}: passed=${newGappers.length} | chg<${minChg}%:${rej.pct} p<0.10:${rej.pl} p>10:${rej.ph} vol:${rej.vol} OTC:${rej.otc} ETF:${rej.etf}`);
     if(newGappers.length>0)
       console.log(`[Gappers] ${newGappers.slice(0,5).map(g=>`${g.ticker}(${g.chgPct.toFixed(0)}%,${fmtN(g.volume)})`).join(' ')}`);
+    // Pre-fetch FMP profiles for all gappers so country flags are ready
+    for(const g of topGappers){
+      if(!fmpCountryMap.has(g.ticker)) getFmpProfile(g.ticker).catch(()=>{});
+    }
 
     topGappers=newGappers;
 
