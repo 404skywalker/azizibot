@@ -1406,13 +1406,21 @@ async function pollHalts(){
         haltState.set(key, st);
 
         // First-poll-after-restart baseline: mark the halt as evaluated (don't
-        // fire stale halt alerts) BUT leave alertedResume=false so the resume
-        // can still fire when the stock comes back online — important for
-        // tickers like TDIC that were halted during a deploy/restart.
+        // fire stale halt alerts).
+        //
+        // For resumes: only leave alertedResume=false if the halt is STILL
+        // LIVE (resume time unknown OR resume time still in the future). For
+        // halts that already resumed earlier today, suppress the resume alert
+        // — otherwise every deploy triggers a flood of historical resumes for
+        // every halt that resolved on the day. The "live halt during restart"
+        // case (TDIC class) still works because those have future resumeAt.
         if(firstHaltPoll){
           st.alertedHalt = true;
           // st.firedHaltAlert stays false → resume will re-check qualification
-          // st.alertedResume stays false → resume can still fire
+          if(st.resumeAt > 0 && Date.now() >= st.resumeAt){
+            st.alertedResume = true; // already over — don't fire ghost resume
+          }
+          // else: live halt — leave alertedResume=false so the resume fires
           baselined++;
           continue;
         }
