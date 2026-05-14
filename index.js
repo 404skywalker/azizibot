@@ -808,14 +808,14 @@ async function fireNHOD(ticker,price){
     console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
   }
 
-  if(s.lastAlertPrice>0&&price<s.lastAlertPrice*1.10){
-    console.log(`[NHOD] ${ticker} skip: need 10% above $${s.lastAlertPrice.toFixed(4)}`);return;
-  }
+  // Throttle: 5-minute cooldown is the ONLY pacing gate. Per user directive
+  // (2026-05-14): "for hot names so it is not repeated so many times, but if
+  // there is a new HOD move on any stocks, specially top gainers I want alerts
+  // to trigger instantly". 5min cooldown handles hot-name throttling; first
+  // alert on a ticker always fires instantly (lastAlertTime===0). No daily cap,
+  // no minimum price-move gate — every fresh NHOD past cooldown alerts.
   if(s.lastAlertTime>0&&Date.now()-s.lastAlertTime<5*60*1000){
-    console.log(`[NHOD] ${ticker} skip: 5-min cooldown`);return;
-  }
-  if((state.dailyCounts.get(ticker)||0)>=3){
-    console.log(`[NHOD] ${ticker} skip: max 3/day`);return;
+    console.log(`[NHOD] ${ticker} skip: 5-min cooldown (last alert ${Math.round((Date.now()-s.lastAlertTime)/1000)}s ago)`);return;
   }
 
   const nhod=(s.nhod||0)+1;
