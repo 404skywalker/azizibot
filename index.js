@@ -11,6 +11,9 @@ const APP_ID        = '1493671812247322624';
 
 const TOP_GAPPERS_WH = 'https://discord.com/api/webhooks/1493250562689597623/57UTSPu2KfLmYNBRVPvPQIa4cSfCQA8wVcqB5d0J8cWYaJf5hlsm1EuRkQ3lolChTNh3';
 const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504111128106631359/W9Ky7814ojPziIuN6loeaNgu6l8aFzUMlMtrj8vsf4egXWfiBKFv0sNKu8VO9cclmRKD';
+// Halt + resume alerts only — routed to its own #halt-alerts channel so the
+// main alert feed stays clean. Env var HALT_ALERTS_WH can override at runtime.
+const HALT_ALERTS_WH = process.env.HALT_ALERTS_WH || 'https://discord.com/api/webhooks/1504534490821689374/RStoJri7X5g5RTth-2TCEFSIyiyXvXnjx29YbGAn_Bp0tc-DzJ7qADmYI8qTpTChnIXE';
 
 // ─── Session tiers ────────────────────────────────────────────────────────────
 //
@@ -312,6 +315,18 @@ async function postToWebhook(url,payload){
 async function post(payload){
   payload.username='AziziBot';
   await postToWebhook(MAIN_CHAT_WH,payload);
+}
+// Halt + resume alerts route to their own #halt-alerts channel ONLY.
+// If HALT_ALERTS_WH is not configured, halt alerts are suppressed entirely
+// (logged to console but not posted anywhere) to keep them out of the main
+// alert feed. Set the env var to enable.
+async function postHalt(payload){
+  if(!HALT_ALERTS_WH){
+    console.log('[Halt] suppressed (HALT_ALERTS_WH not configured)');
+    return;
+  }
+  payload.username='AziziBot';
+  await postToWebhook(HALT_ALERTS_WH, payload);
 }
 function discordRest(method,path,body=null){
   return new Promise((resolve,reject)=>{
@@ -1423,7 +1438,7 @@ async function fireHaltAlert(st){
   } catch(e){}
   const resumeNote = resumeTimeOriginal ? ` | Resume: ${resumeTimeOriginal.slice(0,5)} ET` : '';
   const line = `\`${timeShort}\` 🛑 **${ticker}**${priceStr} ~ ${flag(ticker)} | \`HALT\` \`${code}\` — ${reason}${resumeNote}`;
-  await post({content: line});
+  await postHalt({content: line});
   console.log(`[Halt] 🛑 ${ticker} ${code} ${reason}`);
 }
 
@@ -1442,7 +1457,7 @@ async function fireResumeAlert(st){
   } catch(e){}
   const durStr = durMin > 0 ? ` after ${durMin}min halt` : '';
   const line = `\`${timeShort}\` ▶️ **${ticker}**${priceStr} ~ ${flag(ticker)} | \`RESUMED\`${durStr} (\`${code}\`)`;
-  await post({content: line});
+  await postHalt({content: line});
   console.log(`[Halt] ▶️ ${ticker} resumed (${code})`);
 }
 
@@ -1813,6 +1828,7 @@ async function main(){
   console.log('🤖 AziziBot v8 starting...');
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
+  console.log(`[Halts] webhook: ${HALT_ALERTS_WH ? 'CONFIGURED → #halt-alerts' : 'NOT SET → halt alerts SUPPRESSED (set HALT_ALERTS_WH env var to enable)'}`);
 
   // Check Discord session_start_limit before connecting
   try{
