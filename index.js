@@ -7,7 +7,6 @@ const WebSocket = require('ws');
 const POLY_KEY      = process.env.POLY_KEY      || '';
 const BZ_KEY        = process.env.BZ_KEY        || '';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
-const FMP_KEY       = process.env.FMP_KEY        || '';
 const APP_ID        = '1493671812247322624';
 
 const TOP_GAPPERS_WH = 'https://discord.com/api/webhooks/1493250562689597623/57UTSPu2KfLmYNBRVPvPQIa4cSfCQA8wVcqB5d0J8cWYaJf5hlsm1EuRkQ3lolChTNh3';
@@ -236,17 +235,23 @@ const FOREIGN_TICKER_OVERRIDES = {
   'YPF':'AR','GGAL':'AR','PAM':'AR','TEO':'AR',
 };
 
+// Returns a country flag emoji for every ticker, no exceptions.
+// Order of authority (highest → lowest):
+//   1. FOREIGN_TICKER_OVERRIDES — 130+ hand-curated ADRs/foreign listings
+//   2. Polygon ticker details `locale` (us = 🇺🇸, global = best-guess country code)
+//   3. Default 🇺🇸 — safe fallback so the alert format never breaks
 function flag(ticker){
   if(!ticker) return '🇺🇸';
-  // 1) Manual override map — highest confidence, used to fix FMP/Polygon ADR data quality issues
+  // 1) Manual override map — highest confidence, hand-curated for ADRs
   const ov = FOREIGN_TICKER_OVERRIDES[ticker];
   if(ov) return countryFlag(ov);
-  // 2) FMP profile country (accurate for most non-ADR foreign companies)
-  const fmpCountry = fmpCountryMap.get(ticker);
-  if(fmpCountry) return countryFlag(fmpCountry);
-  // 3) Polygon locale (least granular — only knows US vs global)
+  // 2) Polygon locale — only knows broad country codes if any
   const c = countryMap.get(ticker);
-  if(c==='IL')return'🇮🇱'; if(c==='CN')return'🇨🇳'; if(c==='GB')return'🇬🇧'; if(c==='CA')return'🇨🇦';
+  if(c==='IL') return '🇮🇱';
+  if(c==='CN') return '🇨🇳';
+  if(c==='GB') return '🇬🇧';
+  if(c==='CA') return '🇨🇦';
+  // 3) Default — never return empty, every alert gets a flag
   return '🇺🇸';
 }
 function isBadTicker(t) {
@@ -273,10 +278,6 @@ async function jsonGet(url){try{return JSON.parse(await rawGet(url));}catch(e){r
 function polyGet(path){
   const sep=path.includes('?')?'&':'?';
   return jsonGet(`https://api.polygon.io${path}${sep}apiKey=${POLY_KEY}`);
-}
-function fmpGet(path){
-  const sep=path.includes('?')?'&':'?';
-  return jsonGet(`https://financialmodelingprep.com${path}${sep}apikey=${FMP_KEY}`);
 }
 
 async function postToWebhook(url,payload){
@@ -418,7 +419,7 @@ function isRegSHO(ticker){ return regSHOSet.has((ticker||'').toUpperCase()); }
 
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
-const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), fmpProfileCache=new Map(), fmpCountryMap=new Map(), ctbCache=new Map(), fmpFloatCache=new Map();
+const countryMap=new Map(), tickerCache=new Map(), newsCache=new Map(), ctbCache=new Map();
 
 async function getTickerDetails(ticker){
   const c=tickerCache.get(ticker);
@@ -430,33 +431,6 @@ async function getTickerDetails(ticker){
     if(data.locale) countryMap.set(ticker,data.locale.toUpperCase());
     return data;
   }catch(e){return {};}
-}
-async function getFmpProfile(ticker){
-  const c=fmpProfileCache.get(ticker);
-  if(c&&Date.now()-c.ts<12*60*60*1000) return c.data;
-  if(!FMP_KEY){fmpProfileCache.set(ticker,{data:{},ts:Date.now()});return {};}
-  try{
-    // FMP migrated to /stable/ namespace. With Ultimate plan's Global Coverage,
-    // this endpoint returns correct HQ country for foreign ADRs (vs v3 which often
-    // misreported as US). Still cross-checked against FOREIGN_TICKER_OVERRIDES.
-    const r=await fmpGet(`/stable/profile?symbol=${ticker}`);
-    const arr = Array.isArray(r) ? r : (r ? [r] : []);
-    if(!arr[0]){
-      console.log(`[FMP Profile] ${ticker}: bad response → ${JSON.stringify(r)?.slice(0,120)}`);
-      fmpProfileCache.set(ticker,{data:{},ts:Date.now()-11*60*60*1000});
-      return {};
-    }
-    const data=arr[0];
-    fmpProfileCache.set(ticker,{data,ts:Date.now()});
-    if(data.country){
-      fmpCountryMap.set(ticker,data.country);
-      const adrTag = data.isAdr ? ' [ADR]' : '';
-      console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)}${adrTag} | sector: ${data.sector||'--'}`);
-    } else {
-      console.log(`[Flag] ${ticker}: no country field (sector=${data.sector||'--'}, exchange=${data.exchangeShortName||'--'})`);
-    }
-    return data;
-  }catch(e){console.error(`[FMP Profile] ${ticker} error:`,e.message);return {};}
 }
 
 async function getNewsUrl(ticker){
@@ -484,65 +458,81 @@ async function getRecentSplit(ticker){
 }
 // FMP shares-float endpoint (Ultimate plan) — reliable structured data,
 // replaces fragile Finviz HTML scraping for float. Cached 12h.
-async function getFmpFloat(ticker){
-  if(!FMP_KEY) return null;
-  const c=fmpFloatCache.get(ticker);
-  if(c&&Date.now()-c.ts<12*60*60*1000) return c.data;
-  try{
-    const r=await fmpGet(`/stable/shares-float?symbol=${ticker}`);
-    const arr=Array.isArray(r)?r:(r?[r]:[]);
-    if(!arr[0]){
-      fmpFloatCache.set(ticker,{data:null,ts:Date.now()-11*60*60*1000});
+// ─── Polygon Short Interest ──────────────────────────────────────────────────
+// Replaces fragile Finviz HTML scrape with Polygon's official endpoint.
+// FINRA cadence: settlement data refreshed every 2 weeks. Cache 24h.
+// Returns SI% computed as short_interest / shares_outstanding * 100.
+const polySICache = new Map();
+async function getPolySI(ticker){
+  const c = polySICache.get(ticker);
+  if(c && Date.now()-c.ts < 24*60*60*1000) return c.data;
+  try {
+    // Latest record for this ticker. Polygon returns highest settlement_date first
+    // when sorted desc; defaulting to limit=1 keeps the response tiny.
+    const r = await polyGet(`/stocks/v1/short-interest?ticker=${ticker}&limit=1&sort=settlement_date.desc`);
+    if(!r || !Array.isArray(r.results) || r.results.length === 0){
+      polySICache.set(ticker,{data:null,ts:Date.now()-23*60*60*1000}); // short-cache empty
       return null;
     }
-    const d=arr[0];
-    const data={
-      floatShares: +d.floatShares || +d.freeFloat || 0,
-      outstandingShares: +d.outstandingShares || 0,
-      date: d.date || '',
+    const row = r.results[0];
+    const shortShares = +row.short_interest || 0;
+    const adv = +row.avg_daily_volume || 0;
+    const dtc = +row.days_to_cover || 0;
+    // Get share count for SI% calc — share_class_shares_outstanding from ticker details
+    const det = await getTickerDetails(ticker);
+    const sharesOut = +det.share_class_shares_outstanding || +det.weighted_shares_outstanding || 0;
+    const siPct = (shortShares > 0 && sharesOut > 0) ? (shortShares / sharesOut) * 100 : 0;
+    const data = {
+      shortShares,
+      adv,
+      dtc,
+      sharesOut,
+      siPct,                                       // e.g. 18.7
+      siStr: siPct > 0 ? siPct.toFixed(1) + '%' : '--',
+      settlementDate: row.settlement_date || '',
     };
-    fmpFloatCache.set(ticker,{data,ts:Date.now()});
+    polySICache.set(ticker,{data,ts:Date.now()});
     return data;
-  }catch(e){
-    console.error(`[FMP Float] ${ticker} error:`,e.message);
+  } catch(e) {
+    console.error(`[Poly SI] ${ticker} error:`, e.message);
     return null;
   }
 }
 
+// Stats for alerts: SI from Polygon, Float from Polygon shares-outstanding,
+// IO still from Finviz (no clean replacement — 13F aggregation is heavy).
 async function getFinvizStats(ticker){
-  const r={si:'--',float:'--',io:'--'};
-  // Try FMP for float first (Ultimate plan — much more reliable than HTML scrape)
-  const fmpFloat=await getFmpFloat(ticker);
-  if(fmpFloat && fmpFloat.floatShares > 0){
-    r.float = fmtNS(fmpFloat.floatShares).trim();
+  const r = {si:'--', float:'--', io:'--'};
+  // Polygon SI (official FINRA data)
+  const psi = await getPolySI(ticker);
+  if(psi){
+    if(psi.siStr !== '--') r.si = psi.siStr;
+    if(psi.sharesOut > 0) r.float = fmtNS(psi.sharesOut).trim();
   }
-  // Finviz still needed for SI and IO (FMP doesn't have SI; IO would need 13F aggregation)
-  try{
-    const html=await rawGet(`https://finviz.com/quote.ashx?t=${ticker}`,{
-      'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept':'text/html','Accept-Language':'en-US,en;q=0.5'
-    });
-    if(html.length>1000){
-      // Only fall back to Finviz float if FMP didn't provide one
-      if(r.float==='--'){
-        const fm=html.match(/Shs Float<\/b><\/td>\s*<td[^>]*>([^<]+)<\/td>/i)||html.match(/Shs Float[^<]*<\/td>[^<]*<td[^>]*>([^<]+)<\/td>/i);
-        if(fm&&fm[1]&&fm[1]!=='-') r.float=fm[1].trim();
+  // Finviz fallback for IO (and a SI/float backup if Polygon is empty)
+  if(r.io === '--' || r.si === '--' || r.float === '--'){
+    try {
+      const html = await rawGet(`https://finviz.com/quote.ashx?t=${ticker}`, {
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept':'text/html','Accept-Language':'en-US,en;q=0.5'
+      });
+      if(html.length > 1000){
+        if(r.float === '--'){
+          const fm = html.match(/Shs Float<\/b><\/td>\s*<td[^>]*>([^<]+)<\/td>/i) || html.match(/Shs Float[^<]*<\/td>[^<]*<td[^>]*>([^<]+)<\/td>/i);
+          if(fm && fm[1] && fm[1] !== '-') r.float = fm[1].trim();
+        }
+        if(r.si === '--'){
+          const sm = html.match(/Short Float[^<]*<\/b><\/td>\s*<td[^>]*>([\d.]+%?)<\/td>/i) || html.match(/Short Float[^<]*<\/td>[^<]*<td[^>]*>([\d.]+%?)<\/td>/i);
+          if(sm && sm[1] && sm[1] !== '-') r.si = sm[1].includes('%') ? sm[1].trim() : sm[1].trim() + '%';
+        }
+        const im = html.match(/Inst Own[^<]*<\/b><\/td>\s*<td[^>]*>([\d.]+%?)<\/td>/i) || html.match(/Inst Own[^<]*<\/td>[^<]*<td[^>]*>([\d.]+%?)<\/td>/i);
+        if(im && im[1] && im[1] !== '-') r.io = im[1].includes('%') ? im[1].trim() : im[1].trim() + '%';
       }
-      const sm=html.match(/Short Float[^<]*<\/b><\/td>\s*<td[^>]*>([\d.]+%?)<\/td>/i)||html.match(/Short Float[^<]*<\/td>[^<]*<td[^>]*>([\d.]+%?)<\/td>/i);
-      if(sm&&sm[1]&&sm[1]!=='-') r.si=sm[1].includes('%')?sm[1].trim():sm[1].trim()+'%';
-      const im=html.match(/Inst Own[^<]*<\/b><\/td>\s*<td[^>]*>([\d.]+%?)<\/td>/i)||html.match(/Inst Own[^<]*<\/td>[^<]*<td[^>]*>([\d.]+%?)<\/td>/i);
-      if(im&&im[1]&&im[1]!=='-') r.io=im[1].includes('%')?im[1].trim():im[1].trim()+'%';
-    }
-  }catch(e){}
-  if(r.float==='--'){
-    try{
-      const det=await getTickerDetails(ticker);
-      const sh=det.share_class_shares_outstanding||det.weighted_shares_outstanding||0;
-      if(sh>0) r.float=fmtN(sh)+' (out)';
-    }catch(e){}
+    } catch(e){}
   }
   return r;
 }
+
 async function getGreenBars(ticker){
   // NuntioBot checks multiple bar timeframes and shows whichever has the most
   // consecutive green closes. We check 1m and 3m and pick the higher count.
@@ -594,7 +584,7 @@ async function getCTB(ticker){
 // ─── State ────────────────────────────────────────────────────────────────────
 let topGappers=[];
 const dayWatchlist=new Map();
-const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),sentInsider:new Set(),sentGrades:new Set(),morningPosted:new Set()};
+const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set()};
 const wsDebounce=new Map();
 const closePrice=new Map(); // ticker → price at 4PM close
 // recentRunners: tickers that qualified as gappers in the last 5 days
@@ -615,8 +605,8 @@ async function postEventAlert(ticker, event) {
   const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
   if (price < 0.10) { console.log(`[Alert] ${ticker} skip: price ${price}`); return; }
 
-  const [det, fv, prof] = await Promise.all([
-    getTickerDetails(ticker), getFinvizStats(ticker), getFmpProfile(ticker).catch(()=>({})),
+  const [det, fv] = await Promise.all([
+    getTickerDetails(ticker), getFinvizStats(ticker),
   ]);
   const mc = det.market_cap || 0;
   const { timeStr } = getET();
@@ -629,7 +619,7 @@ async function postEventAlert(ticker, event) {
 
   const ageMs = Date.now() - new Date(event.publishedTime || Date.now()).getTime();
   const ageStr = fmtAge(Math.max(ageMs, 0));
-  const typePill = `\`${event.type}\``; // `PR` `SEC` `INSIDER` `GRADE`
+  const typePill = `\`${event.type}\``; // `PR` or `SEC`
   const titlePart = event.title || '';
   const linkPart = event.url ? ` - [Link](<${event.url}>)` : '';
   const bullet = `> • \`${ageStr}\` ${typePill} ${titlePart}${linkPart}`;
@@ -720,10 +710,6 @@ async function refreshGappers(){
     console.log(`[${name}] from ${merge.size}: passed=${newGappers.length} | chg<${minChg}%:${rej.pct} p<0.10:${rej.pl} p>10:${rej.ph} vol:${rej.vol} OTC:${rej.otc} ETF:${rej.etf}`);
     if(newGappers.length>0)
       console.log(`[Gappers] ${newGappers.slice(0,5).map(g=>`${g.ticker}(${g.chgPct.toFixed(0)}%,${fmtN(g.volume)})`).join(' ')}`);
-    // Pre-fetch FMP profiles for all gappers so country flags are ready
-    for(const g of topGappers){
-      if(!fmpCountryMap.has(g.ticker)) getFmpProfile(g.ticker).catch(()=>{});
-    }
 
     topGappers=newGappers;
 
@@ -735,8 +721,6 @@ async function refreshGappers(){
             rvol:g.rvol,price:g.price,high:g.high,lockedAt:name});
           recentRunners.set(g.ticker, Date.now());
           console.log(`[Watch] +${g.ticker} +${g.chgPct.toFixed(1)}% vol:${fmtN(g.volume)} [${name}]`);
-          // Pre-fetch FMP profile so country flag is ready before first alert
-          getFmpProfile(g.ticker).catch(()=>{});
         }
       }
     }
@@ -848,12 +832,10 @@ async function fireNHOD(ticker,price){
   const livePct  = (()=>{const p=livePrice;const pv=(td&&td.prevDay&&td.prevDay.c)||0;return p&&pv?((p-pv)/pv)*100:gapper.chgPct;})();
   const liveRvol = livePrev>0?(liveVol*390)/(Math.max(etMin-240,1)*livePrev):gapper.rvol||0;
 
-  // Parallel-fetch all enrichment data. FmpProfile + CTB now included here
-  // so the sequential await on line ~680 (FMP) doesn't block alert latency.
-  const [newsUrl,rs,det,fv,greenBars,ctb,prof]=await Promise.all([
+  // Parallel-fetch all enrichment data.
+  const [newsUrl,rs,det,fv,greenBars,ctb]=await Promise.all([
     getNewsUrl(ticker),getRecentSplit(ticker),getTickerDetails(ticker),
     getFinvizStats(ticker),getGreenBars(ticker),getCTB(ticker),
-    getFmpProfile(ticker).catch(()=>({})),
   ]);
 
   const mc=det.market_cap||0;
@@ -871,14 +853,11 @@ async function fireNHOD(ticker,price){
 
   // tLink: bold ticker, made clickable when there's a recent news URL
   const tLink=newsUrl?`[**${ticker}**](<${newsUrl}>)`:`**${ticker}**`;
-  const sector   = prof.sector||'';
-  const industry = prof.industry||'';
-  const sectorStr= sector ? ` | ${sector}${industry?` · ${industry}`:''}` : '';
 
   // NuntioBot exact format (verified against 5 screenshots 2026-05-14):
   // `09:44` ↗ **CREG** <$.50c · 1 `NHOD` ~ 🇨🇳 | **RVol:** 6.0x | `Reg SHO` | `High CTB`
   // `08:55` ↗ **MOBX** <$3 `47%` · 7 `3 green bars 1m` ~ 🇺🇸 | **RVol:** 1.8x | **Vol:** 5.7 M | **SI:** 16.1% | [`PR`↗](url)
-  //   time-pill  bold-ticker  PLAIN-price  pct-pill  · count  label-pill  ~ flag  | **labels:** vals | regSHO | CTB | sector | PR
+  //   time-pill  bold-ticker  PLAIN-price  pct-pill  · count  label-pill  ~ flag  | **labels:** vals | regSHO | CTB | PR
   const timeShort = timeStr.slice(0,5);
   const pctCode   = livePct!==0 ? ` \`${Math.abs(livePct).toFixed(0)}%\`` : '';
   const afterStr  = afterLull ? ` after-lull` : '';
@@ -895,7 +874,7 @@ async function fireNHOD(ticker,price){
   const ctbStr    = (ctb && ctb.fee >= 20) ? ' | `High CTB`' : '';
   const prData2   = newsCache.get(ticker);
   const prLink    = prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url ? ` | [\`PR\`↗](<${prData2.url}>)` : '';
-  const line = `\`${timeShort}\` ↗ ${tLink} ${priceFlag(price)}${pctCode} · ${nhod} ${labelStr}${afterStr} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${regSHOStr}${ctbStr}${rsStr}${sectorStr}${prLink}`;
+  const line = `\`${timeShort}\` ↗ ${tLink} ${priceFlag(price)}${pctCode} · ${nhod} ${labelStr}${afterStr} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${regSHOStr}${ctbStr}${rsStr}${prLink}`;
 
   await post({content:line});
   console.log(`[ALERT] posted OK`);
@@ -981,33 +960,6 @@ async function pollNews(){
   }catch(e){console.error('[Poly News] error:',e.message);}
 }
 
-// ─── FMP news poll ───────────────────────────────────────────────────────────
-let lastFmpPoll=0;
-async function pollFmpNews(){
-  if(!isActive()||!FMP_KEY) return;
-  if(Date.now()-lastFmpPoll<8000) return;
-  lastFmpPoll=Date.now();
-  try{
-    // FMP killed v4/stock-news-sentiments-rss-feed in 2025. Migrated to the new
-    // /stable/ namespace. press-releases-latest matches our intent (corporate PRs).
-    const r=await fmpGet('/stable/news/press-releases-latest?page=0&limit=50');
-    if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,160));return;}
-    const items=r,cutoff=Date.now()-15*60*1000;
-    let matched=0, total=items.length;
-    for(const n of items){
-      // /stable/ field names may differ — accept all common variants defensively
-      const pubStr = n.publishedDate || n.published_date || n.date;
-      if(!pubStr || new Date(pubStr).getTime()<cutoff) continue;
-      const ticker = ((n.symbol || (Array.isArray(n.symbols)&&n.symbols[0]) || '')+'').toUpperCase();
-      if(!ticker) continue;
-      await handleNewsItem(n.title||'',[ticker],n.url||n.link||'',pubStr);
-      matched++;
-    }
-    if(matched>0) console.log(`[FMP News] ${matched}/${total} items processed`);
-    else if(total>0) console.log(`[FMP News] ${total} items returned, none fresh (cutoff 15m)`);
-  }catch(e){console.error('[FMP News] error:',e.message);}
-}
-
 // ─── SEC filings ──────────────────────────────────────────────────────────────
 let lastFilingCheck=0;
 async function checkFilings(){
@@ -1036,122 +988,6 @@ async function checkFilings(){
       }
     }catch(e){}
     await sleep(200);
-  }
-}
-
-
-
-// ─── Insider trading alerts (FMP Ultimate) ───────────────────────────────────
-// Polls FMP's latest insider trades. Fires only on PURCHASES (P-* transaction
-// types with acquisition flag), since insider BUYING is the signal that matters —
-// sales are routine (taxes, comp, diversification). Same gates as PR alerts.
-let lastInsiderPoll = 0;
-async function pollInsiderTrades(){
-  if(!isActive() || !FMP_KEY) return;
-  if(Date.now() - lastInsiderPoll < 30000) return; // poll every 30s
-  lastInsiderPoll = Date.now();
-  try {
-    const r = await fmpGet('/stable/insider-trading-latest?page=0&limit=100');
-    if(!Array.isArray(r)){console.log('[Insider] unexpected response:',JSON.stringify(r)?.slice(0,160));return;}
-    const cutoff = Date.now() - 15*60*1000; // last 15min
-    let matched = 0;
-    for(const t of r) {
-      const txType = (t.transactionType || '').toUpperCase();
-      const aod = (t.acquistionOrDisposition || t.acquisitionOrDisposition || '').toUpperCase();
-      // Filter: real purchases only (P-Purchase + Acquisition flag).
-      // Skips A-Award, M-Exempt, S-Sale, G-Gift, etc. — those aren't directional signals.
-      if(!txType.startsWith('P-') || aod !== 'A') continue;
-      const ticker = (t.symbol || '').toUpperCase();
-      if(!ticker || isBadTicker(ticker) || isEtf(ticker)) continue;
-      // Only fire for tracked tickers (same as PR alerts)
-      const isTracked = topGappers.some(g=>g.ticker===ticker)
-                     || dayWatchlist.has(ticker)
-                     || recentRunners.has(ticker)
-                     || permanentWatch.has(ticker);
-      if(!isTracked) continue;
-      // Time filter: must be recent
-      const filedTs = new Date(t.filingDate || t.transactionDate || 0).getTime();
-      if(filedTs <= cutoff) continue;
-      // Dedup
-      const id = `${ticker}_${t.reportingCik||''}_${t.transactionDate||''}_${t.securitiesTransacted||0}`;
-      if(state.sentInsider.has(id)) continue;
-      state.sentInsider.add(id);
-
-      const shares = +t.securitiesTransacted || 0;
-      const px = +t.price || 0;
-      const value = shares * px;
-      const who = t.reportingName ? t.reportingName.split(/\s+/).slice(0,3).join(' ') : 'Insider';
-      const role = t.typeOfOwner || 'insider';
-      const valStr = value > 0 ? ` ($${fmtNS(value).trim()})` : '';
-      const title = `${who} (${role}) bought ${fmtN(shares)} shares${valStr}`;
-
-      postEventAlert(ticker, {
-        type: 'INSIDER',
-        title,
-        url: t.link || '',
-        publishedTime: t.filingDate || t.transactionDate,
-        isDrop: false,
-      }).catch(e => console.error(`[postEventAlert INSIDER] ${ticker}:`, e.message));
-      matched++;
-    }
-    if(matched > 0) console.log(`[Insider] ${matched} purchase alerts fired`);
-    if(state.sentInsider.size > 500){const a=[...state.sentInsider];state.sentInsider.clear();a.slice(-200).forEach(x=>state.sentInsider.add(x));}
-  } catch(e) {
-    console.error('[Insider] error:', e.message);
-  }
-}
-
-// ─── Analyst grade change alerts (FMP Ultimate) ──────────────────────────────
-// Polls FMP's latest analyst rating changes. Fires for upgrades, downgrades,
-// and new coverage initiations. Title includes firm + action + grade transition.
-let lastGradesPoll = 0;
-async function pollGrades(){
-  if(!isActive() || !FMP_KEY) return;
-  if(Date.now() - lastGradesPoll < 30000) return; // poll every 30s
-  lastGradesPoll = Date.now();
-  try {
-    const r = await fmpGet('/stable/grades-latest-news?page=0&limit=100');
-    if(!Array.isArray(r)){console.log('[Grades] unexpected response:',JSON.stringify(r)?.slice(0,160));return;}
-    const cutoff = Date.now() - 15*60*1000;
-    let matched = 0;
-    for(const g of r) {
-      const ticker = (g.symbol || '').toUpperCase();
-      if(!ticker || isBadTicker(ticker) || isEtf(ticker)) continue;
-      const isTracked = topGappers.some(x=>x.ticker===ticker)
-                     || dayWatchlist.has(ticker)
-                     || recentRunners.has(ticker)
-                     || permanentWatch.has(ticker);
-      if(!isTracked) continue;
-      const ts = new Date(g.publishedDate || g.date || 0).getTime();
-      if(ts <= cutoff) continue;
-      // Dedup
-      const id = `${ticker}_${g.gradingCompany||''}_${g.publishedDate||g.date||''}`;
-      if(state.sentGrades.has(id)) continue;
-      state.sentGrades.add(id);
-
-      const firm = g.gradingCompany || g.publisher || 'Analyst';
-      const action = (g.action || '').toLowerCase(); // upgrade/downgrade/hold/initiate
-      const newG = g.newGrade || '';
-      const prevG = g.previousGrade || '';
-      let title;
-      if(action === 'upgrade') title = `${firm}: upgraded${prevG?` from ${prevG}`:''} to ${newG}`;
-      else if(action === 'downgrade') title = `${firm}: downgraded${prevG?` from ${prevG}`:''} to ${newG}`;
-      else if(action === 'initiate') title = `${firm}: initiated coverage at ${newG}`;
-      else title = `${firm}: ${newG||'rating update'}`;
-
-      postEventAlert(ticker, {
-        type: 'GRADE',
-        title,
-        url: g.newsURL || g.url || '',
-        publishedTime: g.publishedDate || g.date,
-        isDrop: action === 'downgrade',
-      }).catch(e => console.error(`[postEventAlert GRADE] ${ticker}:`, e.message));
-      matched++;
-    }
-    if(matched > 0) console.log(`[Grades] ${matched} grade alerts fired`);
-    if(state.sentGrades.size > 500){const a=[...state.sentGrades];state.sentGrades.clear();a.slice(-200).forEach(x=>state.sentGrades.add(x));}
-  } catch(e) {
-    console.error('[Grades] error:', e.message);
   }
 }
 
@@ -1434,8 +1270,7 @@ async function main(){
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
-  console.log(`[FMP] key: ${FMP_KEY?FMP_KEY.slice(0,8)+'...':'NOT SET — add FMP_KEY to Railway'}}`);
-  console.log('[Key]   Vol floor = 0 for all pre-market. % gain is the only pre-market quality gate.');
+  console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
 
   // Check Discord session_start_limit before connecting
   try{
@@ -1447,21 +1282,17 @@ async function main(){
     }
   }catch(e){}
 
-  fmpProfileCache.clear(); fmpCountryMap.clear();
-  // Test FMP connectivity on startup
-  if(FMP_KEY){
-    try{
-      const testR=await fmpGet('/stable/profile?symbol=AAPL');
-      const t = Array.isArray(testR) ? testR[0] : testR;
-      if(t&&t.country){
-        console.log(`[FMP] stable/profile working ✓ (AAPL country: ${t.country}, sector: ${t.sector||'--'})`);
-      } else {
-        console.log(`[FMP] stable/profile failed: ${JSON.stringify(testR)?.slice(0,160)}`);
-      }
-    }catch(e){console.error('[FMP] connectivity test failed:',e.message);}
-  } else {
-    console.log('[FMP] FMP_KEY not set — skipping FMP features');
-  }
+  // Test Polygon short interest endpoint on startup
+  try {
+    const testSI = await polyGet('/stocks/v1/short-interest?ticker=AAPL&limit=1&sort=settlement_date.desc');
+    if(testSI && Array.isArray(testSI.results) && testSI.results.length > 0){
+      const t = testSI.results[0];
+      console.log(`[Poly SI] working ✓ (AAPL short_interest: ${fmtN(t.short_interest)}, settlement: ${t.settlement_date})`);
+    } else {
+      console.log(`[Poly SI] unexpected response: ${JSON.stringify(testSI)?.slice(0,200)}`);
+    }
+  } catch(e) { console.error('[Poly SI] connectivity test failed:', e.message); }
+
   loadPermanentWatchlist();
   await refreshEtfList();
   await refreshRegSHO();
@@ -1485,15 +1316,12 @@ async function main(){
     const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...permanentWatch])].filter(t=>!subscribedTickers.has(t));
     if(newT.length) subscribeNewTickers(newT);
     await pollNews();
-    await pollFmpNews();
-    await pollInsiderTrades();
-    await pollGrades();
     await syncHighsAtTransition(); // capture 4PM close prices within 20s
   },20*1000);
 
   setInterval(async()=>{
     const {hh,m}=getET();
-    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();state.sentInsider.clear();state.sentGrades.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();ctbCache.clear();fmpFloatCache.clear();
+    if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();
       // Prune recentRunners older than 5 days
       const fiveDaysAgo=Date.now()-5*24*60*60*1000;
       for(const [t,ts] of recentRunners) if(ts<fiveDaysAgo) recentRunners.delete(t);
