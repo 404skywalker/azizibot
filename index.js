@@ -490,11 +490,26 @@ async function fireNHOD(ticker,price){
   // All tickers must pass session tier gates (permanentWatch = same as watchlist)
   const tier=getTier(etMin);
   if(!tier) return;
-  // AH vol gate: fresh names need 500K, but top day gainers already proven with day volume
   const checkVol = Math.max(gapper.volume||0, s.peakVol||0);
-  const isDayGapper = dayWatchlist.has(ticker) || (s.peakVol||0) >= 500_000;
-  if(tier.minVol>0 && !isDayGapper && checkVol<tier.minVol){
-    console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (fresh)`);return;
+  if(tier.minVol>0){
+    if(tier.name==='PRE'){
+      // Pre-market: Polygon day.v is always 0 before open — don't penalize live scanner tickers
+      // Only apply vol gate to watchlist-only tickers (they bypassed the scanner)
+      if(isWatchOnly && checkVol<tier.minVol){
+        console.log(`[NHOD] ${ticker} skip: PRE vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (watch)`);return;
+      }
+    } else if(tier.name==='AH'){
+      // AH: fresh names need 500K; day gainers with big peakVol bypass
+      const isDayGapper = dayWatchlist.has(ticker)||(s.peakVol||0)>=500_000;
+      if(!isDayGapper && checkVol<tier.minVol){
+        console.log(`[NHOD] ${ticker} skip: AH vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (fresh)`);return;
+      }
+    } else {
+      // MKT: full vol gate applies to all
+      if(checkVol<tier.minVol){
+        console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(checkVol)}<${fmtN(tier.minVol)}`);return;
+      }
+    }
   }
   // In AH: measure move from 4PM close price, not all-day chgPct.
   // Require ≥5% above 4PM close to confirm a real AH move.
@@ -689,7 +704,7 @@ async function pollFmpNews(){
   if(Date.now()-lastFmpPoll<8000) return;
   lastFmpPoll=Date.now();
   try{
-    const r=await fmpGet('/api/v3/stock_news?limit=50');
+    const r=await fmpGet('/api/v4/general_news?page=0');
     if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,100));return;}
     const items=r,cutoff=Date.now()-15*60*1000;
     let matched=0;
