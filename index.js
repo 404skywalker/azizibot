@@ -195,6 +195,8 @@ const FOREIGN_TICKER_OVERRIDES = {
   'NRSN':'IL','TEVA':'IL','CHKP':'IL','NICE':'IL','MNDY':'IL','WIX':'IL','SOLY':'IL',
   'CYBR':'IL','RDWR':'IL','TARO':'IL','TOMI':'IL','GRWG':'IL','ELBT':'IL','PLTK':'IL',
   'CMCT':'IL','MTNB':'IL','NVMI':'IL','SLDB':'IL','GLBE':'IL','BVS':'IL','MNTS':'IL',
+  'GLMD':'IL','ENLV':'IL','ALTI':'IL','BTBT':'IL','SVRA':'IL','GILT':'IL','ALLT':'IL',
+  'AUDC':'IL','ZIM':'IL','ICCM':'IL','OPRX':'IL','ORMP':'IL','UAVS':'IL','PRPL':'IL',
   // United Kingdom
   'ARM':'GB','BP':'GB','HSBC':'GB','SHEL':'GB','UL':'GB','AZN':'GB','GSK':'GB',
   'RIO':'GB','BCS':'GB','LYG':'GB','VOD':'GB',
@@ -237,20 +239,18 @@ const FOREIGN_TICKER_OVERRIDES = {
 
 // Returns a country flag emoji for every ticker, no exceptions.
 // Order of authority (highest → lowest):
-//   1. FOREIGN_TICKER_OVERRIDES — 130+ hand-curated ADRs/foreign listings
-//   2. Polygon ticker details `locale` (us = 🇺🇸, global = best-guess country code)
-//   3. Default 🇺🇸 — safe fallback so the alert format never breaks
+//   1. FOREIGN_TICKER_OVERRIDES — hand-curated ADRs/foreign listings
+//   2. Polygon ticker-details auto-detection (address.country / phone_number)
+//   3. Polygon locale (broad fallback: us = 🇺🇸)
+//   4. Default 🇺🇸 — safe fallback so the alert format never breaks
 function flag(ticker){
   if(!ticker) return '🇺🇸';
   // 1) Manual override map — highest confidence, hand-curated for ADRs
   const ov = FOREIGN_TICKER_OVERRIDES[ticker];
   if(ov) return countryFlag(ov);
-  // 2) Polygon locale — only knows broad country codes if any
+  // 2) Auto-detected from Polygon ticker details (address.country / phone)
   const c = countryMap.get(ticker);
-  if(c==='IL') return '🇮🇱';
-  if(c==='CN') return '🇨🇳';
-  if(c==='GB') return '🇬🇧';
-  if(c==='CA') return '🇨🇦';
+  if(c) return countryFlag(c);
   // 3) Default — never return empty, every alert gets a flag
   return '🇺🇸';
 }
@@ -428,9 +428,79 @@ async function getTickerDetails(ticker){
     const r=await polyGet(`/v3/reference/tickers/${ticker}`);
     const data=(r&&r.results)||{};
     tickerCache.set(ticker,{data,ts:Date.now()});
-    if(data.locale) countryMap.set(ticker,data.locale.toUpperCase());
+    // Extract HQ country from multiple Polygon fields. address.country is the
+    // strongest signal — explicitly populated for ADRs of foreign companies
+    // (GLMD → "Israel", BABA → "China"). Falls back to phone country code
+    // prefix (+972 = IL, +86 = CN, +33 = FR, etc) when address is sparse.
+    // Last resort: locale (only knows us/global, but better than nothing).
+    const cc = resolveCountry(data);
+    if(cc) countryMap.set(ticker, cc);
     return data;
   }catch(e){return {};}
+}
+
+// Convert raw Polygon ticker-details fields into a 2-letter ISO country code.
+// Returns '' if no signal — caller falls through to FOREIGN_TICKER_OVERRIDES /
+// 🇺🇸 default. Country names mapped to ISO codes for the markets that
+// commonly produce ADRs on US exchanges.
+function resolveCountry(data){
+  if(!data) return '';
+  const addrCountry = (data.address && data.address.country) || '';
+  if(addrCountry){
+    const cn = addrCountry.trim().toUpperCase();
+    const COUNTRY_NAME_TO_ISO = {
+      'UNITED STATES':'US','USA':'US','US':'US',
+      'CHINA':'CN','CN':'CN',"PEOPLE'S REPUBLIC OF CHINA":'CN','HONG KONG':'HK',
+      'ISRAEL':'IL','IL':'IL',
+      'CANADA':'CA','CA':'CA',
+      'UNITED KINGDOM':'GB','UK':'GB','GREAT BRITAIN':'GB','ENGLAND':'GB','GB':'GB',
+      'FRANCE':'FR','FR':'FR',
+      'GERMANY':'DE','DE':'DE',
+      'NETHERLANDS':'NL','NL':'NL','HOLLAND':'NL',
+      'SWITZERLAND':'CH','CH':'CH',
+      'IRELAND':'IE','IE':'IE',
+      'JAPAN':'JP','JP':'JP',
+      'SOUTH KOREA':'KR','KOREA':'KR','KR':'KR',
+      'TAIWAN':'TW','TW':'TW',
+      'SINGAPORE':'SG','SG':'SG',
+      'AUSTRALIA':'AU','AU':'AU',
+      'BRAZIL':'BR','BR':'BR',
+      'INDIA':'IN','IN':'IN',
+      'MEXICO':'MX','MX':'MX',
+      'SWEDEN':'SE','SE':'SE',
+      'SPAIN':'ES','ES':'ES',
+      'ITALY':'IT','IT':'IT',
+      'BERMUDA':'BM','CAYMAN ISLANDS':'KY','BRITISH VIRGIN ISLANDS':'VG',
+      'LUXEMBOURG':'LU','BELGIUM':'BE','DENMARK':'DK','NORWAY':'NO','FINLAND':'FI',
+      'GREECE':'GR','TURKEY':'TR','SOUTH AFRICA':'ZA','ARGENTINA':'AR',
+      'CHILE':'CL','COLOMBIA':'CO','URUGUAY':'UY','PERU':'PE',
+    };
+    if(COUNTRY_NAME_TO_ISO[cn]) return COUNTRY_NAME_TO_ISO[cn];
+  }
+  // Phone country code prefix — surprisingly accurate for ADRs whose address is "US mailing"
+  const phone = (data.phone_number || '').replace(/\s|-/g,'');
+  if(phone.startsWith('+')){
+    const PHONE_PREFIX_TO_ISO = {
+      '+1':'',     // ambiguous US/CA — ignore
+      '+972':'IL','+86':'CN','+852':'HK','+33':'FR','+44':'GB','+49':'DE',
+      '+31':'NL','+41':'CH','+353':'IE','+81':'JP','+82':'KR','+886':'TW',
+      '+65':'SG','+61':'AU','+55':'BR','+91':'IN','+52':'MX','+46':'SE',
+      '+34':'ES','+39':'IT','+352':'LU','+32':'BE','+45':'DK','+47':'NO',
+      '+358':'FI','+30':'GR','+90':'TR','+27':'ZA','+54':'AR','+56':'CL',
+      '+57':'CO','+598':'UY','+51':'PE',
+    };
+    // Try longest prefix first (3-digit), then 2-digit
+    for(const len of [4,3,2]){
+      const px = phone.slice(0, len);
+      if(PHONE_PREFIX_TO_ISO[px]) return PHONE_PREFIX_TO_ISO[px];
+    }
+  }
+  // Fallback to locale (least granular)
+  if(data.locale){
+    const loc = data.locale.toUpperCase();
+    if(loc !== 'US' && loc !== 'GLOBAL') return loc;
+  }
+  return '';
 }
 
 async function getNewsUrl(ticker){
@@ -784,13 +854,12 @@ async function fireNHOD(ticker,price){
   if(!tier) return;
   let checkVol = Math.max(gapper.volume||0, s.peakVol||0);
 
-  // Synthetic-gapper freshen: when liveG is missing (ticker not in current
-  // top-gappers scanner result), the gapper came from dayWatchlist (stale lock-
-  // time data) or permanentWatch fallback (hardcoded 0s). Either way, chgPct
-  // and rvol are wrong/zero and would falsely fail the gates below. Pull a
-  // fresh snapshot to populate real values. This is the path AEHL/WOK hit when
-  // the scanner missed them but they're in watchlist.txt.
-  const needFreshen = !liveG && (checkVol === 0 || gapper.chgPct === 0);
+  // Always freshen when not in current topGappers. dayWatchlist data is from
+  // lock-time (could be hours stale). Synthetic permanentWatch gappers are
+  // hardcoded zeros. Just always pull a fresh snapshot in this path — the
+  // ~200ms cost is cheaper than missing alerts. liveG tickers skip this
+  // (their data is from the most recent scanner cycle, ≤20s old).
+  const needFreshen = !liveG;
   if(needFreshen){
     try {
       const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
@@ -852,8 +921,12 @@ async function fireNHOD(ticker,price){
     if(ahMove<5){
       console.log(`[NHOD] ${ticker} skip: AH move ${ahMove.toFixed(1)}% from close $${cp.toFixed(4)} < 5%`);return;
     }
-  } else if(gapper.chgPct<tier.minChg){
-    console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}%`);return;
+  } else if(gapper.chgPct<tier.minChg && gapper.rvol<3){
+    // chgPct gate now has the same RVol bypass as the volume gate. A 7% gain
+    // on 50x RVol is still a real event (the entire float is changing hands);
+    // we shouldn't reject it just because it's under 10%. Only skip if BOTH
+    // chgPct AND rvol are below threshold. Rejects boring drift cleanly.
+    console.log(`[NHOD] ${ticker} skip: ${tier.name} chg ${gapper.chgPct.toFixed(1)}%<${tier.minChg}% AND rvol ${gapper.rvol.toFixed(1)}x<3x`);return;
   }
 
   // Tiered cooldown: HOT movers (top gainers / unusual volume) get a much
@@ -1092,6 +1165,62 @@ async function checkMorningSnapshot(){
   console.log(`[${getET().timeStr}] Morning snapshot posted`);
 }
 
+// ─── Day-gapper recovery (restart resilience) ────────────────────────────────
+// On startup, dayWatchlist is empty. Standard refreshGappers only catches
+// tickers currently in top 50 by chgPct. A stock that pumped to +80% at 10AM
+// but is now back to +20% might fall off top 50 and never re-enter tracking.
+// This function scans current snapshot for ANY ticker whose intraday HIGH
+// (day.h vs prevDay.c) was ≥10%, regardless of current chgPct. Re-locks them
+// into dayWatchlist so we keep tracking. Only runs on startup — eats ~1s.
+async function recoverDayGappers(){
+  const {etMin} = getET();
+  // Skip pre-market (day.h hasn't moved yet)
+  if(etMin < 570) return;
+  try {
+    // Pull a wide net — top 500 by volume catches anything that traded heavily today
+    const r = await polyGet('/v2/snapshot/locale/us/markets/stocks/tickers?sort=volume&direction=desc&limit=500');
+    const tickers = (r && r.tickers) || [];
+    let recovered = 0;
+    for(const t of tickers){
+      const symbol = t.ticker;
+      if(!symbol || isBadTicker(symbol) || isEtf(symbol) || dayWatchlist.has(symbol)) continue;
+      const prevC = (t.prevDay && t.prevDay.c) || 0;
+      const dayH  = (t.day && t.day.h) || 0;
+      const dayV  = (t.day && t.day.v) || 0;
+      const dayC  = (t.day && t.day.c) || 0;
+      if(prevC <= 0 || dayH <= 0 || dayV < 100_000) continue;
+      // peakPct = highest gain achieved today (using day.h)
+      const peakPct = ((dayH - prevC) / prevC) * 100;
+      const curPct  = dayC > 0 ? ((dayC - prevC) / prevC) * 100 : peakPct;
+      if(peakPct < 10) continue;
+      // Skip OTC and >$10 stocks (matches scanner gates)
+      const isOTC = /OTC|GREY|PINK|EXPERT/i.test(t.primaryExchange || '');
+      if(isOTC) continue;
+      if(dayH > 10) continue; // matches the $10 ceiling from scanner
+      const curPrice = (t.lastTrade && t.lastTrade.p) || dayC || dayH;
+      const mins = Math.max(etMin - 240, 1);
+      const prevV = (t.prevDay && t.prevDay.v) || 0;
+      const rvol = prevV > 0 ? (dayV * 390) / (mins * prevV) : 0;
+      dayWatchlist.set(symbol, {
+        ticker: symbol,
+        chgPct: peakPct,         // use peak so cooldown tier "isHot" gets the truth
+        volume: dayV,
+        prevVol: prevV,
+        rvol,
+        price: curPrice,
+        high: dayH,
+        lockedAt: 'recovered',
+      });
+      recentRunners.set(symbol, Date.now());
+      recovered++;
+      if(recovered >= 100) break; // cap so we don't blow the WS subscription budget
+    }
+    console.log(`[Recovery] +${recovered} day-gappers recovered (intraday peak ≥10%, vol ≥100K)`);
+  } catch(e) {
+    console.error('[Recovery] error:', e.message);
+  }
+}
+
 // ─── Price WebSocket ──────────────────────────────────────────────────────────
 let ws=null;
 const subscribedTickers=new Set();
@@ -1162,6 +1291,25 @@ function subscribeNewTickers(tickers){
   ws.send(JSON.stringify({action:'subscribe',params:tickers.map(t=>`T.${t},A.${t}`).join(',')}));
   tickers.forEach(t=>subscribedTickers.add(t));
   console.log(`[PriceWS] +subscribed: ${tickers.join(', ')}`);
+  // PRE-WARM: fetch snapshot for each newly subscribed ticker so state.high
+  // and state.peakVol are seeded BEFORE the first WS tick arrives. Closes
+  // the race where a fresh subscription's first trade tick triggers fireNHOD
+  // against an uninitialized state (s.high=0) — that path would either fire
+  // a false NHOD or skip due to synthetic data. With pre-warm, state is
+  // populated from day.h/day.v within ~200ms of subscribe, before any
+  // meaningful tick volume arrives.
+  for(const t of tickers){
+    polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${t}`).then(snap => {
+      const td = snap && snap.ticker;
+      if(!td) return;
+      const dayH = (td.day && td.day.h) || 0;
+      const dayV = (td.day && td.day.v) || 0;
+      const s = state.tickers.get(t) || {high:0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]};
+      if(dayH > (s.high||0)) s.high = dayH;
+      if(dayV > (s.peakVol||0)) s.peakVol = dayV;
+      state.tickers.set(t, s);
+    }).catch(()=>{ /* non-critical pre-warm; main snapshot fetch on fireNHOD will recover */ });
+  }
 }
 
 // ─── Discord commands ─────────────────────────────────────────────────────────
@@ -1360,6 +1508,7 @@ async function main(){
   await refreshEtfList();
   await refreshRegSHO();
   await refreshGappers();
+  await recoverDayGappers(); // restore today's gappers that fell off topGappers
   // If bot starts during AH, capture close prices immediately
   const _startEt = getET();
   if(_startEt.etMin >= 960 && _startEt.etMin < 1200){
