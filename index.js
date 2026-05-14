@@ -271,7 +271,11 @@ async function getFmpProfile(ticker){
     const r=await fmpGet(`/api/v3/profile/${ticker}`);
     const data=(r&&r[0])||{};
     fmpProfileCache.set(ticker,{data,ts:Date.now()});
-    if(data.country) fmpCountryMap.set(ticker,data.country);
+    if(data.country){
+      fmpCountryMap.set(ticker,data.country);
+      if(data.country.toUpperCase()!=='US'&&data.country.toUpperCase()!=='UNITED STATES')
+        console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)}`);
+    }
     return data;
   }catch(e){return {};}
 }
@@ -1045,6 +1049,7 @@ async function main(){
     }
   }catch(e){}
 
+  fmpProfileCache.clear(); fmpCountryMap.clear(); // force fresh country data on startup
   loadPermanentWatchlist();
   await refreshEtfList();
   await refreshGappers();
