@@ -11,9 +11,15 @@ const APP_ID        = '1493671812247322624';
 
 const TOP_GAPPERS_WH = 'https://discord.com/api/webhooks/1493250562689597623/57UTSPu2KfLmYNBRVPvPQIa4cSfCQA8wVcqB5d0J8cWYaJf5hlsm1EuRkQ3lolChTNh3';
 const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504111128106631359/W9Ky7814ojPziIuN6loeaNgu6l8aFzUMlMtrj8vsf4egXWfiBKFv0sNKu8VO9cclmRKD';
-// Halt + resume alerts only — routed to its own #halt-alerts channel so the
-// main alert feed stays clean. Env var HALT_ALERTS_WH can override at runtime.
-const HALT_ALERTS_WH = process.env.HALT_ALERTS_WH || 'https://discord.com/api/webhooks/1504534490821689374/RStoJri7X5g5RTth-2TCEFSIyiyXvXnjx29YbGAn_Bp0tc-DzJ7qADmYI8qTpTChnIXE';
+// Halt + resume alerts fan out to BOTH the dedicated #halt-alerts channel
+// AND the main chat for visibility. Add/remove URLs to change broadcast.
+// Env override HALT_ALERTS_WH replaces the entire list (comma-separated).
+const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || [
+  // #halt-alerts (dedicated channel)
+  'https://discord.com/api/webhooks/1504534490821689374/RStoJri7X5g5RTth-2TCEFSIyiyXvXnjx29YbGAn_Bp0tc-DzJ7qADmYI8qTpTChnIXE',
+  // main chat (broadcast for visibility)
+  'https://discord.com/api/webhooks/1504535425535049738/MbDW1k1ESVMoIRokvaJ6Fg76WhkiSh8K46AHCpZi042jNjGkUn_Y6ybU0mOXZCPMU53w',
+].join(',')).split(',').map(s=>s.trim()).filter(Boolean);
 
 // ─── Session tiers ────────────────────────────────────────────────────────────
 //
@@ -316,17 +322,15 @@ async function post(payload){
   payload.username='AziziBot';
   await postToWebhook(MAIN_CHAT_WH,payload);
 }
-// Halt + resume alerts route to their own #halt-alerts channel ONLY.
-// If HALT_ALERTS_WH is not configured, halt alerts are suppressed entirely
-// (logged to console but not posted anywhere) to keep them out of the main
-// alert feed. Set the env var to enable.
+// Halt + resume alerts broadcast to every webhook in HALT_ALERT_WHS in
+// parallel. If the list is empty, alerts are suppressed (logged only).
 async function postHalt(payload){
-  if(!HALT_ALERTS_WH){
-    console.log('[Halt] suppressed (HALT_ALERTS_WH not configured)');
+  if(!HALT_ALERT_WHS.length){
+    console.log('[Halt] suppressed (no webhooks configured)');
     return;
   }
   payload.username='AziziBot';
-  await postToWebhook(HALT_ALERTS_WH, payload);
+  await Promise.all(HALT_ALERT_WHS.map(wh => postToWebhook(wh, payload)));
 }
 function discordRest(method,path,body=null){
   return new Promise((resolve,reject)=>{
@@ -1292,24 +1296,32 @@ async function checkFilings(){
 
 // ─── Halt + Resume alerts (NASDAQ RSS) ────────────────────────────────────────
 // NASDAQ Trader publishes a free, real-time RSS feed of all US equity trade
-// halts and resumes — the same source most halt scanners use. We poll every
-// 30s, parse XML, and fire alerts on:
+// halts. We poll every 30s and fire alerts on:
 //   - new halts: tracked tickers OR small-caps under $20 (catches new movers)
-//   - resumes: when the scheduled resume time has passed
-// User directive 2026-05-14: alert on trader-relevant codes only.
+//   - resumes: detected two ways — scheduled resume time has passed, OR the
+//     halt entry has DISAPPEARED from the RSS (the feed only lists currently-
+//     halted issues, so disappearance = resumed)
+// Format matches NuntioBot style: time-with-seconds + direction (UP/DOWN) for
+// volatility halts. Trader-relevant codes only.
 const HALT_ALERT_CODES = new Set(['T1','T2','T5','T12','LUDP','H10','H11']);
-const HALT_REASON = {
+// Short labels for display — long names go in console logs only
+const HALT_REASON_SHORT = {
   'T1':  'News Pending',
   'T2':  'News Released',
-  'T5':  'Volatility Trading Pause',
-  'T12': 'Information Requested',
-  'LUDP':'Volatility Trading Pause',
-  'H10': 'SEC Trading Suspension',
-  'H11': 'Regulatory Concern',
+  'T5':  'Volatility',
+  'T12': 'Info Requested',
+  'LUDP':'Volatility',
+  'H10': 'SEC Suspension',
+  'H11': 'Regulatory',
 };
+// Codes where direction (UP/DOWN) is meaningful — price hit a limit band
+const HALT_DIRECTIONAL = new Set(['T5','LUDP','LUDS']);
 
-// haltState: composite key → {ticker, code, reason, haltedAt, resumeAt, resumeTimeOriginal, alertedHalt, alertedResume}
+// haltState: composite key → {ticker, code, reason, haltedAt, resumeAt, ...}
 const haltState = new Map();
+// Tickers currently in the RSS feed (cleared and rebuilt each poll). Used to
+// detect resumes: keys in PREVIOUS set but not in CURRENT set = resumed.
+let currentlyHalted = new Set();
 let lastHaltPoll = 0;
 
 // Parse "MM/DD/YYYY" + "HH:MM:SS" (NASDAQ publishes everything in ET) into
@@ -1338,8 +1350,10 @@ async function pollHalts(){
     });
     if(!xml || xml.length < 200) return;
     const items = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
-    let newHalts = 0, dueResumes = 0;
+    const nowHalted = new Set();
+    let newHalts = 0, resumes = 0;
 
+    // First pass: parse all items, register new halts, fire halt alerts
     for(const itemXml of items){
       const grab = (re) => { const x = itemXml.match(re); return x ? x[1].trim() : ''; };
       const ticker = grab(/<ndaq:IssueSymbol[^>]*>([^<]+)<\/ndaq:IssueSymbol>/i).toUpperCase();
@@ -1356,47 +1370,60 @@ async function pollHalts(){
       const haltedAt = parseEtToUtcMs(haltDate, haltTime);
       const resumeAt = parseEtToUtcMs(resumeDate, resumeTime);
       const key = `${ticker}_${haltDate}_${haltTime}`;
-      let st = haltState.get(key);
+      nowHalted.add(key);
 
+      let st = haltState.get(key);
       if(!st){
         st = {
           ticker, code,
-          reason: HALT_REASON[code] || `Code ${code}`,
+          reason: HALT_REASON_SHORT[code] || code,
           haltedAt: haltedAt || Date.now(),
-          resumeAt,
-          resumeTimeOriginal: resumeTime,
-          alertedHalt: false,
-          alertedResume: false,
+          resumeAt, resumeTimeOriginal: resumeTime,
+          alertedHalt: false, alertedResume: false,
         };
         haltState.set(key, st);
       } else if(resumeAt > 0 && !st.resumeAt){
-        // Resume time was just announced — store it but don't re-alert on halt
+        // Resume time was just announced — store but don't re-alert on halt
         st.resumeAt = resumeAt;
         st.resumeTimeOriginal = resumeTime;
       }
 
-      // Halt alert (once per halt event)
       if(!st.alertedHalt){
         const should = await shouldAlertHalt(ticker);
         if(should){
           await fireHaltAlert(st);
           newHalts++;
         }
-        st.alertedHalt = true; // mark even if we didn't alert, to avoid re-checking
+        st.alertedHalt = true; // mark even if we didn't alert
       }
 
-      // Resume alert (only if we previously alerted on the halt AND scheduled time has passed)
+      // Resume alert path 1: scheduled resume time has passed
       if(st.alertedHalt && st.resumeAt > 0 && !st.alertedResume && Date.now() >= st.resumeAt){
         await fireResumeAlert(st);
         st.alertedResume = true;
-        dueResumes++;
+        resumes++;
       }
     }
 
-    if(newHalts || dueResumes) {
-      console.log(`[Halts] ${newHalts} halt(s), ${dueResumes} resume(s)`);
+    // Second pass: items that were in the PREVIOUS poll but NOT this one =
+    // disappeared from RSS = resumed. Fires for any halt we previously alerted
+    // on, even without a scheduled resume time.
+    for(const key of currentlyHalted){
+      if(!nowHalted.has(key)){
+        const st = haltState.get(key);
+        if(st && st.alertedHalt && !st.alertedResume){
+          await fireResumeAlert(st);
+          st.alertedResume = true;
+          resumes++;
+        }
+      }
     }
-    // Prune entries older than 24h
+    currentlyHalted = nowHalted;
+
+    if(newHalts || resumes) {
+      console.log(`[Halts] ${newHalts} halt(s), ${resumes} resume(s)`);
+    }
+    // Prune state older than 24h
     const cutoff = Date.now() - 24*60*60*1000;
     for(const [k, st] of haltState){
       if((st.haltedAt || 0) < cutoff) haltState.delete(k);
@@ -1406,7 +1433,7 @@ async function pollHalts(){
   }
 }
 
-// Tracked tickers always alert. Untracked: only small-caps under $20 (catches new movers).
+// Tracked tickers always alert. Untracked: only small-caps under $20.
 async function shouldAlertHalt(ticker){
   if(topGappers.some(g => g.ticker === ticker) ||
      dayWatchlist.has(ticker) ||
@@ -1425,38 +1452,60 @@ async function shouldAlertHalt(ticker){
   } catch(e){ return false; }
 }
 
+// Pull fresh price/volume/change for a halted ticker. Returns null on failure.
+async function snapForHalt(ticker){
+  try {
+    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    const td = snap && snap.ticker;
+    if(!td) return null;
+    const price = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || 0;
+    const vol = (td.day && td.day.v) || 0;
+    const chgPct = (typeof td.todaysChangePerc === 'number') ? td.todaysChangePerc : null;
+    return { price, vol, chgPct };
+  } catch(e){ return null; }
+}
+
+// Format halt alert in NuntioBot style:
+//   `13:28:35` `AEHL` `Halted DOWN` 🇨🇳 | Volatility → $5.27 · 33.5M vol · Resume 13:33 ET
 async function fireHaltAlert(st){
   const {ticker, code, reason, resumeTimeOriginal} = st;
   const {timeStr} = getET();
-  const timeShort = timeStr.slice(0, 5);
-  let priceStr = '';
-  try {
-    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-    const td = snap && snap.ticker;
-    const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
-    if(price > 0) priceStr = ` ${priceFlag(price)}`;
-  } catch(e){}
-  const resumeNote = resumeTimeOriginal ? ` | Resume: ${resumeTimeOriginal.slice(0,5)} ET` : '';
-  const line = `\`${timeShort}\` 🛑 **${ticker}**${priceStr} ~ ${flag(ticker)} | \`HALT\` \`${code}\` — ${reason}${resumeNote}`;
+  const s = await snapForHalt(ticker);
+
+  // Direction for volatility halts: positive day change = halted at the top
+  // of the band (UP), negative = halted at the bottom (DOWN). Threshold ±0.5%
+  // to avoid mis-labeling halts near flat.
+  let haltLabel = 'Halted';
+  if(HALT_DIRECTIONAL.has(code) && s && typeof s.chgPct === 'number'){
+    if(s.chgPct > 0.5) haltLabel = 'Halted UP';
+    else if(s.chgPct < -0.5) haltLabel = 'Halted DOWN';
+  }
+
+  // Compose the right-of-pipe content
+  const after = [];
+  let mainPart = reason;
+  if(s && s.price > 0){
+    const priceStr = `$${s.price.toFixed(2)}`;
+    const volStr = s.vol > 0 ? `${fmtNS(s.vol)} vol` : '';
+    const tail = [priceStr, volStr].filter(Boolean).join(' · ');
+    mainPart = `${reason} → ${tail}`;
+  }
+  after.push(mainPart);
+  if(resumeTimeOriginal){
+    after.push(`Resume ${resumeTimeOriginal.slice(0,5)} ET`);
+  }
+
+  const line = `\`${timeStr}\` \`${ticker}\` \`${haltLabel}\` ${flag(ticker)} | ${after.join(' · ')}`;
   await postHalt({content: line});
-  console.log(`[Halt] 🛑 ${ticker} ${code} ${reason}`);
+  console.log(`[Halt] 🛑 ${ticker} ${code} ${haltLabel}`);
 }
 
+// Format resume alert in NuntioBot style (minimal):
+//   `13:27:59` `AEHL` `Resumed` 🇨🇳
 async function fireResumeAlert(st){
-  const {ticker, code, haltedAt, resumeAt} = st;
+  const {ticker, code} = st;
   const {timeStr} = getET();
-  const timeShort = timeStr.slice(0, 5);
-  const durMs = Math.max(0, resumeAt - haltedAt);
-  const durMin = Math.round(durMs / 60_000);
-  let priceStr = '';
-  try {
-    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-    const td = snap && snap.ticker;
-    const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
-    if(price > 0) priceStr = ` ${priceFlag(price)}`;
-  } catch(e){}
-  const durStr = durMin > 0 ? ` after ${durMin}min halt` : '';
-  const line = `\`${timeShort}\` ▶️ **${ticker}**${priceStr} ~ ${flag(ticker)} | \`RESUMED\`${durStr} (\`${code}\`)`;
+  const line = `\`${timeStr}\` \`${ticker}\` \`Resumed\` ${flag(ticker)}`;
   await postHalt({content: line});
   console.log(`[Halt] ▶️ ${ticker} resumed (${code})`);
 }
@@ -1828,7 +1877,7 @@ async function main(){
   console.log('🤖 AziziBot v8 starting...');
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
-  console.log(`[Halts] webhook: ${HALT_ALERTS_WH ? 'CONFIGURED → #halt-alerts' : 'NOT SET → halt alerts SUPPRESSED (set HALT_ALERTS_WH env var to enable)'}`);
+  console.log(`[Halts] webhooks: ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s) configured` : 'NONE → halt alerts SUPPRESSED'}`);
 
   // Check Discord session_start_limit before connecting
   try{
