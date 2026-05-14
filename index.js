@@ -27,8 +27,7 @@ const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504111128106631359/W9K
 //  Watchlist-only tickers skip session gates — monitored for bounces/PRs/filings.
 
 function getTier(etMin) {
-  if(etMin>=240&&etMin<420)  return {name:'EARLY-PRE', minChg:10, minVol:0};
-  if(etMin>=420&&etMin<570)  return {name:'LATE-PRE',  minChg:10, minVol:0};
+  if(etMin>=240&&etMin<570)  return {name:'PRE',       minChg:10, minVol:100000};
   if(etMin>=570&&etMin<960)  return {name:'MKT',       minChg:10, minVol:5_000_000};
   if(etMin>=960&&etMin<1200) return {name:"AH", minChg:10, minVol:500000};
   return null; // no alerts after 8PM
@@ -491,10 +490,11 @@ async function fireNHOD(ticker,price){
   // All tickers must pass session tier gates (permanentWatch = same as watchlist)
   const tier=getTier(etMin);
   if(!tier) return;
-  // Use best available volume — full day peakVol beats stale gapper.volume
+  // AH vol gate: fresh names need 500K, but top day gainers already proven with day volume
   const checkVol = Math.max(gapper.volume||0, s.peakVol||0);
-  if(tier.minVol>0&&checkVol<tier.minVol){
-    console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(checkVol)}<${fmtN(tier.minVol)}`);return;
+  const isDayGapper = dayWatchlist.has(ticker) || (s.peakVol||0) >= 500_000;
+  if(tier.minVol>0 && !isDayGapper && checkVol<tier.minVol){
+    console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (fresh)`);return;
   }
   // In AH: measure move from 4PM close price, not all-day chgPct.
   // Require ≥5% above 4PM close to confirm a real AH move.
@@ -1041,7 +1041,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[Tiers] EARLY-PRE 4-7AM ≥10%/noVol | LATE-PRE 7-9:30AM ≥20%/noVol | MKT ≥10%/5M | AH ≥10%/500K');
+  console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[FMP] key: ${FMP_KEY?FMP_KEY.slice(0,8)+'...':'NOT SET — add FMP_KEY to Railway'}}`);
   console.log('[Key]   Vol floor = 0 for all pre-market. % gain is the only pre-market quality gate.');
 
