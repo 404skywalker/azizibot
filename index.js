@@ -419,7 +419,7 @@ async function refreshGappers(){
       if(t.chgPct <minChg)    {rej.pct++; return false;}
       if(t.price  <0.10)      {rej.pl++;  return false;}
       if(t.price  >10&&t.chgPct<100){rej.ph++;return false;} // allow >$10 if ≥100% gain
-      if(minVol>0&&t.volume<minVol){rej.vol++;return false;}
+      if(minVol>0&&name!=='PRE'&&t.volume<minVol){rej.vol++;return false;} // PRE: skip vol filter, day.v=0 pre-market
       if(t.isOTC)             {rej.otc++; return false;}
       if(isEtf(t.ticker))     {rej.etf++; return false;}
       if(isBadTicker(t.ticker)){rej.bad++;return false;}
