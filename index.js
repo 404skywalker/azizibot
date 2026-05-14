@@ -1399,16 +1399,20 @@ async function pollHalts(){
           resumeAt,
           haltTimeOriginal: haltTime,      // ← actual halt time string for display
           resumeTimeOriginal: resumeTime,
-          alertedHalt: false,
-          alertedResume: false,
+          alertedHalt: false,    // have we evaluated this halt yet?
+          firedHaltAlert: false, // did we actually post a halt alert?
+          alertedResume: false,  // have we evaluated/fired the resume?
         };
         haltState.set(key, st);
 
-        // First-poll-after-restart baseline: don't alert on halts that were
-        // already in effect when we came online. Prevents restart noise.
+        // First-poll-after-restart baseline: mark the halt as evaluated (don't
+        // fire stale halt alerts) BUT leave alertedResume=false so the resume
+        // can still fire when the stock comes back online — important for
+        // tickers like TDIC that were halted during a deploy/restart.
         if(firstHaltPoll){
           st.alertedHalt = true;
-          st.alertedResume = true;
+          // st.firedHaltAlert stays false → resume will re-check qualification
+          // st.alertedResume stays false → resume can still fire
           baselined++;
           continue;
         }
@@ -1422,38 +1426,49 @@ async function pollHalts(){
         const should = await shouldAlertHalt(ticker);
         if(should){
           await fireHaltAlert(st);
+          st.firedHaltAlert = true;
           newHalts++;
         }
         st.alertedHalt = true; // mark even if we didn't alert (avoids re-eval)
 
         // CRITICAL: if the halt is ALREADY over at first detection (we were
         // late), suppress the resume alert entirely. The halt message already
-        // shows "Resume HH:MM ET" so user knows it's resolved. Without this,
-        // we fire halt + resume back-to-back as the user observed.
+        // shows "Resume HH:MM ET" so the user knows it's resolved. Without
+        // this, halt + resume fire back-to-back for stale halts.
         if(st.resumeAt > 0 && Date.now() >= st.resumeAt){
           st.alertedResume = true;
         }
       }
 
-      // Resume alert path 1: scheduled resume time passed AFTER halt alert fired
-      if(st.alertedHalt && st.resumeAt > 0 && !st.alertedResume && Date.now() >= st.resumeAt){
-        await fireResumeAlert(st);
+      // Resume alert path 1: scheduled resume time passed.
+      // Fires if EITHER (a) we previously posted the halt alert (consistency)
+      // OR (b) the ticker currently qualifies (catches restart-baselined cases
+      // like TDIC where we missed the halt but the ticker is a huge mover).
+      if(!st.alertedResume && st.resumeAt > 0 && Date.now() >= st.resumeAt){
+        const should = st.firedHaltAlert || await shouldAlertHalt(st.ticker);
+        if(should){
+          await fireResumeAlert(st);
+          resumes++;
+        }
         st.alertedResume = true;
-        resumes++;
       }
     }
 
     // Second pass: items in PREVIOUS poll but NOT in this one = disappeared
     // from RSS = resumed. Catches resumes when the RSS never published a
     // resume time. Skip on first poll (no prior set to compare against).
+    // Same fire-criteria as path 1: posted halt alert OR currently qualifies.
     if(!firstHaltPoll){
       for(const key of currentlyHalted){
         if(!nowHalted.has(key)){
           const st = haltState.get(key);
-          if(st && st.alertedHalt && !st.alertedResume){
-            await fireResumeAlert(st);
+          if(st && !st.alertedResume){
+            const should = st.firedHaltAlert || await shouldAlertHalt(st.ticker);
+            if(should){
+              await fireResumeAlert(st);
+              resumes++;
+            }
             st.alertedResume = true;
-            resumes++;
           }
         }
       }
