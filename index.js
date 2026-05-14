@@ -27,7 +27,7 @@ const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504111128106631359/W9K
 //  Watchlist-only tickers skip session gates — monitored for bounces/PRs/filings.
 
 function getTier(etMin) {
-  if(etMin>=240&&etMin<570)  return {name:'PRE',       minChg:10, minVol:100000};
+  if(etMin>=240&&etMin<570)  return {name:'PRE',       minChg:10, minVol:50000};
   if(etMin>=570&&etMin<960)  return {name:'MKT',       minChg:10, minVol:5_000_000};
   if(etMin>=960&&etMin<1200) return {name:"AH", minChg:10, minVol:500000};
   return null; // no alerts after 8PM
