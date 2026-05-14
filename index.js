@@ -267,20 +267,23 @@ async function getTickerDetails(ticker){
 async function getFmpProfile(ticker){
   const c=fmpProfileCache.get(ticker);
   if(c&&Date.now()-c.ts<12*60*60*1000) return c.data;
+  if(!FMP_KEY){fmpProfileCache.set(ticker,{data:{},ts:Date.now()});return {};}
   try{
-    const r=await fmpGet(`/api/v4/profile/${ticker}`);
+    // FMP profile endpoint is on v3, NOT v4. v4 returns an error object.
+    const r=await fmpGet(`/api/v3/profile/${ticker}`);
     if(!r||!Array.isArray(r)||!r[0]){
       console.log(`[FMP Profile] ${ticker}: bad response → ${JSON.stringify(r)?.slice(0,120)}`);
-      fmpProfileCache.set(ticker,{data:{},ts:Date.now()-11*60*60*1000}); // retry in 1h
+      // Short-cache failures (1h) so we retry; long-cache successes (12h).
+      fmpProfileCache.set(ticker,{data:{},ts:Date.now()-11*60*60*1000});
       return {};
     }
     const data=r[0];
     fmpProfileCache.set(ticker,{data,ts:Date.now()});
     if(data.country){
       fmpCountryMap.set(ticker,data.country);
-      console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)}`);
+      console.log(`[Flag] ${ticker} → ${data.country} ${countryFlag(data.country)} | sector: ${data.sector||'--'}`);
     } else {
-      console.log(`[Flag] ${ticker}: no country in FMP response`);
+      console.log(`[Flag] ${ticker}: no country field (sector=${data.sector||'--'}, exchange=${data.exchangeShortName||'--'})`);
     }
     return data;
   }catch(e){console.error(`[FMP Profile] ${ticker} error:`,e.message);return {};}
@@ -597,26 +600,26 @@ async function fireNHOD(ticker,price){
   const prof=await getFmpProfile(ticker).catch(()=>({}));
   const sector   = prof.sector||'';
   const industry = prof.industry||'';
-  const sectorStr= sector ? ` · ${sector}${industry?` · ${industry}`:''}` : '';
+  const sectorStr= sector ? ` | ${sector}${industry?` · ${industry}`:''}` : '';
 
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
   const extraStr=extra?` | ${extra}`:'';
 
-  // NuntioBot exact format:
-  // 10:48 ↗ TICKER `<$2` 67% · 1 · `3 green bars 1m` ~ FLAG | RVol: 15x | Vol: XXM
-  const isUp      = livePct >= 0;
+  // NuntioBot exact format (verified against screenshot 2026-05-14):
+  // `08:55` ↗ **MOBX** `<$3` `47%` · 7 `3 green bars 1m` ~ 🇺🇸 | **RVol:** 1.8x | **Vol:** 5.7 M | **SI:** 16.1% | [`PR`↗](url)
+  //   time-in-code   bold-ticker   pricepill  pct-in-code  ·  nhod  greenbars-in-code (no leading ·)  ~ flag  | **label:** value  | PR-pill
   const timeShort = timeStr.slice(0,5);
-  const pctPlain  = livePct!==0 ? ` ${Math.abs(livePct).toFixed(1)}%` : '';
+  const pctCode   = livePct!==0 ? ` \`${Math.abs(livePct).toFixed(0)}%\`` : '';
   const afterStr  = afterLull ? ` after-lull` : '';
-  const greenStr2 = greenBars>=2 ? ` · \`${greenBars} green bars 1m\`` : '';
-  const rvolStr   = liveRvol>0 ? ` | RVol: ${fmtRVol(liveRvol)}` : '';
-  // Vol with space before unit like NuntioBot: "5.7 M" not "5.7M"
-  function fmtNS(n){if(!n||n<=0)return'--';if(n>=1e9)return(n/1e9).toFixed(2)+' B';if(n>=1e6)return(n/1e6).toFixed(2)+' M';if(n>=1e3)return(n/1e3).toFixed(1)+' K';return n.toString();}
-  const volStr    = liveVol>0  ? ` | Vol: ${fmtNS(liveVol)}` : '';
-  const siStr     = fv.si!=='--' ? ` | SI: ${fv.si}` : '';
+  const greenStr2 = greenBars>=2 ? ` \`${greenBars} green bars 1m\`` : ''; // no leading ·
+  const rvolStr   = liveRvol>0 ? ` | **RVol:** ${fmtRVol(liveRvol)}` : '';
+  // Vol with 1 decimal + space before unit like NuntioBot: "5.7 M" not "5.70M"
+  function fmtNS(n){if(!n||n<=0)return'--';if(n>=1e9)return(n/1e9).toFixed(1)+' B';if(n>=1e6)return(n/1e6).toFixed(1)+' M';if(n>=1e3)return(n/1e3).toFixed(1)+' K';return n.toString();}
+  const volStr    = liveVol>0  ? ` | **Vol:** ${fmtNS(liveVol)}` : '';
+  const siStr     = fv.si!=='--' ? ` | **SI:** ${fv.si}` : '';
   const prData2   = newsCache.get(ticker);
-  const prLink    = prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url ? ` | [PR→](<${prData2.url}>)` : '';
-  const line = `${timeShort} ↗ ${ticker} \`${priceFlag(price)}\`${pctPlain} · ${nhod}${afterStr}${greenStr2} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${rsStr}${prLink}`;
+  const prLink    = prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url ? ` | [\`PR\`↗](<${prData2.url}>)` : '';
+  const line = `\`${timeShort}\` ↗ **${ticker}** \`${priceFlag(price)}\`${pctCode} · ${nhod}${afterStr}${greenStr2} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${rsStr}${sectorStr}${prLink}`;
 
   await post({content:line});
   console.log(`[ALERT] posted OK`);
@@ -726,9 +729,9 @@ async function pollFmpNews(){
   lastFmpPoll=Date.now();
   try{
     const r=await fmpGet('/api/v4/stock-news-sentiments-rss-feed?page=0');
-    if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,100));return;}
+    if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,120));return;}
     const items=r,cutoff=Date.now()-15*60*1000;
-    let matched=0;
+    let matched=0, total=items.length;
     for(const n of items){
       if(!n.publishedDate||new Date(n.publishedDate).getTime()<cutoff) continue;
       const ticker=(n.symbol||'').toUpperCase();
@@ -736,7 +739,8 @@ async function pollFmpNews(){
       await handleNewsItem(n.title||'',[ticker],n.url||'',n.publishedDate);
       matched++;
     }
-    if(matched>0) console.log(`[FMP News] ${matched} items processed`);
+    if(matched>0) console.log(`[FMP News] ${matched}/${total} items processed`);
+    else if(total>0) console.log(`[FMP News] ${total} items returned, none fresh (cutoff 15m)`);
   }catch(e){console.error('[FMP News] error:',e.message);}
 }
 
