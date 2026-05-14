@@ -769,7 +769,33 @@ async function fireNHOD(ticker,price){
   // All tickers must pass session tier gates (permanentWatch = same as watchlist)
   const tier=getTier(etMin);
   if(!tier) return;
-  const checkVol = Math.max(gapper.volume||0, s.peakVol||0);
+  let checkVol = Math.max(gapper.volume||0, s.peakVol||0);
+  // Safety net: if vol is 0 we likely hit the synthetic gapper path for a
+  // permanentWatch-only ticker BEFORE the WS sent its first A event. Fetch a
+  // fresh snapshot to avoid false-negative gate. This is rare (only when both
+  // the scanner missed the ticker AND no aggregate has streamed yet) so the
+  // extra API call doesn't impact alert latency on normal paths.
+  if(checkVol === 0){
+    try {
+      const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+      const td = snap && snap.ticker;
+      const dayV = (td && td.day && td.day.v) || 0;
+      if(dayV > 0){
+        checkVol = dayV;
+        s.peakVol = Math.max(s.peakVol||0, dayV);
+        // Also bootstrap chgPct/price for the synthetic gapper so downstream is correct
+        const lastP = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || price;
+        const prevC = (td.prevDay && td.prevDay.c) || 0;
+        if(prevC > 0){
+          gapper.chgPct = ((lastP - prevC) / prevC) * 100;
+          gapper.price  = lastP;
+          gapper.volume = dayV;
+          gapper.prevVol = (td.prevDay && td.prevDay.v) || 0;
+        }
+        console.log(`[NHOD] ${ticker} snapshot-fallback: vol=${fmtN(dayV)} chgPct=${gapper.chgPct.toFixed(1)}%`);
+      }
+    } catch(e){ /* fall through; gate below will skip */ }
+  }
   if(tier.minVol>0){
     if(tier.name==='PRE'){
       // Pre-market: Polygon day.v is always 0 before open — don't penalize live scanner tickers
@@ -1074,6 +1100,18 @@ function connectPriceWS(){
           if(liveG&&(liveG.price>10||liveG.chgPct<5)) continue;
           const s=state.tickers.get(ticker);
           if(!s) continue;
+          // Pull volume + daily high from A (per-minute aggregate) events.
+          // av = accumulated daily volume. This is critical for watchlist-only
+          // tickers that didn't pass the scanner this cycle — without it,
+          // s.peakVol stays at the scanner value (often 0) and the vol gate
+          // misfires. h = current minute high; used to bootstrap s.high when
+          // state was just created and never seen a price yet.
+          if(msg.ev==='A'){
+            const av=+msg.av||0;
+            if(av>(s.peakVol||0)) s.peakVol=av;
+            const dh=+msg.h||0;
+            if((!s.high||s.high===0)&&dh>0) s.high=dh;
+          }
           if(!s.priceHistory) s.priceHistory=[];
           s.priceHistory.push({price,time:Date.now()});
           if(s.priceHistory.length>60) s.priceHistory.shift();
@@ -1081,7 +1119,7 @@ function connectPriceWS(){
           if(price>prevHigh+0.001){
             const last=wsDebounce.get(ticker)||0;
             if(Date.now()-last>10000){
-              console.log(`[PriceWS] ${ticker} NEW HIGH $${price.toFixed(4)} (was $${s.high.toFixed(4)})`);
+              console.log(`[PriceWS] ${ticker} NEW HIGH $${price.toFixed(4)} (was $${prevHigh.toFixed(4)}) peakVol=${fmtN(s.peakVol||0)}`);
               wsDebounce.set(ticker,Date.now());
               fireNHOD(ticker,price).catch(e=>console.error(`[fireNHOD] ${ticker}:`,e.message));
             }
