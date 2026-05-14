@@ -107,6 +107,10 @@ function isMarketDay() {
 function isActive()  { return isMarketDay() && !!getTier(getET().etMin); }
 function sleep(ms)   { return new Promise(r=>setTimeout(r,ms)); }
 function fmtN(n)     { if(!n||isNaN(n))return'--'; if(n>=1e9)return(n/1e9).toFixed(2)+'B'; if(n>=1e6)return(n/1e6).toFixed(2)+'M'; if(n>=1e3)return(n/1e3).toFixed(1)+'K'; return String(n); }
+// NuntioBot-style numeric format: "5.7 M" not "5.70M" — 1 decimal, space before unit.
+function fmtNS(n)    { if(!n||n<=0)return'--'; if(n>=1e9)return(n/1e9).toFixed(1)+' B'; if(n>=1e6)return(n/1e6).toFixed(1)+' M'; if(n>=1e3)return(n/1e3).toFixed(1)+' K'; return String(n); }
+// Age string for bullet lines: "14 minutes ago" / "3 hours ago"
+function fmtAge(ms)  { if(ms<60000)return`${Math.round(ms/1000)} seconds ago`; if(ms<3600000)return`${Math.round(ms/60000)} minutes ago`; if(ms<86400000)return`${Math.round(ms/3600000)} hours ago`; return`${Math.round(ms/86400000)} days ago`; }
 function fmtRVol(r)  { if(!r||isNaN(r)||r===0)return'--'; if(r>=1000)return Math.round(r).toLocaleString()+'x'; if(r>=10)return r.toFixed(0)+'x'; return r.toFixed(1)+'x'; }
 function priceFlag(p){ if(p<0.50)return'<$.50c'; if(p<1)return'<$1'; if(p<2)return'<$2'; if(p<5)return'<$5'; return'<$10'; }
 function countryFlag(country){
@@ -360,6 +364,67 @@ const recentRunners=new Map(); // ticker → timestamp when last seen as gapper
 // permanentWatch: loaded from watchlist.txt — monitored forever, no gates
 const permanentWatch=new Set();
 let lastWatchlistRead=0;
+
+// ─── Event aggregation queue ─────────────────────────────────────────────────
+// PR/SEC events for the same ticker arriving within EVENT_BUFFER_MS get batched
+// into a single Discord message with multiple bullets (matches NuntioBot exactly).
+// Solo events still post — they just wait briefly in case a paired event arrives.
+const EVENT_BUFFER_MS = 15_000;
+const eventQueue = new Map(); // ticker → { events: [], timer: timeoutId }
+
+function queueAlertEvent(ticker, event) {
+  let q = eventQueue.get(ticker);
+  if (!q) {
+    q = { events: [], timer: null };
+    eventQueue.set(ticker, q);
+  }
+  q.events.push(event);
+  if (!q.timer) {
+    q.timer = setTimeout(
+      () => flushAlertEvents(ticker).catch(e => console.error(`[flush] ${ticker}:`, e.message)),
+      EVENT_BUFFER_MS
+    );
+  }
+  console.log(`[Queue] ${ticker} +${event.type} (total ${q.events.length}, flush in ${EVENT_BUFFER_MS/1000}s)`);
+}
+
+async function flushAlertEvents(ticker) {
+  const q = eventQueue.get(ticker);
+  if (!q || q.events.length === 0) { eventQueue.delete(ticker); return; }
+  const events = q.events;
+  eventQueue.delete(ticker);
+
+  // Fresh snapshot for header
+  const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+  const td = snap && snap.ticker;
+  const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
+  if (price < 0.10) { console.log(`[flush] ${ticker} skip: price ${price}`); return; }
+
+  const [det, fv, prof] = await Promise.all([
+    getTickerDetails(ticker), getFinvizStats(ticker), getFmpProfile(ticker),
+  ]);
+  const mc = det.market_cap || 0;
+  const { timeStr } = getET();
+  const timeShort = timeStr.slice(0, 5);
+
+  const ioStr = fv.io !== '--' ? ` | **IO:** ${fv.io}` : '';
+  const mcStr = mc > 0 ? ` | **MC:** ${fmtNS(mc)}` : '';
+  const siStr = fv.si !== '--' ? ` | **SI:** ${fv.si}` : '';
+  const header = `\`${timeShort}\` ↗ **${ticker}** ${priceFlag(price)} ~ ${flag(ticker)}${ioStr}${mcStr}${siStr}`;
+
+  const bullets = events.map(e => {
+    const ageMs = Date.now() - new Date(e.publishedTime || Date.now()).getTime();
+    const ageStr = fmtAge(Math.max(ageMs, 0));
+    const typePill = `\`${e.type}\``; // `PR` or `SEC`
+    const titlePart = e.title || '';
+    const linkPart = e.url ? ` - [Link](<${e.url}>)` : '';
+    return `> • \`${ageStr}\` ${typePill} ${titlePart}${linkPart}`;
+  });
+
+  await post({ content: `${header}\n${bullets.join('\n')}` });
+  console.log(`[Alert] ${ticker} batch posted: ${events.length} event(s) [${events.map(e => e.type).join(',')}]`);
+}
+
 function loadPermanentWatchlist(){
   try{
     const path='/app/watchlist.txt';
@@ -593,7 +658,8 @@ async function fireNHOD(ticker,price){
   const prStr=prData&&(Date.now()-prData.ts)<24*60*60*1000?` | [PR+](<${prData.url}>)`:'';
   const {sess}=getET();
   const sessLabel=nhod===1?(sess==='PRE'?'PMH':sess==='AH'?'AHs':'NSH'):`${nhod} NHOD`;
-  const tLink=newsUrl?`[${ticker}](<${newsUrl}>)`:`**${ticker}**`;
+  // tLink: bold ticker, made clickable when there's a recent news URL
+  const tLink=newsUrl?`[**${ticker}**](<${newsUrl}>)`:`**${ticker}**`;
   const pctStr=`+${livePct.toFixed(1)}%`;
   const mcLine=mc>0?` | MC: ${fmtN(mc)}`:'';
   // Fetch FMP profile for sector tag
@@ -605,21 +671,21 @@ async function fireNHOD(ticker,price){
   const extra=[fv.float!=='--'?`Float: ${fv.float}`:'',fv.si!=='--'?`SI: ${fv.si}`:'',fv.io!=='--'?`IO: ${fv.io}`:''].filter(Boolean).join(' | ');
   const extraStr=extra?` | ${extra}`:'';
 
-  // NuntioBot exact format (verified against screenshot 2026-05-14):
-  // `08:55` ↗ **MOBX** `<$3` `47%` · 7 `3 green bars 1m` ~ 🇺🇸 | **RVol:** 1.8x | **Vol:** 5.7 M | **SI:** 16.1% | [`PR`↗](url)
-  //   time-in-code   bold-ticker   pricepill  pct-in-code  ·  nhod  greenbars-in-code (no leading ·)  ~ flag  | **label:** value  | PR-pill
+  // NuntioBot exact format (verified against 5 screenshots 2026-05-14):
+  // `08:55` ↗ **MOBX** <$3 `47%` · 7 `NHOD` ~ 🇺🇸 | **RVol:** 1.8x | **Vol:** 5.7 M | **SI:** 16.1% | [`PR`↗](url)
+  //   time-pill   bold-ticker  PLAIN-price  pct-pill  · count  label-pill (NHOD OR green-bars, never both, never bare)  ~ flag
+  // Bold ticker becomes clickable [**TICKER**](<url>) when there's recent news.
   const timeShort = timeStr.slice(0,5);
   const pctCode   = livePct!==0 ? ` \`${Math.abs(livePct).toFixed(0)}%\`` : '';
   const afterStr  = afterLull ? ` after-lull` : '';
-  const greenStr2 = greenBars>=2 ? ` \`${greenBars} green bars 1m\`` : ''; // no leading ·
+  // Count is ALWAYS followed by a label pill — green-bars pill takes priority when present.
+  const labelStr  = greenBars>=2 ? `\`${greenBars} green bars 1m\`` : '`NHOD`';
   const rvolStr   = liveRvol>0 ? ` | **RVol:** ${fmtRVol(liveRvol)}` : '';
-  // Vol with 1 decimal + space before unit like NuntioBot: "5.7 M" not "5.70M"
-  function fmtNS(n){if(!n||n<=0)return'--';if(n>=1e9)return(n/1e9).toFixed(1)+' B';if(n>=1e6)return(n/1e6).toFixed(1)+' M';if(n>=1e3)return(n/1e3).toFixed(1)+' K';return n.toString();}
   const volStr    = liveVol>0  ? ` | **Vol:** ${fmtNS(liveVol)}` : '';
   const siStr     = fv.si!=='--' ? ` | **SI:** ${fv.si}` : '';
   const prData2   = newsCache.get(ticker);
   const prLink    = prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url ? ` | [\`PR\`↗](<${prData2.url}>)` : '';
-  const line = `\`${timeShort}\` ↗ **${ticker}** \`${priceFlag(price)}\`${pctCode} · ${nhod}${afterStr}${greenStr2} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${rsStr}${sectorStr}${prLink}`;
+  const line = `\`${timeShort}\` ↗ ${tLink} ${priceFlag(price)}${pctCode} · ${nhod} ${labelStr}${afterStr} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${rsStr}${sectorStr}${prLink}`;
 
   await post({content:line});
   console.log(`[ALERT] posted OK`);
@@ -640,7 +706,7 @@ async function handleNewsItem(title,tickers,url,published_utc){
   if(isDrop||isSpike) console.log(`[News] ${isDrop?'DROP':'SPIKE'} match: ${tickers.slice(0,3).join(',')} — ${title.slice(0,80)}`);
   if(!isDrop&&!isSpike) return;
 
-  const {timeStr,etMin}=getET();
+  const {etMin}=getET();
   const tier=getTier(etMin);
   const prVolMin = tier ? (tier.name==='MKT' ? 50_000 : 0) : 0;
 
@@ -652,41 +718,25 @@ async function handleNewsItem(title,tickers,url,published_utc){
     if(state.sentPR.has(prId)) continue;
     state.sentPR.add(prId);
 
+    // Quick gate — make sure ticker is tracked and within price/volume limits
     const snap=await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
     const td=snap&&snap.ticker;
     const vol=(td&&td.day&&td.day.v)||0;
     const price=(td&&td.lastTrade&&td.lastTrade.p)||(td&&td.day&&td.day.c)||0;
-    // Only fire for stocks under $30 and in our tracked universe
     const isTracked = topGappers.some(g=>g.ticker===ticker)
                    || dayWatchlist.has(ticker)
                    || recentRunners.has(ticker)
                    || permanentWatch.has(ticker);
     if(!td||vol<prVolMin||price<0.10||price>30||!isTracked) continue;
 
-    const [det,fv,prof]=await Promise.all([getTickerDetails(ticker),getFinvizStats(ticker),getFmpProfile(ticker)]);
-    const mc      = det.market_cap||0;
-    const prev    = (td.prevDay&&td.prevDay.c)||0;
-    const chgPct  = price&&prev?((price-prev)/prev)*100:0;
-    const pv2     = (td.prevDay&&td.prevDay.v)||0;
-    const rvol    = pv2>0?(vol*390)/(Math.max(etMin-240,1)*pv2):0;
-    const sector  = prof.sector||'';
-    const industry= prof.industry||'';
-
-    // Age of article
-    const ageMs  = Date.now()-new Date(published_utc||Date.now()).getTime();
-    const ageStr = ageMs<60000?`${Math.round(ageMs/1000)}s`:ageMs<3600000?`${Math.round(ageMs/60000)}m`:`${Math.round(ageMs/3600000)}h`;
-
-    // Exact NuntioBot PR format — two lines:
-    // 08:14 ↗ TICKER <$12 ~ FLAG | IO: X% | MC: X B | SI: X%
-    // • 14 minutes ago [PR] Title - Link
-    const mcStr2 = mc>0?` | MC: ${fmtN(mc)}`:'';
-    const ioStr2 = fv.io!=='--'?` | IO: ${fv.io}`:'';
-    const siStr2 = fv.si!=='--'?` | SI: ${fv.si}`:'';
-    const fmtAge = ms => ms<3600000?`${Math.round(ms/60000)} minutes ago`:`${Math.round(ms/3600000)} hours ago`;
-    const header = `${timeStr.slice(0,5)} ${isDrop?'↓':'↑'} ${ticker} ${priceFlag(price)} ~ ${flag(ticker)}${ioStr2}${mcStr2}${siStr2}`;
-    const bullet = `> • ${fmtAge(ageMs)} [${isDrop?'PR Drop':'PR'}] ${title.slice(0,200)}${url?` - [Link](<${url}>)`:''}`;
-    await post({content:`${header}\n${bullet}`});
-    console.log(`[${timeStr}] ${isDrop?'PR-DROP':'PR-SPIKE'}: ${ticker}`);
+    // Queue for aggregated posting — paired SEC filings within EVENT_BUFFER_MS will batch
+    queueAlertEvent(ticker, {
+      type: 'PR',
+      title: title.slice(0, 200),
+      url,
+      publishedTime: published_utc,
+      isDrop,
+    });
   }
   if(state.sentNews.size>500){const a=[...state.sentNews];state.sentNews.clear();a.slice(-200).forEach(x=>state.sentNews.add(x));}
   if(state.sentPR.size>500){const a=[...state.sentPR];state.sentPR.clear();a.slice(-200).forEach(x=>state.sentPR.add(x));}
@@ -752,7 +802,6 @@ async function checkFilings(){
   lastFilingCheck=Date.now();
   const known=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys(),...permanentWatch]);
   if(!known.size) return;
-  const {timeStr}=getET();
   for(const ticker of known){
     try{
       const r=await polyGet(`/vX/reference/filings?ticker=${ticker}&limit=5&order=desc&sort=filed_at`);
@@ -762,10 +811,14 @@ async function checkFilings(){
         if(filed<=Date.now()-15*60*1000||state.sentFilings.has(id)) continue;
         state.sentFilings.add(id);
         const ft=(f.form_type||'SEC').toUpperCase();
-        const g=topGappers.find(x=>x.ticker===ticker)||dayWatchlist.get(ticker);
-        const pStr=g?` | $${g.price.toFixed(4)} \`+${g.chgPct.toFixed(1)}%\``:'';
-        await post({content:`\`${timeStr}\` **SEC** **${ticker}**${/S-3|S-1|424B/.test(ft)?' ⚠️':''} — Form ${ft}${f.filing_url?` — [Link](<${f.filing_url}>)`:''}${pStr}`});
-        console.log(`[${timeStr}] FILING: ${ticker} ${ft}`);
+        // Queue as SEC event — header + bullet built at flush time alongside any paired PR
+        queueAlertEvent(ticker, {
+          type: 'SEC',
+          title: `Form ${ft}`,
+          url: f.filing_url,
+          publishedTime: f.filed_at,
+          isDrop: false,
+        });
       }
     }catch(e){}
     await sleep(200);
@@ -1112,6 +1165,9 @@ async function main(){
   setInterval(async()=>{
     const {hh,m}=getET();
     if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();fmpProfileCache.clear();
+      // Flush any pending event queues so timers don't leak
+      for(const [t,q] of eventQueue){ if(q.timer) clearTimeout(q.timer); }
+      eventQueue.clear();
       // Prune recentRunners older than 5 days
       const fiveDaysAgo=Date.now()-5*24*60*60*1000;
       for(const [t,ts] of recentRunners) if(ts<fiveDaysAgo) recentRunners.delete(t);
