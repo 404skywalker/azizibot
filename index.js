@@ -845,7 +845,7 @@ async function getCTB(ticker){
 // ─── State ────────────────────────────────────────────────────────────────────
 let topGappers=[];
 const dayWatchlist=new Map();
-const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set()};
+const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set(),bellPosted:new Set()};
 const wsDebounce=new Map();
 const closePrice=new Map(); // ticker → price at 4PM close
 // recentRunners: tickers that qualified as gappers in the last 5 days
@@ -1673,6 +1673,34 @@ async function checkMorningSnapshot(){
   console.log(`[${getET().timeStr}] Morning snapshot posted`);
 }
 
+// ─── Market bell alerts: 5 min to open + 5 min to close ───────────────────────
+// Fires once per trading day at:
+//   9:25 AM ET → "Market Open in 5 minutes"  (green)
+//   3:55 PM ET → "Market Close in 5 minutes" (red)
+// Uses ±2-min window so a brief poll skip doesn't miss it, and a Set keyed by
+// date+event so it never double-fires. Restart-safe: if the bot starts after
+// the trigger window, that day's alert simply doesn't fire (no late spam).
+async function checkBellAlerts(){
+  if(!isMarketDay()) return;
+  const {hh, m, etMin} = getET();
+  const dateKey = new Date().toISOString().slice(0,10);
+  const BELLS = [
+    {name:'open',  triggerMin: 9*60 + 25, title:'🟢 Market Open in 5 minutes',  color:0x22c55e},
+    {name:'close', triggerMin:15*60 + 55, title:'🔴 Market Close in 5 minutes', color:0xef4444},
+  ];
+  for(const b of BELLS){
+    const key = `${dateKey}_${b.name}`;
+    if(state.bellPosted.has(key)) continue;
+    // Fire within a 2-minute window starting at the trigger time. The window
+    // is wide enough to absorb the 20s main-loop cadence, narrow enough to
+    // never fire late if the bot was offline through the entire window.
+    if(etMin < b.triggerMin || etMin > b.triggerMin + 2) continue;
+    state.bellPosted.add(key);
+    await post({embeds:[{title:b.title,color:b.color,footer:{text:`AziziBot · ${getET().timeStr} ET`},timestamp:new Date().toISOString()}]});
+    console.log(`[${getET().timeStr}] Bell alert: ${b.name}`);
+  }
+}
+
 // ─── Day-gapper recovery (restart resilience) ────────────────────────────────
 // On startup, dayWatchlist is empty. Standard refreshGappers only catches
 // tickers currently in top 50 by chgPct. A stock that pumped to +80% at 10AM
@@ -2056,6 +2084,7 @@ async function main(){
       for(const [t,ts] of recentRunners) if(ts<fiveDaysAgo) recentRunners.delete(t);
       console.log(`[Daily] recentRunners: ${recentRunners.size} tickers kept`);console.log('[Daily] Reset');}
     await checkMorningSnapshot();
+    await checkBellAlerts();
     await checkFilings();
     await syncHighsAtTransition();
     await refreshRegSHO(); // self-rate-limits to 23h, safe to call every minute
