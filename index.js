@@ -637,15 +637,16 @@ async function handleNewsItem(title,tickers,url,published_utc){
     const ageMs  = Date.now()-new Date(published_utc||Date.now()).getTime();
     const ageStr = ageMs<60000?`${Math.round(ageMs/1000)}s`:ageMs<3600000?`${Math.round(ageMs/60000)}m`:`${Math.round(ageMs/3600000)}h`;
 
-    // Exact NuntioBot PR format:
-    // **TICKER** < $X – Title – Link ~ FLAG | IO: X% | MC: X M | SI: X%
-    const mcStr  = mc>0?` | MC: ${fmtN(mc)}`:'';
+    // Exact NuntioBot PR format — two lines:
+    // 08:14 ↗ TICKER <$12 ~ FLAG | IO: X% | MC: X B | SI: X%
+    // • 14 minutes ago [PR] Title - Link
+    const mcStr2 = mc>0?` | MC: ${fmtN(mc)}`:'';
     const ioStr2 = fv.io!=='--'?` | IO: ${fv.io}`:'';
     const siStr2 = fv.si!=='--'?` | SI: ${fv.si}`:'';
-    const priceStr = `< $${price<1?price.toFixed(2):price%1===0?price.toFixed(0):price.toFixed(2)}`;
-    const linkPart = url?` - [Link](<${url}>)`:'';
-    const line = `**${ticker}** ${priceStr} - ${title.slice(0,200)}${linkPart} ~ ${flag(ticker)}${ioStr2}${mcStr}${siStr2}`;
-    await post({content:line});
+    const fmtAge = ms => ms<3600000?`${Math.round(ms/60000)} minutes ago`:`${Math.round(ms/3600000)} hours ago`;
+    const header = `${timeStr.slice(0,5)} ${isDrop?'↓':'↑'} ${ticker} ${priceFlag(price)} ~ ${flag(ticker)}${ioStr2}${mcStr2}${siStr2}`;
+    const bullet = `> • ${fmtAge(ageMs)} [${isDrop?'PR Drop':'PR'}] ${title.slice(0,200)}${url?` - [Link](<${url}>)`:''}`;
+    await post({content:`${header}\n${bullet}`});
     console.log(`[${timeStr}] ${isDrop?'PR-DROP':'PR-SPIKE'}: ${ticker}`);
   }
   if(state.sentNews.size>500){const a=[...state.sentNews];state.sentNews.clear();a.slice(-200).forEach(x=>state.sentNews.add(x));}
