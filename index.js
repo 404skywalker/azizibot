@@ -509,8 +509,10 @@ async function fireNHOD(ticker,price){
     if(tier.name==='PRE'){
       // Pre-market: Polygon day.v is always 0 before open — don't penalize live scanner tickers
       // Only apply vol gate to watchlist-only tickers (they bypassed the scanner)
-      if(isWatchOnly && checkVol<tier.minVol){
-        console.log(`[NHOD] ${ticker} skip: PRE vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (watch)`);return;
+      // Watchlist tickers: block if NO volume at all (yesterday's ghosts)
+      // Allow if they have ANY pre-market activity (peakVol or gapper.volume > 0)
+      if(isWatchOnly && checkVol===0){
+        console.log(`[NHOD] ${ticker} skip: PRE no volume (watch)`);return;
       }
     } else if(tier.name==='AH'){
       // AH: fresh names need 500K; day gainers with big peakVol bypass
@@ -608,8 +610,13 @@ async function fireNHOD(ticker,price){
   const afterStr  = afterLull ? ` after-lull` : '';
   const greenStr2 = greenBars>=2 ? ` · \`${greenBars} green bars 1m\`` : '';
   const rvolStr   = liveRvol>0 ? ` | RVol: ${fmtRVol(liveRvol)}` : '';
-  const volStr    = liveVol>0  ? ` | Vol: ${fmtN(liveVol)}` : '';
-  const line = `${timeShort} ↗ **${ticker}** \`${priceFlag(price)}\`${pctPlain} · ${nhod}${afterStr}${greenStr2} ~ ${flag(ticker)}${rvolStr}${volStr}${regSHO}${rsStr}`;
+  // Vol with space before unit like NuntioBot: "5.7 M" not "5.7M"
+  function fmtNS(n){if(!n||n<=0)return'--';if(n>=1e9)return(n/1e9).toFixed(2)+' B';if(n>=1e6)return(n/1e6).toFixed(2)+' M';if(n>=1e3)return(n/1e3).toFixed(1)+' K';return n.toString();}
+  const volStr    = liveVol>0  ? ` | Vol: ${fmtNS(liveVol)}` : '';
+  const siStr     = fv.si!=='--' ? ` | SI: ${fv.si}` : '';
+  const prData2   = newsCache.get(ticker);
+  const prLink    = prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url ? ` | [PR→](<${prData2.url}>)` : '';
+  const line = `${timeShort} ↗ ${ticker} \`${priceFlag(price)}\`${pctPlain} · ${nhod}${afterStr}${greenStr2} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${rsStr}${prLink}`;
 
   await post({content:line});
   console.log(`[ALERT] posted OK`);
