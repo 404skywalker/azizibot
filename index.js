@@ -452,59 +452,210 @@ async function getTickerDetails(ticker){
 // Returns '' if no signal — caller falls through to FOREIGN_TICKER_OVERRIDES /
 // 🇺🇸 default. Country names mapped to ISO codes for the markets that
 // commonly produce ADRs on US exchanges.
+// Auto-detect a ticker's home country from Polygon's ticker-details payload.
+// Priority order (highest → lowest confidence):
+//   1. address.city matches a known foreign metro (Polygon often gets city
+//      right even when address.country wrongly says "United States" for ADRs)
+//   2. description contains "X-based" / "headquartered in X" / "based in X"
+//   3. description contains the country name with strong context (provinces, "PRC")
+//   4. address.country structured field (current logic)
+//   5. phone_number country code prefix
+//   6. locale fallback
+//
+// Each country is defined once below with all its signals so adding a new
+// country is a one-line config change, not a code change.
+const COUNTRY_RULES = [
+  {iso:'CN',
+   names:['china','chinese','people\'s republic of china','prc','mainland china'],
+   cities:['beijing','shanghai','shenzhen','guangzhou','hangzhou','chengdu','wuhan','nanjing','tianjin','xiamen','qingdao','dalian','fuzhou','jinan','hefei','kunming','changsha','wuxi','ningbo','suzhou','zhengzhou','chongqing','harbin','shenyang','xian',"xi'an",'foshan','dongguan','urumqi','taiyuan','lanzhou','nanchang','nanning','jinjiang','quanzhou','zibo','linyi','weifang','tangshan','baoding'],
+   addr:['china','cn','people\'s republic of china','prc'],
+   phone:'+86'},
+  {iso:'HK',
+   names:['hong kong','hongkong'],
+   cities:['hong kong','hongkong','kowloon','central','wan chai'],
+   addr:['hong kong','hk'], phone:'+852'},
+  {iso:'TW',
+   names:['taiwan','taiwanese','republic of china'],
+   cities:['taipei','kaohsiung','taichung','taoyuan','tainan','hsinchu'],
+   addr:['taiwan','tw'], phone:'+886'},
+  {iso:'IL',
+   names:['israel','israeli'],
+   cities:['tel aviv','jerusalem','herzliya','haifa','netanya','ramat gan','rehovot','petah tikva','bnei brak','ashdod','yokneam'],
+   addr:['israel','il'], phone:'+972'},
+  {iso:'GB',
+   names:['united kingdom','great britain','british','english','scotland','scottish','wales','welsh'],
+   cities:['london','manchester','edinburgh','glasgow','birmingham','cambridge','oxford','liverpool','leeds','bristol','sheffield','newcastle','cardiff','belfast'],
+   addr:['united kingdom','uk','great britain','gb','england','scotland'], phone:'+44'},
+  {iso:'CA',
+   names:['canada','canadian'],
+   cities:['toronto','vancouver','montreal','calgary','ottawa','edmonton','winnipeg','quebec','halifax','victoria','mississauga','burnaby','markham','oakville'],
+   addr:['canada','ca'], phone:null}, // +1 ambiguous with US
+  {iso:'FR',
+   names:['france','french'],
+   cities:['paris','lyon','marseille','nice','toulouse','nantes','bordeaux','strasbourg'],
+   addr:['france','fr'], phone:'+33'},
+  {iso:'DE',
+   names:['germany','german','deutschland'],
+   cities:['berlin','munich','frankfurt','hamburg','cologne','stuttgart','düsseldorf','dusseldorf','leipzig'],
+   addr:['germany','de'], phone:'+49'},
+  {iso:'NL',
+   names:['netherlands','dutch','holland'],
+   cities:['amsterdam','rotterdam','the hague','utrecht','eindhoven'],
+   addr:['netherlands','nl'], phone:'+31'},
+  {iso:'CH',
+   names:['switzerland','swiss'],
+   cities:['zurich','geneva','basel','bern','lausanne','lugano','zug'],
+   addr:['switzerland','ch'], phone:'+41'},
+  {iso:'IE',
+   names:['ireland','irish'],
+   cities:['dublin','cork','limerick','galway'],
+   addr:['ireland','ie'], phone:'+353'},
+  {iso:'JP',
+   names:['japan','japanese'],
+   cities:['tokyo','osaka','kyoto','yokohama','nagoya','sapporo','kobe','fukuoka'],
+   addr:['japan','jp'], phone:'+81'},
+  {iso:'KR',
+   names:['south korea','korean','republic of korea'],
+   cities:['seoul','busan','incheon','daegu','daejeon','gwangju'],
+   addr:['south korea','korea','kr'], phone:'+82'},
+  {iso:'SG',
+   names:['singapore','singaporean'],
+   cities:['singapore'],
+   addr:['singapore','sg'], phone:'+65'},
+  {iso:'AU',
+   names:['australia','australian'],
+   cities:['sydney','melbourne','brisbane','perth','adelaide','canberra','gold coast'],
+   addr:['australia','au'], phone:'+61'},
+  {iso:'BR',
+   names:['brazil','brazilian'],
+   cities:['são paulo','sao paulo','rio de janeiro','brasília','brasilia','salvador','fortaleza'],
+   addr:['brazil','br'], phone:'+55'},
+  {iso:'IN',
+   names:['india','indian'],
+   cities:['mumbai','delhi','bangalore','bengaluru','chennai','kolkata','hyderabad','pune','ahmedabad','gurgaon','noida'],
+   addr:['india','in'], phone:'+91'},
+  {iso:'MX',
+   names:['mexico','mexican'],
+   cities:['mexico city','guadalajara','monterrey'],
+   addr:['mexico','mx'], phone:'+52'},
+  {iso:'SE',
+   names:['sweden','swedish'],
+   cities:['stockholm','gothenburg','malmö','malmo','uppsala'],
+   addr:['sweden','se'], phone:'+46'},
+  {iso:'ES',
+   names:['spain','spanish'],
+   cities:['madrid','barcelona','valencia','seville','sevilla'],
+   addr:['spain','es'], phone:'+34'},
+  {iso:'IT',
+   names:['italy','italian'],
+   cities:['rome','milan','milano','naples','turin','torino','florence','firenze'],
+   addr:['italy','it'], phone:'+39'},
+  {iso:'NO',
+   names:['norway','norwegian'],
+   cities:['oslo','bergen','trondheim','stavanger'],
+   addr:['norway','no'], phone:'+47'},
+  {iso:'DK',
+   names:['denmark','danish'],
+   cities:['copenhagen','aarhus','odense'],
+   addr:['denmark','dk'], phone:'+45'},
+  {iso:'FI',
+   names:['finland','finnish'],
+   cities:['helsinki','espoo','tampere','vantaa'],
+   addr:['finland','fi'], phone:'+358'},
+  {iso:'BE',
+   names:['belgium','belgian'],
+   cities:['brussels','antwerp','ghent','bruges'],
+   addr:['belgium','be'], phone:'+32'},
+  {iso:'AT',
+   names:['austria','austrian'],
+   cities:['vienna','salzburg','graz','innsbruck'],
+   addr:['austria','at'], phone:'+43'},
+  {iso:'LU',
+   names:['luxembourg'],
+   cities:['luxembourg'],
+   addr:['luxembourg','lu'], phone:'+352'},
+  {iso:'GR',
+   names:['greece','greek'],
+   cities:['athens','thessaloniki'],
+   addr:['greece','gr'], phone:'+30'},
+  {iso:'TR',
+   names:['turkey','turkish'],
+   cities:['istanbul','ankara','izmir'],
+   addr:['turkey','tr'], phone:'+90'},
+  {iso:'ZA',
+   names:['south africa','south african'],
+   cities:['johannesburg','cape town','durban','pretoria'],
+   addr:['south africa','za'], phone:'+27'},
+  {iso:'AR',
+   names:['argentina','argentine','argentinian'],
+   cities:['buenos aires','córdoba','cordoba','rosario'],
+   addr:['argentina','ar'], phone:'+54'},
+  {iso:'CL',
+   names:['chile','chilean'],
+   cities:['santiago','valparaíso','valparaiso','concepción','concepcion'],
+   addr:['chile','cl'], phone:'+56'},
+  {iso:'BM', names:['bermuda'], cities:['hamilton'], addr:['bermuda','bm'], phone:'+1441'},
+  {iso:'KY', names:['cayman islands'], cities:['george town'], addr:['cayman islands','ky'], phone:'+1345'},
+];
+
 function resolveCountry(data){
   if(!data) return '';
-  const addrCountry = (data.address && data.address.country) || '';
-  if(addrCountry){
-    const cn = addrCountry.trim().toUpperCase();
-    const COUNTRY_NAME_TO_ISO = {
-      'UNITED STATES':'US','USA':'US','US':'US',
-      'CHINA':'CN','CN':'CN',"PEOPLE'S REPUBLIC OF CHINA":'CN','HONG KONG':'HK',
-      'ISRAEL':'IL','IL':'IL',
-      'CANADA':'CA','CA':'CA',
-      'UNITED KINGDOM':'GB','UK':'GB','GREAT BRITAIN':'GB','ENGLAND':'GB','GB':'GB',
-      'FRANCE':'FR','FR':'FR',
-      'GERMANY':'DE','DE':'DE',
-      'NETHERLANDS':'NL','NL':'NL','HOLLAND':'NL',
-      'SWITZERLAND':'CH','CH':'CH',
-      'IRELAND':'IE','IE':'IE',
-      'JAPAN':'JP','JP':'JP',
-      'SOUTH KOREA':'KR','KOREA':'KR','KR':'KR',
-      'TAIWAN':'TW','TW':'TW',
-      'SINGAPORE':'SG','SG':'SG',
-      'AUSTRALIA':'AU','AU':'AU',
-      'BRAZIL':'BR','BR':'BR',
-      'INDIA':'IN','IN':'IN',
-      'MEXICO':'MX','MX':'MX',
-      'SWEDEN':'SE','SE':'SE',
-      'SPAIN':'ES','ES':'ES',
-      'ITALY':'IT','IT':'IT',
-      'BERMUDA':'BM','CAYMAN ISLANDS':'KY','BRITISH VIRGIN ISLANDS':'VG',
-      'LUXEMBOURG':'LU','BELGIUM':'BE','DENMARK':'DK','NORWAY':'NO','FINLAND':'FI',
-      'GREECE':'GR','TURKEY':'TR','SOUTH AFRICA':'ZA','ARGENTINA':'AR',
-      'CHILE':'CL','COLOMBIA':'CO','URUGUAY':'UY','PERU':'PE',
-    };
-    if(COUNTRY_NAME_TO_ISO[cn]) return COUNTRY_NAME_TO_ISO[cn];
-  }
-  // Phone country code prefix — surprisingly accurate for ADRs whose address is "US mailing"
+  const desc = (data.description || '').toLowerCase();
+  const name = (data.name || '').toLowerCase();
+  const addr = data.address || {};
+  const city = (addr.city || '').toLowerCase().trim();
+  const addrCountry = (addr.country || '').toLowerCase().trim();
   const phone = (data.phone_number || '').replace(/\s|-/g,'');
-  if(phone.startsWith('+')){
-    const PHONE_PREFIX_TO_ISO = {
-      '+1':'',     // ambiguous US/CA — ignore
-      '+972':'IL','+86':'CN','+852':'HK','+33':'FR','+44':'GB','+49':'DE',
-      '+31':'NL','+41':'CH','+353':'IE','+81':'JP','+82':'KR','+886':'TW',
-      '+65':'SG','+61':'AU','+55':'BR','+91':'IN','+52':'MX','+46':'SE',
-      '+34':'ES','+39':'IT','+352':'LU','+32':'BE','+45':'DK','+47':'NO',
-      '+358':'FI','+30':'GR','+90':'TR','+27':'ZA','+54':'AR','+56':'CL',
-      '+57':'CO','+598':'UY','+51':'PE',
-    };
-    // Try longest prefix first (3-digit), then 2-digit
-    for(const len of [4,3,2]){
-      const px = phone.slice(0, len);
-      if(PHONE_PREFIX_TO_ISO[px]) return PHONE_PREFIX_TO_ISO[px];
+
+  // 1. address.city match — strongest signal. Polygon often has the correct
+  //    city even when address.country wrongly says United States for ADRs.
+  if(city){
+    for(const r of COUNTRY_RULES){
+      if(r.cities.includes(city)) return r.iso;
     }
   }
-  // Fallback to locale (least granular)
+
+  // 2. Description has strong HQ phrase: "X-based", "headquartered in X",
+  //    "based in X", "principal offices in X". These are specific enough to
+  //    avoid false positives like "we ship to China."
+  for(const r of COUNTRY_RULES){
+    for(const n of r.names){
+      const nEsc = n.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+      const hqRe = new RegExp(
+        `\\b(?:headquartered|based|located|incorporated|registered|operates|operating|domiciled)\\s+(?:in|across|throughout|within|out\\s+of)\\s+(?:the\\s+)?${nEsc}\\b|\\b${nEsc}-based\\b|\\bis\\s+a\\s+(?:leading\\s+)?${nEsc}\\b`,
+        'i'
+      );
+      if(hqRe.test(desc) || hqRe.test(name)) return r.iso;
+    }
+  }
+
+  // 3. Description contains country name with strong context — last bullet
+  //    of description for most foreign ADRs reads "... in the People's
+  //    Republic of China." Pattern: country name followed by sentence end.
+  for(const r of COUNTRY_RULES){
+    for(const n of r.names){
+      const nEsc = n.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+      const ctxRe = new RegExp(`\\b(?:in|across|of|to)\\s+(?:the\\s+)?${nEsc}\\b[.,;]`, 'i');
+      if(ctxRe.test(desc)) return r.iso;
+    }
+  }
+
+  // 4. address.country structured field
+  if(addrCountry){
+    for(const r of COUNTRY_RULES){
+      if(r.addr.includes(addrCountry)) return r.iso;
+    }
+    if(['united states','usa','us'].includes(addrCountry)) return 'US';
+  }
+
+  // 5. Phone country-code prefix
+  if(phone.startsWith('+')){
+    for(const r of COUNTRY_RULES){
+      if(r.phone && phone.startsWith(r.phone)) return r.iso;
+    }
+  }
+
+  // 6. Polygon locale fallback (only knows broad us/global distinction)
   if(data.locale){
     const loc = data.locale.toUpperCase();
     if(loc !== 'US' && loc !== 'GLOBAL') return loc;
