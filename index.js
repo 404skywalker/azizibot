@@ -268,7 +268,7 @@ async function getFmpProfile(ticker){
   const c=fmpProfileCache.get(ticker);
   if(c&&Date.now()-c.ts<12*60*60*1000) return c.data;
   try{
-    const r=await fmpGet(`/api/v3/profile/${ticker}`);
+    const r=await fmpGet(`/api/v4/profile/${ticker}`);
     if(!r||!Array.isArray(r)||!r[0]){
       console.log(`[FMP Profile] ${ticker}: bad response → ${JSON.stringify(r)?.slice(0,120)}`);
       fmpProfileCache.set(ticker,{data:{},ts:Date.now()-11*60*60*1000}); // retry in 1h
@@ -718,7 +718,7 @@ async function pollFmpNews(){
   if(Date.now()-lastFmpPoll<8000) return;
   lastFmpPoll=Date.now();
   try{
-    const r=await fmpGet('/api/v4/general_news?page=0');
+    const r=await fmpGet('/api/v4/stock-news-sentiments-rss-feed?page=0');
     if(!r||!Array.isArray(r)){console.log('[FMP News] unexpected response:',JSON.stringify(r)?.slice(0,100));return;}
     const items=r,cutoff=Date.now()-15*60*1000;
     let matched=0;
@@ -1055,7 +1055,23 @@ async function main(){
     }
   }catch(e){}
 
-  fmpProfileCache.clear(); fmpCountryMap.clear(); // force fresh country data on startup
+  fmpProfileCache.clear(); fmpCountryMap.clear();
+  // Test FMP connectivity on startup
+  if(FMP_KEY){
+    try{
+      const testR=await fmpGet('/api/v3/profile/AAPL');
+      if(Array.isArray(testR)&&testR[0]&&testR[0].country){
+        console.log(`[FMP] v3 profile working ✓ (AAPL country: ${testR[0].country})`);
+      } else {
+        console.log(`[FMP] v3 profile failed: ${JSON.stringify(testR)?.slice(0,120)}`);
+        console.log('[FMP] Trying v4...');
+        const testR4=await fmpGet('/api/v4/profile/AAPL');
+        console.log(`[FMP] v4 response: ${JSON.stringify(testR4)?.slice(0,120)}`);
+      }
+    }catch(e){console.error('[FMP] connectivity test failed:',e.message);}
+  } else {
+    console.log('[FMP] FMP_KEY not set — skipping FMP features');
+  }
   loadPermanentWatchlist();
   await refreshEtfList();
   await refreshGappers();
