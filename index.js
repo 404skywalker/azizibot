@@ -1475,7 +1475,18 @@ async function pollHalts(){
   }
 }
 
-// Tracked tickers always alert. Untracked: only small-caps under $20.
+// Decide whether to fire a halt/resume alert for this ticker.
+//
+// ALWAYS alert for tracked tickers (topGappers, dayWatchlist, permanentWatch)
+// since those are explicitly on our radar.
+//
+// For UNTRACKED tickers, require ALL of:
+//   - moving meaningfully (|chgPct| ≥ 5%) — a real mover, not noise
+//   - liquid (today's volume ≥ 1M shares AND today's dollar volume ≥ $2M)
+//   - reasonable price range ($0.50–$50)
+//   - not OTC / ETF / bad ticker pattern
+// Filters out illiquid microcap LUDPs (SRL/TCGL/JMG class) that LUDP'd on a
+// 5K-share spike — those halts/resumes aren't actionable.
 async function shouldAlertHalt(ticker){
   if(topGappers.some(g => g.ticker === ticker) ||
      dayWatchlist.has(ticker) ||
@@ -1489,8 +1500,21 @@ async function shouldAlertHalt(ticker){
     if(!td) return false;
     const isOTC = /OTC|GREY|PINK|EXPERT/i.test(td.primaryExchange || '');
     if(isOTC) return false;
-    const price = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || 0;
-    return price > 0.10 && price < 20;
+
+    const price   = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || 0;
+    const dayVol  = (td.day && td.day.v) || 0;
+    const chgPct  = (typeof td.todaysChangePerc === 'number') ? td.todaysChangePerc : 0;
+    const dollarVol = dayVol * price;
+
+    // Price range — kept slightly wider than before ($50 ceiling) to catch
+    // mid-cap halts on real catalysts, but with the liquidity guard below.
+    if(price < 0.50 || price > 50) return false;
+    // Real mover today, not just noise that touched a limit band
+    if(Math.abs(chgPct) < 5) return false;
+    // Liquidity floor — both share volume AND dollar volume must clear bar
+    if(dayVol < 1_000_000) return false;
+    if(dollarVol < 2_000_000) return false;
+    return true;
   } catch(e){ return false; }
 }
 
