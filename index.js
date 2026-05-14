@@ -222,7 +222,7 @@ const FOREIGN_TICKER_OVERRIDES = {
   // Germany
   'SAP':'DE','PSO':'DE','BAYRY':'DE','SIEGY':'DE',
   // France
-  'TTE':'FR','SNY':'FR','LVMUY':'FR',
+  'TTE':'FR','SNY':'FR','LVMUY':'FR','IPHA':'FR',
   // Switzerland
   'NVS':'CH','ROG':'CH','UBS':'CH','NESN':'CH','ABBN':'CH',
   // Sweden
@@ -556,17 +556,23 @@ async function getGreenBars(ticker){
 async function getCTB(ticker){
   const c=ctbCache.get(ticker);
   if(c&&Date.now()-c.ts<60*60*1000) return c.data;
+  const empty={fee:0,available:0,date:''};
   try{
     const raw=await rawGet(`https://iborrowdesk.com/api/ticker/${ticker}`,{
       'User-Agent':'Mozilla/5.0 (Linux; Railway) AziziBot/1.0',
       'Accept':'application/json',
     });
+    // iborrowdesk.com sometimes returns an HTML error page (rate limit, downtime,
+    // CloudFlare challenge). Detect this BEFORE JSON.parse so we don't spam logs.
+    if(!raw || raw.trimStart().startsWith('<') || raw.length < 20){
+      ctbCache.set(ticker,{data:empty,ts:Date.now()-50*60*1000});
+      return empty;
+    }
     const j=JSON.parse(raw);
     const daily=(j&&j.daily)||[];
     if(daily.length===0){
-      const data={fee:0,available:0,date:''};
-      ctbCache.set(ticker,{data,ts:Date.now()-50*60*1000}); // short-cache empty result, retry in 10min
-      return data;
+      ctbCache.set(ticker,{data:empty,ts:Date.now()-50*60*1000}); // short-cache empty result, retry in 10min
+      return empty;
     }
     const latest=daily[daily.length-1];
     const data={fee:+latest.fee||0, available:+latest.available||0, date:latest.date||''};
@@ -574,10 +580,12 @@ async function getCTB(ticker){
     if(data.fee>=10) console.log(`[CTB] ${ticker} fee:${data.fee.toFixed(2)}% avail:${data.available}`);
     return data;
   }catch(e){
-    console.error(`[CTB] ${ticker} error:`,e.message);
-    const data={fee:0,available:0,date:''};
-    ctbCache.set(ticker,{data,ts:Date.now()-50*60*1000});
-    return data;
+    // Suppress JSON parse spam — log only true network/timeout errors
+    if(!String(e.message).includes('JSON')){
+      console.error(`[CTB] ${ticker} error:`,e.message);
+    }
+    ctbCache.set(ticker,{data:empty,ts:Date.now()-50*60*1000});
+    return empty;
   }
 }
 
@@ -700,7 +708,12 @@ async function refreshGappers(){
       if(t.chgPct <minChg)    {rej.pct++; return false;}
       if(t.price  <0.10)      {rej.pl++;  return false;}
       if(t.price  >10&&t.chgPct<100){rej.ph++;return false;} // allow >$10 if ≥100% gain
-      if(minVol>0&&name!=='PRE'&&t.volume<minVol){rej.vol++;return false;} // PRE: skip vol filter, day.v=0 pre-market
+      // Vol gate: absolute volume OR high-RVol bypass. Catches small-cap names
+      // like IPHA (150x RVol on 1M absolute vol) that NuntioBot fires but pure
+      // 5M-absolute gate would reject. RVol ≥ 3x with at least 100K liquidity
+      // is enough signal to not be dust. PRE bypasses entirely (day.v=0 pre-market).
+      const rvolBypass = t.rvol >= 3 && t.volume >= 100_000;
+      if(minVol>0&&name!=='PRE'&&t.volume<minVol&&!rvolBypass){rej.vol++;return false;}
       if(t.isOTC)             {rej.otc++; return false;}
       if(isEtf(t.ticker))     {rej.etf++; return false;}
       if(isBadTicker(t.ticker)){rej.bad++;return false;}
@@ -709,7 +722,7 @@ async function refreshGappers(){
 
     console.log(`[${name}] from ${merge.size}: passed=${newGappers.length} | chg<${minChg}%:${rej.pct} p<0.10:${rej.pl} p>10:${rej.ph} vol:${rej.vol} OTC:${rej.otc} ETF:${rej.etf}`);
     if(newGappers.length>0)
-      console.log(`[Gappers] ${newGappers.slice(0,5).map(g=>`${g.ticker}(${g.chgPct.toFixed(0)}%,${fmtN(g.volume)})`).join(' ')}`);
+      console.log(`[Gappers] ${newGappers.slice(0,5).map(g=>`${g.ticker}(${g.chgPct.toFixed(0)}%,${fmtN(g.volume)},${g.rvol.toFixed(1)}x)`).join(' ')}`);
 
     topGappers=newGappers;
 
@@ -770,31 +783,36 @@ async function fireNHOD(ticker,price){
   const tier=getTier(etMin);
   if(!tier) return;
   let checkVol = Math.max(gapper.volume||0, s.peakVol||0);
-  // Safety net: if vol is 0 we likely hit the synthetic gapper path for a
-  // permanentWatch-only ticker BEFORE the WS sent its first A event. Fetch a
-  // fresh snapshot to avoid false-negative gate. This is rare (only when both
-  // the scanner missed the ticker AND no aggregate has streamed yet) so the
-  // extra API call doesn't impact alert latency on normal paths.
-  if(checkVol === 0){
+
+  // Synthetic-gapper freshen: when liveG is missing (ticker not in current
+  // top-gappers scanner result), the gapper came from dayWatchlist (stale lock-
+  // time data) or permanentWatch fallback (hardcoded 0s). Either way, chgPct
+  // and rvol are wrong/zero and would falsely fail the gates below. Pull a
+  // fresh snapshot to populate real values. This is the path AEHL/WOK hit when
+  // the scanner missed them but they're in watchlist.txt.
+  const needFreshen = !liveG && (checkVol === 0 || gapper.chgPct === 0);
+  if(needFreshen){
     try {
       const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
       const td = snap && snap.ticker;
-      const dayV = (td && td.day && td.day.v) || 0;
-      if(dayV > 0){
-        checkVol = dayV;
-        s.peakVol = Math.max(s.peakVol||0, dayV);
-        // Also bootstrap chgPct/price for the synthetic gapper so downstream is correct
+      if(td){
         const lastP = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || price;
         const prevC = (td.prevDay && td.prevDay.c) || 0;
-        if(prevC > 0){
-          gapper.chgPct = ((lastP - prevC) / prevC) * 100;
-          gapper.price  = lastP;
-          gapper.volume = dayV;
-          gapper.prevVol = (td.prevDay && td.prevDay.v) || 0;
+        const dayV  = (td.day && td.day.v) || 0;
+        const prevV = (td.prevDay && td.prevDay.v) || 0;
+        const mins  = Math.max(etMin-240, 1);
+        if(prevC > 0) gapper.chgPct = ((lastP - prevC) / prevC) * 100;
+        gapper.price   = lastP;
+        gapper.volume  = dayV;
+        gapper.prevVol = prevV;
+        gapper.rvol    = prevV > 0 ? (dayV*390)/(mins*prevV) : 0;
+        if(dayV > 0){
+          checkVol = Math.max(checkVol, dayV);
+          s.peakVol = Math.max(s.peakVol||0, dayV);
         }
-        console.log(`[NHOD] ${ticker} snapshot-fallback: vol=${fmtN(dayV)} chgPct=${gapper.chgPct.toFixed(1)}%`);
+        console.log(`[NHOD] ${ticker} freshen: chg=${gapper.chgPct.toFixed(1)}% vol=${fmtN(dayV)} rvol=${gapper.rvol.toFixed(1)}x`);
       }
-    } catch(e){ /* fall through; gate below will skip */ }
+    } catch(e){ /* fall through; gates below will reject if data still bad */ }
   }
   if(tier.minVol>0){
     if(tier.name==='PRE'){
@@ -812,9 +830,13 @@ async function fireNHOD(ticker,price){
         console.log(`[NHOD] ${ticker} skip: AH vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (fresh)`);return;
       }
     } else {
-      // MKT: full vol gate applies to all
-      if(checkVol<tier.minVol){
-        console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(checkVol)}<${fmtN(tier.minVol)}`);return;
+      // MKT: vol gate with RVol bypass (mirrors scanner logic). A 150x-RVol
+      // small-cap pump shouldn't be silenced just because absolute volume is
+      // <5M. Require ≥3x RVol AND ≥100K abs vol for liquidity sanity.
+      const liveRvolForGate = gapper.rvol || 0;
+      const rvolBypass = liveRvolForGate >= 3 && checkVol >= 100_000;
+      if(checkVol<tier.minVol && !rvolBypass){
+        console.log(`[NHOD] ${ticker} skip: ${tier.name} vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (rvol=${liveRvolForGate.toFixed(1)}x)`);return;
       }
     }
   }
