@@ -10,7 +10,11 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
 const APP_ID        = '1493671812247322624';
 
 const TOP_GAPPERS_WH = 'https://discord.com/api/webhooks/1493250562689597623/57UTSPu2KfLmYNBRVPvPQIa4cSfCQA8wVcqB5d0J8cWYaJf5hlsm1EuRkQ3lolChTNh3';
-const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504111128106631359/W9Ky7814ojPziIuN6loeaNgu6l8aFzUMlMtrj8vsf4egXWfiBKFv0sNKu8VO9cclmRKD';
+// All NHOD, PR, and SEC alerts route here. Swapped from #alerts-testing to
+// #Main-chat 2026-05-14 per user directive.
+const MAIN_CHAT_WH   = 'https://discord.com/api/webhooks/1504535425535049738/MbDW1k1ESVMoIRokvaJ6Fg76WhkiSh8K46AHCpZi042jNjGkUn_Y6ybU0mOXZCPMU53w';
+// (Previous alerts-testing webhook, kept commented out for rollback if needed)
+// const MAIN_CHAT_WH = 'https://discord.com/api/webhooks/1504111128106631359/W9Ky7814ojPziIuN6loeaNgu6l8aFzUMlMtrj8vsf4egXWfiBKFv0sNKu8VO9cclmRKD';
 // Halt + resume alerts fan out to BOTH the dedicated #halt-alerts channel
 // AND the main chat for visibility. Add/remove URLs to change broadcast.
 // Env override HALT_ALERTS_WH replaces the entire list (comma-separated).
