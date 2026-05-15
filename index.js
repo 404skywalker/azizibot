@@ -1775,10 +1775,51 @@ async function detectHaltDirection(ticker, haltedAtMs){
 // inline ("Resume HH:MM ET"), which is the same info a separate post would
 // carry.
 
+// Format a UTC ms timestamp as "HH:MM" in ET.
+function fmtEtHM(utcMs){
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(new Date(utcMs));
+}
+
+// Return a credible "Resume HH:MM" display string, or null if we don't have
+// one. NASDAQ's RSS publishes garbage resume times for fresh halts: same
+// minute as halt time (the 11:49 halt with 11:49 resume bug), earlier than
+// the halt, or just incomplete. This filters those out.
+//
+// For LULD volatility halts (T5/LUDP/LUDS), we IGNORE RSS entirely and
+// compute haltedAt + 5 minutes — that's the standard LULD halt duration,
+// it's deterministic, and it's the most common halt type by far.
+//
+// For other codes (T1 news, T12 info, H10/H11 regulatory) we honor RSS but
+// only if the resume time string is strictly after the halt time string.
+function computeResumeTimeDisplay(st){
+  const {code, haltedAt, haltTimeOriginal, resumeTimeOriginal} = st;
+
+  // LULD volatility halts → always 5 minutes after the halt
+  if(HALT_DIRECTIONAL.has(code) && haltedAt > 0){
+    return fmtEtHM(haltedAt + 5*60*1000);
+  }
+
+  if(!resumeTimeOriginal) return null;
+
+  // Compare HH:MM portions lexicographically. Same minute as halt or earlier
+  // = bogus. (Both strings are zero-padded HH:MM:SS so this is a valid
+  // chronological comparison within the same day.)
+  if(haltTimeOriginal){
+    const haltMin   = haltTimeOriginal.slice(0, 5);
+    const resumeMin = resumeTimeOriginal.slice(0, 5);
+    if(resumeMin <= haltMin) return null;
+  }
+
+  return resumeTimeOriginal.slice(0, 5);
+}
+
 // Build the right-of-pipe content shared by all halt variants. Pure formatter
 // — no API calls, no posting. Easy to test, easy to reason about.
 function buildHaltLineRight(st, snap){
-  const {reason, resumeTimeOriginal} = st;
+  const {reason} = st;
   const parts = [];
   let mainPart = reason;
   if(snap && snap.price > 0){
@@ -1788,8 +1829,9 @@ function buildHaltLineRight(st, snap){
     mainPart = `${reason} → ${tail}`;
   }
   parts.push(mainPart);
-  if(resumeTimeOriginal){
-    parts.push(`Resume ${resumeTimeOriginal.slice(0,5)} ET`);
+  const resumeDisplay = computeResumeTimeDisplay(st);
+  if(resumeDisplay){
+    parts.push(`Resume ${resumeDisplay} ET`);
   }
   return parts.join(' · ');
 }
