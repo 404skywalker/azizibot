@@ -1421,12 +1421,23 @@ async function pollNews(){
 }
 
 // ─── SEC filings ──────────────────────────────────────────────────────────────
-let lastFilingCheck=0;
-// Check recent filings for a single ticker. Shared between the periodic
-// checkFilings() loop and the news-triggered path in handleNewsItem(). PR
-// and SEC filings often drop within seconds of each other (earnings is
-// the canonical example), and the periodic loop runs every 2 minutes which
-// is too slow for that — so handleNewsItem calls this directly.
+// Trader-relevant filing forms. 8-K and 10-Q are the bread and butter
+// (material events, quarterly earnings). S-1/S-3/F-1/F-3 indicate dilution
+// risk. 424B* are pricing supplements (often dilutive offerings). SC 13G/D
+// flag large/activist positions. 6-K/20-F are foreign issuer equivalents.
+const FILINGS_FORM_TYPES = new Set([
+  '8-K', '10-Q', '10-K', '10-K/A', '10-Q/A', '8-K/A',
+  'S-1', 'S-3', 'S-1/A', 'S-3/A', 'F-1', 'F-3', 'F-1/A', 'F-3/A',
+  '424B1', '424B2', '424B3', '424B4', '424B5',
+  '6-K', '20-F', '40-F',
+  'SC 13D', 'SC 13G', 'SC 13D/A', 'SC 13G/A',
+  '425', 'DEF 14A',
+]);
+
+// Check recent filings for a single ticker. Shared between the news-triggered
+// path in handleNewsItem() (which calls this directly so PR+SEC pairings drop
+// together) and not used elsewhere. The market-wide pollAllFilings() below
+// handles the discovery case for tickers we don't have tracked yet.
 async function checkTickerFilings(ticker){
   try {
     const r = await polyGet(`/vX/reference/filings?ticker=${ticker}&limit=5&order=desc&sort=filed_at`);
@@ -1447,15 +1458,91 @@ async function checkTickerFilings(ticker){
   } catch(e){}
 }
 
-async function checkFilings(){
-  if(!isActive()) return;
-  if(Date.now()-lastFilingCheck<2*60*1000) return;
-  lastFilingCheck=Date.now();
-  const known=new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...recentRunners.keys(),...permanentWatch]);
-  if(!known.size) return;
-  for(const ticker of known){
-    await checkTickerFilings(ticker);
-    await sleep(200);
+// Market-wide real-time filings poll. Fetches Polygon's filings endpoint
+// WITHOUT a ticker filter — gets the most recent filings across all US
+// equities — and alerts on any whose ticker passes the news qualifier
+// (loose: $0.01–$100, alive volume signal, not OTC/ETF/bad-ticker). This is
+// the QUCY-class fix: filings on stocks that aren't yet in topGappers when
+// they file (e.g. 10-Q dropped before the stock started running today) get
+// caught regardless. NuntioBot does the same — polls EDGAR's full feed.
+let pollFilingsInProgress = false;
+let lastFilingsPoll = 0;
+let firstFilingsPoll = true;
+
+async function pollAllFilings(){
+  if(pollFilingsInProgress) return;
+  if(Date.now() - lastFilingsPoll < 30_000) return;
+  pollFilingsInProgress = true;
+  lastFilingsPoll = Date.now();
+  try {
+    const r = await polyGet('/vX/reference/filings?limit=100&order=desc&sort=filed_at');
+    const filings = (r && r.results) || [];
+    let processed = 0, baselined = 0;
+
+    for(const f of filings){
+      const filed = new Date(f.filed_at || 0).getTime();
+      const id = (f.filing_url || f.accession_number || '').slice(0, 80);
+
+      // Skip if older than 15 min (fresh filings only) or already alerted
+      if(filed <= Date.now() - 15*60*1000) continue;
+      if(state.sentFilings.has(id)) continue;
+
+      // Baseline first poll to prevent restart spam
+      if(firstFilingsPoll){
+        state.sentFilings.add(id);
+        baselined++;
+        continue;
+      }
+
+      // Filter by form type — only trader-relevant filings
+      const formType = (f.form_type || '').toUpperCase();
+      if(!FILINGS_FORM_TYPES.has(formType)) continue;
+
+      // Extract ticker(s) — Polygon may return single ticker or array
+      const rawTickers = Array.isArray(f.tickers) ? f.tickers
+                       : (f.ticker ? [f.ticker] : []);
+      const tickers = [...new Set(rawTickers.filter(Boolean).map(t => String(t).toUpperCase()))];
+      if(!tickers.length) continue;
+
+      // For each ticker on this filing, check if it qualifies. Fire alert
+      // for the FIRST qualifying ticker only — one filing = one alert even
+      // if it mentions multiple tickers (most filings are single-ticker
+      // anyway; multi-ticker filings are mergers/spinoffs).
+      let fired = false;
+      for(const ticker of tickers){
+        if(fired) break;
+        const qualifying = await isQualifyingForNews(ticker);
+        if(!qualifying) continue;
+        state.sentFilings.add(id);
+        await postEventAlert(ticker, {
+          type: 'SEC',
+          title: `Form ${formType}`,
+          url: f.filing_url,
+          publishedTime: f.filed_at,
+          isDrop: false,
+        }).catch(e => console.error(`[Filings] postEventAlert ${ticker}:`, e.message));
+        processed++;
+        fired = true;
+      }
+    }
+
+    // Trim sentFilings if it grows too large
+    if(state.sentFilings.size > 2000){
+      const arr = [...state.sentFilings];
+      state.sentFilings.clear();
+      arr.slice(-800).forEach(x => state.sentFilings.add(x));
+    }
+
+    if(firstFilingsPoll){
+      console.log(`[Filings] startup baseline: ${baselined} pre-existing filing(s) skipped`);
+      firstFilingsPoll = false;
+    } else if(processed > 0){
+      console.log(`[Filings] ${processed} new filing alert(s)`);
+    }
+  } catch(e){
+    console.error('[Filings] error:', e.message);
+  } finally {
+    pollFilingsInProgress = false;
   }
 }
 
@@ -2340,7 +2427,7 @@ async function main(){
   console.log(`[Webhooks] PR_NEWS_WH:      ${PR_NEWS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → PR/SEC fall back to MAIN_CHAT_WH' : 'MISSING → PR/SEC alerts SUPPRESSED')}`);
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
-  console.log(`[Pollers]  news: 5s · halts: 5s · main loop: 20s`);
+  console.log(`[Pollers]  news: 5s · halts: 5s · filings: 30s · main loop: 20s`);
 
   // Check Discord session_start_limit before connecting
   try{
@@ -2405,6 +2492,13 @@ async function main(){
     try { await pollHalts(); } catch(e){ console.error('[Halts] loop error:', e.message); }
   }, 5*1000);
 
+  // Market-wide SEC filings poll on its OWN 30s interval. Catches filings for
+  // ANY qualifying US equity, not just tickers we already have tracked. Same
+  // model as halt polling — concurrency-guarded, first-poll baselined.
+  setInterval(async()=>{
+    try { await pollAllFilings(); } catch(e){ console.error('[Filings] loop error:', e.message); }
+  }, 30*1000);
+
   setInterval(async()=>{
     const {hh,m}=getET();
     if(hh===0&&m<1){state.dailyCounts.clear();state.tickers.clear();state.sentFilings.clear();dayWatchlist.clear();closePrice.clear();
@@ -2414,7 +2508,6 @@ async function main(){
       console.log(`[Daily] recentRunners: ${recentRunners.size} tickers kept`);console.log('[Daily] Reset');}
     await checkMorningSnapshot();
     await checkBellAlerts();
-    await checkFilings();
     await syncHighsAtTransition();
     await refreshRegSHO(); // self-rate-limits to 23h, safe to call every minute
   },60*1000);
