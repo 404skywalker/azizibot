@@ -1585,19 +1585,47 @@ async function pollHalts(){
     // from RSS = resumed. Catches resumes when the RSS never published a
     // resume time. Skip on first poll (no prior set to compare against).
     // Same fire-criteria as path 1: posted halt alert OR currently qualifies.
+    //
+    // ROBUSTNESS: NASDAQ's RSS has a known flakiness where freshly-added
+    // halts can briefly disappear and reappear in subsequent polls. Without
+    // protection, this fires a ghost resume seconds after the halt alert
+    // (the PIII case). Two gates prevent this:
+    //   1. Minimum age 60s. LULD halts have a 5-min minimum duration —
+    //      anything "resuming" in under 60s is flaky RSS, not a real resume.
+    //   2. 2 consecutive missed polls. A single-poll absence (5s) is much
+    //      more likely a publishing hiccup than a real resume; require the
+    //      halt to be absent for 2+ poll cycles before treating as resumed.
     if(!firstHaltPoll){
       for(const key of currentlyHalted){
-        if(!nowHalted.has(key)){
-          const st = haltState.get(key);
-          if(st && !st.alertedResume){
-            const should = st.firedHaltAlert || await shouldAlertHalt(st.ticker);
-            if(should){
-              await fireResumeAlert(st);
-              resumes++;
-            }
-            st.alertedResume = true;
-          }
+        const st = haltState.get(key);
+        if(!st) continue;
+        if(nowHalted.has(key)){
+          // Still in RSS this poll — reset miss counter
+          if(st.consecMisses) st.consecMisses = 0;
+          continue;
         }
+        // Disappeared from RSS this poll
+        if(st.alertedResume) continue;
+
+        const ageMs = Date.now() - st.haltedAt;
+        if(ageMs < 60_000){
+          console.log(`[Halt] ${st.ticker} disappeared at age ${(ageMs/1000).toFixed(0)}s — too fresh, ignoring (flaky RSS)`);
+          nowHalted.add(key); // keep tracking so we'll see it next poll
+          continue;
+        }
+        st.consecMisses = (st.consecMisses || 0) + 1;
+        if(st.consecMisses < 2){
+          console.log(`[Halt] ${st.ticker} 1st miss at age ${(ageMs/1000).toFixed(0)}s — waiting for 2nd consecutive miss`);
+          nowHalted.add(key);
+          continue;
+        }
+        // Confirmed: 2+ consecutive misses, age > 60s = real resume
+        const should = st.firedHaltAlert || await shouldAlertHalt(st.ticker);
+        if(should){
+          await fireResumeAlert(st);
+          resumes++;
+        }
+        st.alertedResume = true;
       }
     }
     currentlyHalted = nowHalted;
