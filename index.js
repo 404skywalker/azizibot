@@ -1099,17 +1099,16 @@ async function fireNHOD(ticker,price){
   }
   if(tier.minVol>0){
     if(tier.name==='PRE'){
-      // Pre-market vol gate. Symmetric with MKT: fail if vol below floor
-      // UNLESS RVol bypass kicks in (3x relative volume with at least 10K
-      // absolute volume — lower abs floor than MKT's 100K because pre-market
-      // volumes are naturally lighter). The previous code waved through
-      // every pre-market ticker because the original author thought day.v
-      // was always 0 in pre-market — but our WS av accumulation + pre-warm
-      // session volume gives us real numbers, so we can enforce properly.
+      // Pre-market vol gate. Lower floor than MKT because pre-market volumes
+      // are naturally light. 15K shares absolute floor catches early-morning
+      // small-cap pumps; RVol bypass (3x with 5K abs floor) catches genuine
+      // RVol explosions even when absolute vol is tiny. Blocks INBS-class
+      // noise (a few thousand shares on a small move with no relative-vol
+      // signal) without strangling legit pre-market activity.
       const liveRvolForGate = gapper.rvol || 0;
-      const rvolBypass = liveRvolForGate >= 3 && checkVol >= 10_000;
-      if(checkVol < tier.minVol && !rvolBypass){
-        console.log(`[NHOD] ${ticker} skip: PRE vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (rvol=${liveRvolForGate.toFixed(1)}x)`);return;
+      const rvolBypass = liveRvolForGate >= 3 && checkVol >= 5_000;
+      if(checkVol < 15_000 && !rvolBypass){
+        console.log(`[NHOD] ${ticker} skip: PRE vol ${fmtN(checkVol)}<15K (rvol=${liveRvolForGate.toFixed(1)}x)`);return;
       }
     } else if(tier.name==='AH'){
       // AH: fresh names need 500K; day gainers with big peakVol bypass
@@ -1529,7 +1528,12 @@ async function pollHalts(){
         if(firstHaltPoll){
           st.alertedHalt = true;
           // st.firedHaltAlert stays false → resume will re-check qualification
-          if(st.resumeAt > 0 && Date.now() >= st.resumeAt){
+          // Only suppress resume if resumeAt is sensibly AFTER haltedAt (the
+          // halt actually played out). Opening halts at 09:30 sometimes have
+          // a bogus resumeAt that's the same minute or earlier than haltedAt
+          // — those are still LIVE halts and need the resume alert to fire
+          // when the ticker disappears from RSS.
+          if(st.resumeAt > 0 && Date.now() >= st.resumeAt && st.resumeAt > st.haltedAt + 30_000){
             st.alertedResume = true; // already over — don't fire ghost resume
           }
           // else: live halt — leave alertedResume=false so the resume fires
@@ -1552,10 +1556,11 @@ async function pollHalts(){
         st.alertedHalt = true; // mark even if we didn't alert (avoids re-eval)
 
         // CRITICAL: if the halt is ALREADY over at first detection (we were
-        // late), suppress the resume alert entirely. The halt message already
-        // shows "Resume HH:MM ET" so the user knows it's resolved. Without
-        // this, halt + resume fire back-to-back for stale halts.
-        if(st.resumeAt > 0 && Date.now() >= st.resumeAt){
+        // late), suppress the resume alert entirely. Require resumeAt be at
+        // least 30s after haltedAt — otherwise this is a bogus opening-halt
+        // resume timestamp (09:30:00 reported as resume for a halt at
+        // 09:30:37) and the halt is actually still live.
+        if(st.resumeAt > 0 && Date.now() >= st.resumeAt && st.resumeAt > st.haltedAt + 30_000){
           st.alertedResume = true;
         }
       }
@@ -1564,7 +1569,9 @@ async function pollHalts(){
       // Fires if EITHER (a) we previously posted the halt alert (consistency)
       // OR (b) the ticker currently qualifies (catches restart-baselined cases
       // like TDIC where we missed the halt but the ticker is a huge mover).
-      if(!st.alertedResume && st.resumeAt > 0 && Date.now() >= st.resumeAt){
+      // Require resumeAt > haltedAt+30s so bogus opening-halt timestamps
+      // don't trigger an immediate ghost resume.
+      if(!st.alertedResume && st.resumeAt > 0 && Date.now() >= st.resumeAt && st.resumeAt > st.haltedAt + 30_000){
         const should = st.firedHaltAlert || await shouldAlertHalt(st.ticker);
         if(should){
           await fireResumeAlert(st);
@@ -1674,19 +1681,51 @@ async function snapForHalt(ticker){
 // band. Returns 'UP', 'DOWN', or null (ambiguous → no direction shown).
 async function detectHaltDirection(ticker, haltedAtMs){
   if(!haltedAtMs) return null;
-  const fromMs = haltedAtMs - 3 * 60 * 1000;
+  // Look back 5 minutes to capture the bar CONTAINING the halt plus a few
+  // bars before. The "triggering move" that caused the LULD halt is best
+  // captured by the OPEN→CLOSE of the bar containing the halt — the bar's
+  // close IS the halt price, and the bar's open is the price 60s earlier.
+  // For opening halts (~09:30) where the bar contains "opening cross →
+  // halt price", this captures gap-down halts that a 3-min lookback misses
+  // (because pre-market was trending the other direction).
+  const fromMs = haltedAtMs - 5 * 60 * 1000;
   const toMs = haltedAtMs;
   try {
     const url = `/v2/aggs/ticker/${ticker}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=10`;
     const r = await polyGet(url);
-    if(!r || !r.results || r.results.length === 0) return null;
-    const bars = r.results;
-    const startPrice = bars[0].o;
-    const endPrice   = bars[bars.length - 1].c;
-    if(!startPrice) return null;
-    const pctMove = (endPrice - startPrice) / startPrice * 100;
-    if(Math.abs(pctMove) < 1) return null; // ambiguous — too flat to call
-    return pctMove > 0 ? 'UP' : 'DOWN';
+    const bars = (r && r.results) || [];
+
+    if(bars.length > 0){
+      const lastBar = bars[bars.length - 1];
+
+      // Primary: in-bar move (opening cross → halt price for opening halts)
+      if(lastBar.o > 0 && lastBar.c > 0){
+        const inBarMove = (lastBar.c - lastBar.o) / lastBar.o * 100;
+        if(Math.abs(inBarMove) >= 1) return inBarMove > 0 ? 'UP' : 'DOWN';
+      }
+      // Secondary: prev-bar-close → halt-bar-close (1-min momentum)
+      if(bars.length >= 2){
+        const prevBar = bars[bars.length - 2];
+        if(prevBar.c > 0 && lastBar.c > 0){
+          const move = (lastBar.c - prevBar.c) / prevBar.c * 100;
+          if(Math.abs(move) >= 1) return move > 0 ? 'UP' : 'DOWN';
+        }
+      }
+    }
+
+    // Tertiary: gap from prev day close. For opening halts where the bar
+    // containing the halt has only one print (or no useful O→C signal),
+    // the gap from prev close to halt price captures the direction.
+    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    const prevC = snap && snap.ticker && snap.ticker.prevDay && snap.ticker.prevDay.c;
+    const haltP = (bars.length > 0 ? bars[bars.length-1].c : 0) ||
+                  (snap && snap.ticker && snap.ticker.lastTrade && snap.ticker.lastTrade.p);
+    if(prevC && haltP){
+      const gapMove = (haltP - prevC) / prevC * 100;
+      if(Math.abs(gapMove) >= 2) return gapMove > 0 ? 'UP' : 'DOWN';
+    }
+
+    return null;
   } catch(e){
     console.error(`[Halt] direction detect failed for ${ticker}: ${e.message}`);
     return null;
@@ -1911,24 +1950,16 @@ function connectPriceWS(){
           const s=state.tickers.get(ticker);
           if(!s) continue;
           // Pull volume + minute high from A (per-minute aggregate) events.
-          // av = accumulated daily volume.
-          // h  = current minute high. We accumulate the SESSION high here:
-          // any minute whose high exceeds s.high updates s.high. Previously
-          // we only did this when s.high===0 (bootstrap), which meant the
-          // bot only ever knew the FIRST minute's high — every subsequent
-          // tick above that one minute looked like a "new high of day"
-          // even when the actual session high was reached hours earlier.
+          // av = accumulated daily volume (includes pre-market). h = current
+          // minute's high; we accumulate the SESSION high here — any minute
+          // whose high exceeds s.high updates s.high. This keeps s.high
+          // accurate over the session without needing pre-warm to gate alerts.
           if(msg.ev==='A'){
             const av=+msg.av||0;
             if(av>(s.peakVol||0)) s.peakVol=av;
             const dh=+msg.h||0;
             if(dh > 0 && dh > (s.high||0)) s.high = dh;
           }
-          // Skip NHOD evaluation until the pre-warm has bootstrapped s.high
-          // with the true session high. Without this, a WS trade arriving in
-          // the ~200ms window between subscription and pre-warm completion
-          // would fire NHOD against an uninitialized s.high.
-          if(!s.preWarmed) continue;
           if(!s.priceHistory) s.priceHistory=[];
           s.priceHistory.push({price,time:Date.now()});
           if(s.priceHistory.length>60) s.priceHistory.shift();
