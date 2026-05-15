@@ -13,13 +13,17 @@ const APP_ID        = '1493671812247322624';
 // in source. Source is pushed to a public GitHub repo, so any hardcoded
 // secret would be immediately scrapable. Set these in Railway → Variables:
 //   TOP_GAPPERS_WH   — single URL, for the 6/7AM gapper digest
-//   MAIN_CHAT_WH     — single URL, for NHOD/PR/SEC/bell alerts AND for
-//                      halt mirrors when |chgPct| ≥ 30%
+//   MAIN_CHAT_WH     — single URL, for NHOD/bell alerts AND for halt mirrors
+//                      when |chgPct| ≥ 30%
+//   PR_NEWS_WH       — single URL, for PR + SEC filing alerts (separate
+//                      channel keeps press releases out of the trading feed)
 //   HALT_ALERTS_WH   — comma-separated URLs (every halt goes here)
 // If any is missing, the corresponding alert type is suppressed with a
 // startup log message — the bot still runs, just doesn't post that category.
+// PR_NEWS_WH falls back to MAIN_CHAT_WH if unset (graceful migration).
 const TOP_GAPPERS_WH = process.env.TOP_GAPPERS_WH || '';
 const MAIN_CHAT_WH   = process.env.MAIN_CHAT_WH || '';
+const PR_NEWS_WH     = process.env.PR_NEWS_WH || '';
 // Halt alerts fan out to every URL in HALT_ALERT_WHS in parallel. Big
 // movers (|chgPct| ≥ 30%) are additionally mirrored to MAIN_CHAT_WH so they
 // hit the primary feed without polluting main-chat with every illiquid halt.
@@ -330,6 +334,19 @@ async function post(payload){
   }
   payload.username='AziziBot';
   await postToWebhook(MAIN_CHAT_WH,payload);
+}
+// PR + SEC filing alerts go to their own dedicated channel via PR_NEWS_WH.
+// Keeps press releases out of the main trading feed. Falls back to
+// MAIN_CHAT_WH if PR_NEWS_WH isn't set (graceful migration — bot keeps
+// working even if user hasn't added the new env var yet).
+async function postPRNews(payload){
+  const target = PR_NEWS_WH || MAIN_CHAT_WH;
+  if(!target){
+    console.log('[PR/SEC] suppressed (neither PR_NEWS_WH nor MAIN_CHAT_WH set)');
+    return;
+  }
+  payload.username='AziziBot';
+  await postToWebhook(target,payload);
 }
 // Halt alerts. ALWAYS go to every webhook in HALT_ALERT_WHS.
 // When alsoMain=true (caller determines via chgPct), ADDITIONALLY mirror to
@@ -926,8 +943,8 @@ async function postEventAlert(ticker, event) {
   const linkPart = event.url ? ` - [Link](<${event.url}>)` : '';
   const bullet = `> • \`${ageStr}\` ${typePill} ${titlePart}${linkPart}`;
 
-  await post({ content: `${header}\n${bullet}` });
-  console.log(`[Alert] ${ticker} ${event.type} posted instantly`);
+  await postPRNews({ content: `${header}\n${bullet}` });
+  console.log(`[Alert] ${ticker} ${event.type} posted to PR/news channel`);
 }
 
 function loadPermanentWatchlist(){
@@ -2319,9 +2336,10 @@ async function main(){
   console.log('🤖 AziziBot v8 starting...');
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
-  console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/PR/SEC alerts SUPPRESSED'}`);
+  console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/bell alerts SUPPRESSED'}`);
+  console.log(`[Webhooks] PR_NEWS_WH:      ${PR_NEWS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → PR/SEC fall back to MAIN_CHAT_WH' : 'MISSING → PR/SEC alerts SUPPRESSED')}`);
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
-  console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt/resume alerts SUPPRESSED'}`);
+  console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
   console.log(`[Pollers]  news: 5s · halts: 5s · main loop: 20s`);
 
   // Check Discord session_start_limit before connecting
