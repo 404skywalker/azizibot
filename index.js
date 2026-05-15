@@ -337,23 +337,20 @@ async function post(payload){
 // Halt + resume alerts. ALWAYS go to every webhook in HALT_ALERT_WHS.
 // When alsoMain=true (caller determines via chgPct), ADDITIONALLY mirror to
 // MAIN_CHAT_WH so big-mover halts hit the primary feed.
+//
+// Webhook URLs are deduplicated via Set — if MAIN_CHAT_WH happens to also be
+// listed in HALT_ALERTS_WH (env var misconfig), the post lands once per
+// unique channel, not twice. This is defense-in-depth against the duplicate-
+// alert symptom users have seen when env vars carry over old routing.
 async function postHalt(payload, alsoMain = false){
-  const tasks = [];
-  if(HALT_ALERT_WHS.length){
-    payload.username='AziziBot';
-    for(const wh of HALT_ALERT_WHS){
-      tasks.push(postToWebhook(wh, payload));
-    }
-  }
-  if(alsoMain && MAIN_CHAT_WH){
-    payload.username='AziziBot';
-    tasks.push(postToWebhook(MAIN_CHAT_WH, payload));
-  }
-  if(!tasks.length){
+  const targets = new Set(HALT_ALERT_WHS);
+  if(alsoMain && MAIN_CHAT_WH) targets.add(MAIN_CHAT_WH);
+  if(targets.size === 0){
     console.log('[Halt] suppressed (no webhooks configured)');
     return;
   }
-  await Promise.all(tasks);
+  payload.username = 'AziziBot';
+  await Promise.all([...targets].map(wh => postToWebhook(wh, payload)));
 }
 function discordRest(method,path,body=null){
   return new Promise((resolve,reject)=>{
@@ -1717,25 +1714,37 @@ async function snapForHalt(ticker){
   } catch(e){ return null; }
 }
 
-// For volatility halts (LUDP/T5/LUDS), direction = which limit band was
-// breached: upper = UP, lower = DOWN. NASDAQ RSS doesn't include this, so
-// we infer from minute-bar price action in the 3 minutes immediately before
-// the halt. This is correct regardless of intraday trend — a stock can be
-// +400% on the day and still halt DOWN if it just dropped through the lower
-// band. Returns 'UP', 'DOWN', or null (ambiguous → no direction shown).
-async function detectHaltDirection(ticker, haltedAtMs){
-  if(!haltedAtMs) return null;
-  // Look back 5 minutes to capture the bar CONTAINING the halt plus a few
-  // bars before. The "triggering move" that caused the LULD halt is best
-  // captured by the OPEN→CLOSE of the bar containing the halt — the bar's
-  // close IS the halt price, and the bar's open is the price 60s earlier.
-  const fromMs = haltedAtMs - 5 * 60 * 1000;
-  const toMs = haltedAtMs;
+// Direction detection. Returns {dir: 'UP'|'DOWN'|null, method: string, detail: string}
+// so the caller can log exactly which signal triggered the classification.
+// This is critical when the user reports a wrong-direction alert — we can
+// look at the log and see precisely which method fired with what numbers.
+//
+// Four layers, applied in order; first one with a confident signal wins:
+//
+//   1. PRIMARY    — In-bar O→C move on the halt-minute bar.
+//                   Threshold: |move| ≥ 0.3% (was 1%, lowered after PIII bug
+//                   where a sub-1% O→C still indicated UP via close-at-high).
+//
+//   2. SECONDARY  — Position of close within the halt-minute bar's H/L range.
+//                   For halts UP, the last print (= halt price = bar close)
+//                   sits AT the bar's high by definition. For halts DOWN,
+//                   close = low. This catches halts where O→C is tiny but
+//                   the bar still shows a clear spike-and-halt pattern.
+//
+//   3. TERTIARY   — Prev bar close → halt bar close. 1-minute momentum.
+//                   Threshold: |move| ≥ 0.5%.
+//
+//   4. QUATERNARY — Gap from prev day close. ONLY for opening halts (09:30-
+//                   09:35 ET). Mid-day halts must not use this — a stock
+//                   down 30% on the day can still halt UP on a local bounce,
+//                   and the daily gap would falsely classify it DOWN.
+async function detectHaltDirectionVerbose(ticker, haltedAtMs){
+  if(!haltedAtMs) return {dir: null, method: 'no-halt-time', detail: ''};
 
-  // Opening halt = halt in the first 5 min of regular session. Only opening
-  // halts get the prev-close gap fallback — for mid-day halts, daily
-  // direction != halt direction (a stock can be down 30% on the day and
-  // still halt UP on a local bounce).
+  const fromMs = haltedAtMs - 5 * 60 * 1000;
+  const toMs   = haltedAtMs;
+
+  // Opening halt check (for quaternary gating)
   const haltET = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false
   }).format(new Date(haltedAtMs));
@@ -1748,122 +1757,164 @@ async function detectHaltDirection(ticker, haltedAtMs){
     const bars = (r && r.results) || [];
 
     if(bars.length > 0){
-      const lastBar = bars[bars.length - 1];
+      const lb = bars[bars.length - 1];
+      const barStr = `O=$${(lb.o||0).toFixed(3)} H=$${(lb.h||0).toFixed(3)} L=$${(lb.l||0).toFixed(3)} C=$${(lb.c||0).toFixed(3)}`;
 
-      // Primary: in-bar O→C move. ANY move during the halt-triggering minute
-      // is informative — using 0.3% threshold (was 1%) catches halts where
-      // the trigger happens in the last seconds and O is close to C.
-      if(lastBar.o > 0 && lastBar.c > 0){
-        const inBarMove = (lastBar.c - lastBar.o) / lastBar.o * 100;
-        if(Math.abs(inBarMove) >= 0.3) return inBarMove > 0 ? 'UP' : 'DOWN';
+      // Primary: in-bar O→C
+      if(lb.o > 0 && lb.c > 0){
+        const m = (lb.c - lb.o) / lb.o * 100;
+        if(Math.abs(m) >= 0.3){
+          return {dir: m > 0 ? 'UP' : 'DOWN', method: 'primary/in-bar-oc', detail: `${barStr} O→C ${m.toFixed(2)}%`};
+        }
       }
 
-      // Secondary: high-low position of close within the bar. For halts UP,
-      // the close (= halt price = last print before halt) is essentially AT
-      // the bar's high. For halts DOWN, the close is at the bar's low. This
-      // catches the case where O→C is small but the bar still shows a clear
-      // spike-and-halt pattern (the PIII case: O=$9.05 H=$9.11 L=$9.04
-      // C=$9.11 — only +0.66% O→C but close-equals-high makes UP obvious).
-      if(lastBar.h > 0 && lastBar.l > 0 && lastBar.c > 0 && lastBar.h !== lastBar.l){
-        const range = lastBar.h - lastBar.l;
-        const closeFromHigh = (lastBar.h - lastBar.c) / range; // 0 = at high, 1 = at low
-        const closeFromLow  = (lastBar.c - lastBar.l) / range;
-        if(closeFromHigh < 0.1 && closeFromLow > 0.5) return 'UP';
-        if(closeFromLow  < 0.1 && closeFromHigh > 0.5) return 'DOWN';
+      // Secondary: H/L position of close
+      if(lb.h > 0 && lb.l > 0 && lb.c > 0 && lb.h !== lb.l){
+        const range = lb.h - lb.l;
+        const cFromH = (lb.h - lb.c) / range; // 0 = at high, 1 = at low
+        const cFromL = (lb.c - lb.l) / range;
+        if(cFromH < 0.1 && cFromL > 0.5){
+          return {dir: 'UP', method: 'secondary/close-at-high', detail: `${barStr} cFromH=${cFromH.toFixed(2)} cFromL=${cFromL.toFixed(2)}`};
+        }
+        if(cFromL < 0.1 && cFromH > 0.5){
+          return {dir: 'DOWN', method: 'secondary/close-at-low', detail: `${barStr} cFromH=${cFromH.toFixed(2)} cFromL=${cFromL.toFixed(2)}`};
+        }
       }
 
-      // Tertiary: prev-bar close → halt-bar close (1-min momentum)
+      // Tertiary: prev-bar close → halt-bar close
       if(bars.length >= 2){
-        const prevBar = bars[bars.length - 2];
-        if(prevBar.c > 0 && lastBar.c > 0){
-          const move = (lastBar.c - prevBar.c) / prevBar.c * 100;
-          if(Math.abs(move) >= 0.5) return move > 0 ? 'UP' : 'DOWN';
+        const pb = bars[bars.length - 2];
+        if(pb.c > 0 && lb.c > 0){
+          const m = (lb.c - pb.c) / pb.c * 100;
+          if(Math.abs(m) >= 0.5){
+            return {dir: m > 0 ? 'UP' : 'DOWN', method: 'tertiary/1min-momentum', detail: `prev.c=$${pb.c.toFixed(3)} curr.c=$${lb.c.toFixed(3)} move ${m.toFixed(2)}%`};
+          }
         }
       }
     }
 
-    // Quaternary: gap from prev day close. ONLY for opening halts — for
-    // mid-day halts, the prev-close gap reflects daily direction which is
-    // NOT the same as halt direction (a stock down 30% on the day can still
-    // halt UP on a local bounce). Without this guard, mid-day halts get
-    // misclassified by their daily trend.
+    // Quaternary: prev-close gap (opening halts only)
     if(isOpeningHalt){
       const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
       const prevC = snap && snap.ticker && snap.ticker.prevDay && snap.ticker.prevDay.c;
       const haltP = (bars.length > 0 ? bars[bars.length-1].c : 0) ||
                     (snap && snap.ticker && snap.ticker.lastTrade && snap.ticker.lastTrade.p);
       if(prevC && haltP){
-        const gapMove = (haltP - prevC) / prevC * 100;
-        if(Math.abs(gapMove) >= 2) return gapMove > 0 ? 'UP' : 'DOWN';
+        const g = (haltP - prevC) / prevC * 100;
+        if(Math.abs(g) >= 2){
+          return {dir: g > 0 ? 'UP' : 'DOWN', method: 'quaternary/opening-gap', detail: `prevC=$${prevC.toFixed(3)} haltP=$${haltP.toFixed(3)} gap ${g.toFixed(2)}%`};
+        }
       }
     }
 
-    return null;
+    return {dir: null, method: 'ambiguous', detail: `${bars.length} bar(s), no layer hit threshold`};
   } catch(e){
     console.error(`[Halt] direction detect failed for ${ticker}: ${e.message}`);
-    return null;
+    return {dir: null, method: 'error', detail: e.message};
   }
 }
 
-// Format halt alert in NuntioBot style:
-//   `13:39:00` `FCUV` `Halted UP` 🇺🇸 | Volatility → $1.80 · 1.9M vol · Resume 13:44 ET
-// Timestamp = actual halt time from RSS (not detection time).
-async function fireHaltAlert(st){
-  const {ticker, code, reason, haltedAt, haltTimeOriginal, resumeTimeOriginal} = st;
-  // Use the actual halt time from the RSS feed — accurate to when the stock
-  // halted, regardless of when we detected it.
-  const timeStr = haltTimeOriginal || getET().timeStr;
-  const s = await snapForHalt(ticker);
+// Thin compat wrapper for any code that still calls the old name (returns just dir).
+async function detectHaltDirection(ticker, haltedAtMs){
+  const r = await detectHaltDirectionVerbose(ticker, haltedAtMs);
+  return r.dir;
+}
 
-  // Direction for volatility halts: use recent minute-bar price action, NOT
-  // overall day change. A stock can be up huge on the day yet still halt
-  // DOWN on a recent drop into the lower limit band (the FCUV case).
-  let haltLabel = 'Halted';
-  if(HALT_DIRECTIONAL.has(code)){
-    const dir = await detectHaltDirection(ticker, haltedAt);
-    if(dir === 'UP') haltLabel = 'Halted UP';
-    else if(dir === 'DOWN') haltLabel = 'Halted DOWN';
-  }
+// ─── Halt alert system ────────────────────────────────────────────────────
+// Four explicit functions, one per alert type. The dispatcher decides which
+// to call based on detected direction. No conditional spaghetti — each
+// function owns its label, its formatting, and its logging. When something
+// goes wrong, the logs show exactly which path fired and why.
+//
+//   fireHaltAlert(st)          dispatcher — decides direction, picks function
+//     ↓
+//   fireHaltUpAlert(st, snap)        for halts triggered by upper band
+//   fireHaltDownAlert(st, snap)      for halts triggered by lower band
+//   fireHaltGenericAlert(st, snap)   for non-directional halts (T1 news, etc)
+//   fireResumeAlert(st)              resume — independent, uses cached chgPct
 
-  // Compose right-of-pipe content
-  const after = [];
+// Build the right-of-pipe content shared by all halt variants. Pure formatter
+// — no API calls, no posting. Easy to test, easy to reason about.
+function buildHaltLineRight(st, snap){
+  const {reason, resumeTimeOriginal} = st;
+  const parts = [];
   let mainPart = reason;
-  if(s && s.price > 0){
-    const priceStr = `$${s.price.toFixed(2)}`;
-    const volStr = s.vol > 0 ? `${fmtNS(s.vol)} vol` : '';
-    const tail = [priceStr, volStr].filter(Boolean).join(' · ');
+  if(snap && snap.price > 0){
+    const priceStr = `$${snap.price.toFixed(2)}`;
+    const volStr   = snap.vol > 0 ? `${fmtNS(snap.vol)} vol` : '';
+    const tail     = [priceStr, volStr].filter(Boolean).join(' · ');
     mainPart = `${reason} → ${tail}`;
   }
-  after.push(mainPart);
+  parts.push(mainPart);
   if(resumeTimeOriginal){
-    after.push(`Resume ${resumeTimeOriginal.slice(0,5)} ET`);
+    parts.push(`Resume ${resumeTimeOriginal.slice(0,5)} ET`);
   }
+  return parts.join(' · ');
+}
 
-  // Big-mover routing: cache chgPct on the halt state so the matching resume
-  // alert (fired minutes later) mirrors to the same channels without an
-  // extra API call. |chgPct| >= 30% triggers main-chat mirror.
-  const chgPct = (s && typeof s.chgPct === 'number') ? s.chgPct : 0;
+// Common posting routine. Caches chgPct on st so the matching resume mirrors
+// to the same channels. Returns bigMover bool for log context.
+async function postHaltLine(st, snap, label){
+  const {ticker, code, haltTimeOriginal} = st;
+  const timeStr = haltTimeOriginal || getET().timeStr;
+  const right   = buildHaltLineRight(st, snap);
+  const line    = `\`${timeStr}\` \`${ticker}\` \`${label}\` ${flag(ticker)} | ${right}`;
+
+  const chgPct  = (snap && typeof snap.chgPct === 'number') ? snap.chgPct : 0;
   st.chgPctAtHalt = chgPct;
   const bigMover = Math.abs(chgPct) >= BIG_MOVER_HALT_THRESHOLD;
 
-  const line = `\`${timeStr}\` \`${ticker}\` \`${haltLabel}\` ${flag(ticker)} | ${after.join(' · ')}`;
   await postHalt({content: line}, bigMover);
-  console.log(`[Halt] 🛑 ${ticker} ${code} ${haltLabel} @ ${timeStr} chg=${chgPct.toFixed(1)}%${bigMover ? ' (→ main-chat mirror)' : ''}`);
+  console.log(`[Halt] 🛑 ${ticker} ${code} ${label} @ ${timeStr} chg=${chgPct.toFixed(1)}%${bigMover ? ' (→ main-chat mirror)' : ''}`);
+  return bigMover;
 }
 
-// Format resume alert in NuntioBot style (minimal):
-//   `13:44:00` `FCUV` `Resumed` 🇺🇸
-// Timestamp = scheduled resume time from RSS if known, else current time.
-// Routes to the same channels as the matching halt alert (using cached
-// chgPctAtHalt). If the halt fired before chgPct was captured (very old
-// state), defaults to halt-alerts only.
+// === Explicit alert functions — one per type ============================
+
+async function fireHaltUpAlert(st, snap){
+  return postHaltLine(st, snap, 'Halted UP');
+}
+
+async function fireHaltDownAlert(st, snap){
+  return postHaltLine(st, snap, 'Halted DOWN');
+}
+
+async function fireHaltGenericAlert(st, snap){
+  return postHaltLine(st, snap, 'Halted');
+}
+
+// Dispatcher — fetches snapshot once, classifies direction, routes to the
+// right function. Logs the decision path so direction calls are auditable.
+async function fireHaltAlert(st){
+  const {ticker, code, haltedAt} = st;
+  const snap = await snapForHalt(ticker);
+
+  // Non-directional codes (T1 news pending, T2 additional info, etc.) → generic
+  if(!HALT_DIRECTIONAL.has(code)){
+    console.log(`[Halt] ${ticker} code ${code} is non-directional → Halted (generic)`);
+    return fireHaltGenericAlert(st, snap);
+  }
+
+  // Directional codes (LUDP / volatility) → infer UP/DOWN from minute bars
+  const detect = await detectHaltDirectionVerbose(ticker, haltedAt);
+  console.log(`[Halt] ${ticker} direction-detect: dir=${detect.dir || 'AMBIGUOUS'} method=${detect.method} ${detect.detail}`);
+
+  if(detect.dir === 'UP')   return fireHaltUpAlert(st, snap);
+  if(detect.dir === 'DOWN') return fireHaltDownAlert(st, snap);
+  // Ambiguous — better to label "Halted" than to guess wrong
+  return fireHaltGenericAlert(st, snap);
+}
+
+// Resume alert — independent function. Uses chgPct cached at halt time so
+// it routes to the same channels as its matching halt (no extra API call,
+// no risk of routing inconsistency).
 async function fireResumeAlert(st){
   const {ticker, code, resumeTimeOriginal} = st;
   const timeStr = resumeTimeOriginal || getET().timeStr;
   const line = `\`${timeStr}\` \`${ticker}\` \`Resumed\` ${flag(ticker)}`;
   const bigMover = Math.abs(st.chgPctAtHalt || 0) >= BIG_MOVER_HALT_THRESHOLD;
   await postHalt({content: line}, bigMover);
-  console.log(`[Halt] ▶️ ${ticker} resumed (${code}) @ ${timeStr}${bigMover ? ' (→ main-chat mirror)' : ''}`);
+  console.log(`[Halt] ▶️ ${ticker} resumed (${code}) @ ${timeStr} chgAtHalt=${(st.chgPctAtHalt||0).toFixed(1)}%${bigMover ? ' (→ main-chat mirror)' : ''}`);
 }
 
 // ─── Session transition sync ──────────────────────────────────────────────────
