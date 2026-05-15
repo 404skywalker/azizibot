@@ -14,20 +14,17 @@ const APP_ID        = '1493671812247322624';
 // secret would be immediately scrapable. Set these in Railway → Variables:
 //   TOP_GAPPERS_WH   — single URL, for the 6/7AM gapper digest
 //   MAIN_CHAT_WH     — single URL, for NHOD/PR/SEC/bell alerts AND for
-//                      halt/resume mirrors when |chgPct| ≥ 30%
-//   HALT_ALERTS_WH   — comma-separated URLs (every halt/resume goes here)
+//                      halt mirrors when |chgPct| ≥ 30%
+//   HALT_ALERTS_WH   — comma-separated URLs (every halt goes here)
 // If any is missing, the corresponding alert type is suppressed with a
 // startup log message — the bot still runs, just doesn't post that category.
 const TOP_GAPPERS_WH = process.env.TOP_GAPPERS_WH || '';
 const MAIN_CHAT_WH   = process.env.MAIN_CHAT_WH || '';
-// Halt + resume alerts always fan out to every URL in HALT_ALERT_WHS in
-// parallel. Big movers (|chgPct| ≥ 30%) are additionally mirrored to
-// MAIN_CHAT_WH so they hit the primary feed without polluting main-chat
-// with every illiquid halt. Routing decision is made once at fireHaltAlert
-// using snap-fetched chgPct, cached on the halt state so the matching
-// resume alert mirrors to the same channels.
+// Halt alerts fan out to every URL in HALT_ALERT_WHS in parallel. Big
+// movers (|chgPct| ≥ 30%) are additionally mirrored to MAIN_CHAT_WH so they
+// hit the primary feed without polluting main-chat with every illiquid halt.
 const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || '').split(',').map(s=>s.trim()).filter(Boolean);
-const BIG_MOVER_HALT_THRESHOLD = 30; // % — mirror halts/resumes to main-chat when |chgPct| >= this
+const BIG_MOVER_HALT_THRESHOLD = 30; // % — mirror halts to main-chat when |chgPct| >= this
 
 // ─── Session tiers ────────────────────────────────────────────────────────────
 //
@@ -334,7 +331,7 @@ async function post(payload){
   payload.username='AziziBot';
   await postToWebhook(MAIN_CHAT_WH,payload);
 }
-// Halt + resume alerts. ALWAYS go to every webhook in HALT_ALERT_WHS.
+// Halt alerts. ALWAYS go to every webhook in HALT_ALERT_WHS.
 // When alsoMain=true (caller determines via chgPct), ADDITIONALLY mirror to
 // MAIN_CHAT_WH so big-mover halts hit the primary feed.
 //
@@ -1445,21 +1442,16 @@ async function checkFilings(){
   }
 }
 
-// ─── Halt + Resume alerts (NASDAQ RSS) ────────────────────────────────────────
+// ─── Halt alerts (NASDAQ RSS) ─────────────────────────────────────────────────
 // NASDAQ Trader publishes a free, real-time RSS feed of all US equity trade
-// halts. Polled every 5s (own setInterval, decoupled from main loop). Alerts:
-//   - new halts: tracked tickers OR small-caps under $20 (catches new movers)
-//   - resumes: detected two ways — scheduled resume time has passed, OR the
-//     halt entry has DISAPPEARED from the RSS (the feed only lists currently-
-//     halted issues, so disappearance = resumed)
+// halts. Polled every 5s (own setInterval, decoupled from main loop).
 //
-// Critical correctness fixes 2026-05-14:
-//   - Use haltTime from RSS as the displayed timestamp (not detection time)
-//   - Suppress duplicate resume alert if halt is already over at first sight
-//   - First poll after restart only sets a baseline — no alerts fired for
-//     halts that were already in effect before we came online
-// Format matches NuntioBot style: time-with-seconds + direction (UP/DOWN) for
-// volatility halts. Trader-relevant codes only.
+// Only halts are alerted — no separate resume post. The halt alert itself
+// already shows the scheduled resume time inline ("Resume HH:MM ET"), so a
+// follow-up resume alert would be redundant noise.
+//
+// Format matches NuntioBot style: halt-time-with-seconds + direction
+// (UP/DOWN) for volatility halts. Trader-relevant codes only.
 const HALT_ALERT_CODES = new Set(['T1','T2','T5','T12','LUDP','H10','H11']);
 // Short labels for display — long names go in console logs only
 const HALT_REASON_SHORT = {
@@ -1474,13 +1466,10 @@ const HALT_REASON_SHORT = {
 // Codes where direction (UP/DOWN) is meaningful — price hit a limit band
 const HALT_DIRECTIONAL = new Set(['T5','LUDP','LUDS']);
 
-// haltState: composite key → {ticker, code, reason, haltedAt, resumeAt,
+// haltState: composite key → {ticker, code, reason, haltedAt,
 //                              haltTimeOriginal, resumeTimeOriginal,
-//                              alertedHalt, alertedResume}
+//                              alertedHalt, firedHaltAlert, chgPctAtHalt}
 const haltState = new Map();
-// Tickers currently in the RSS feed (rebuilt each poll). Used to detect
-// resumes: keys in PREVIOUS set but not in CURRENT set = resumed.
-let currentlyHalted = new Set();
 let lastHaltPoll = 0;
 // First poll after startup just sets a baseline — don't alert on halts that
 // were already in effect before we came online. Prevents restart noise.
@@ -1527,8 +1516,7 @@ async function pollHalts(){
     });
     if(!xml || xml.length < 200) return;
     const items = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
-    const nowHalted = new Set();
-    let newHalts = 0, resumes = 0, baselined = 0;
+    let newHalts = 0, baselined = 0;
 
     // First pass: parse all items, register new halts, fire halt alerts
     for(const itemXml of items){
@@ -1545,9 +1533,7 @@ async function pollHalts(){
                        || grab(/<ndaq:ResumptionQuoteTime[^>]*>([^<]+)<\/ndaq:ResumptionQuoteTime>/i);
 
       const haltedAt = parseEtToUtcMs(haltDate, haltTime);
-      const resumeAt = parseEtToUtcMs(resumeDate, resumeTime);
       const key = `${ticker}_${haltDate}_${haltTime}`;
-      nowHalted.add(key);
 
       let st = haltState.get(key);
       if(!st){
@@ -1555,42 +1541,25 @@ async function pollHalts(){
           ticker, code,
           reason: HALT_REASON_SHORT[code] || code,
           haltedAt: haltedAt || Date.now(),
-          resumeAt,
           haltTimeOriginal: haltTime,      // ← actual halt time string for display
-          resumeTimeOriginal: resumeTime,
+          resumeTimeOriginal: resumeTime,  // ← shown inline in halt alert ("Resume HH:MM ET")
           alertedHalt: false,    // have we evaluated this halt yet?
           firedHaltAlert: false, // did we actually post a halt alert?
-          alertedResume: false,  // have we evaluated/fired the resume?
         };
         haltState.set(key, st);
 
-        // First-poll-after-restart baseline: mark the halt as evaluated (don't
-        // fire stale halt alerts).
-        //
-        // For resumes: only leave alertedResume=false if the halt is STILL
-        // LIVE (resume time unknown OR resume time still in the future). For
-        // halts that already resumed earlier today, suppress the resume alert
-        // — otherwise every deploy triggers a flood of historical resumes for
-        // every halt that resolved on the day. The "live halt during restart"
-        // case (TDIC class) still works because those have future resumeAt.
+        // First-poll-after-restart baseline: mark the halt as evaluated so we
+        // don't fire stale halt alerts for halts that occurred before the bot
+        // started (or before the last restart).
         if(firstHaltPoll){
           st.alertedHalt = true;
-          // st.firedHaltAlert stays false → resume will re-check qualification
-          // Only suppress resume if resumeAt is sensibly AFTER haltedAt (the
-          // halt actually played out). Opening halts at 09:30 sometimes have
-          // a bogus resumeAt that's the same minute or earlier than haltedAt
-          // — those are still LIVE halts and need the resume alert to fire
-          // when the ticker disappears from RSS.
-          if(st.resumeAt > 0 && Date.now() >= st.resumeAt && st.resumeAt > st.haltedAt + 30_000){
-            st.alertedResume = true; // already over — don't fire ghost resume
-          }
-          // else: live halt — leave alertedResume=false so the resume fires
           baselined++;
           continue;
         }
-      } else if(resumeAt > 0 && !st.resumeAt){
-        // Resume time was just announced — store but don't re-alert on halt
-        st.resumeAt = resumeAt;
+      } else if(resumeTime && !st.resumeTimeOriginal){
+        // Resume time was just announced (was missing in earlier poll) —
+        // update so future halt-alert displays would show the updated info.
+        // We don't re-fire the halt alert though.
         st.resumeTimeOriginal = resumeTime;
       }
 
@@ -1607,86 +1576,14 @@ async function pollHalts(){
           st.firedHaltAlert = true;
           newHalts++;
         }
-
-        // CRITICAL: if the halt is ALREADY over at first detection (we were
-        // late), suppress the resume alert entirely. Require resumeAt be at
-        // least 30s after haltedAt — otherwise this is a bogus opening-halt
-        // resume timestamp (09:30:00 reported as resume for a halt at
-        // 09:30:37) and the halt is actually still live.
-        if(st.resumeAt > 0 && Date.now() >= st.resumeAt && st.resumeAt > st.haltedAt + 30_000){
-          st.alertedResume = true;
-        }
-      }
-
-      // Resume alert path 1: scheduled resume time passed.
-      // Fires if EITHER (a) we previously posted the halt alert (consistency)
-      // OR (b) the ticker currently qualifies (catches restart-baselined cases
-      // like TDIC where we missed the halt but the ticker is a huge mover).
-      // Require resumeAt > haltedAt+30s so bogus opening-halt timestamps
-      // don't trigger an immediate ghost resume.
-      if(!st.alertedResume && st.resumeAt > 0 && Date.now() >= st.resumeAt && st.resumeAt > st.haltedAt + 30_000){
-        const should = st.firedHaltAlert || await shouldAlertHalt(st.ticker);
-        if(should){
-          await fireResumeAlert(st);
-          resumes++;
-        }
-        st.alertedResume = true;
       }
     }
 
-    // Second pass: items in PREVIOUS poll but NOT in this one = disappeared
-    // from RSS = resumed. Catches resumes when the RSS never published a
-    // resume time. Skip on first poll (no prior set to compare against).
-    // Same fire-criteria as path 1: posted halt alert OR currently qualifies.
-    //
-    // ROBUSTNESS: NASDAQ's RSS has a known flakiness where freshly-added
-    // halts can briefly disappear and reappear in subsequent polls. Without
-    // protection, this fires a ghost resume seconds after the halt alert
-    // (the PIII case). Two gates prevent this:
-    //   1. Minimum age 60s. LULD halts have a 5-min minimum duration —
-    //      anything "resuming" in under 60s is flaky RSS, not a real resume.
-    //   2. 2 consecutive missed polls. A single-poll absence (5s) is much
-    //      more likely a publishing hiccup than a real resume; require the
-    //      halt to be absent for 2+ poll cycles before treating as resumed.
-    if(!firstHaltPoll){
-      for(const key of currentlyHalted){
-        const st = haltState.get(key);
-        if(!st) continue;
-        if(nowHalted.has(key)){
-          // Still in RSS this poll — reset miss counter
-          if(st.consecMisses) st.consecMisses = 0;
-          continue;
-        }
-        // Disappeared from RSS this poll
-        if(st.alertedResume) continue;
-
-        const ageMs = Date.now() - st.haltedAt;
-        if(ageMs < 60_000){
-          console.log(`[Halt] ${st.ticker} disappeared at age ${(ageMs/1000).toFixed(0)}s — too fresh, ignoring (flaky RSS)`);
-          nowHalted.add(key); // keep tracking so we'll see it next poll
-          continue;
-        }
-        st.consecMisses = (st.consecMisses || 0) + 1;
-        if(st.consecMisses < 2){
-          console.log(`[Halt] ${st.ticker} 1st miss at age ${(ageMs/1000).toFixed(0)}s — waiting for 2nd consecutive miss`);
-          nowHalted.add(key);
-          continue;
-        }
-        // Confirmed: 2+ consecutive misses, age > 60s = real resume
-        const should = st.firedHaltAlert || await shouldAlertHalt(st.ticker);
-        if(should){
-          await fireResumeAlert(st);
-          resumes++;
-        }
-        st.alertedResume = true;
-      }
-    }
-    currentlyHalted = nowHalted;
     if(firstHaltPoll){
       console.log(`[Halts] startup baseline: ${baselined} pre-existing halt(s) skipped`);
       firstHaltPoll = false;
-    } else if(newHalts || resumes) {
-      console.log(`[Halts] ${newHalts} halt(s), ${resumes} resume(s)`);
+    } else if(newHalts) {
+      console.log(`[Halts] ${newHalts} halt(s)`);
     }
     // Prune state older than 24h
     const cutoff = Date.now() - 24*60*60*1000;
@@ -1873,7 +1770,10 @@ async function detectHaltDirection(ticker, haltedAtMs){
 //   fireHaltUpAlert(st, snap)        for halts triggered by upper band
 //   fireHaltDownAlert(st, snap)      for halts triggered by lower band
 //   fireHaltGenericAlert(st, snap)   for non-directional halts (T1 news, etc)
-//   fireResumeAlert(st)              resume — independent, uses cached chgPct
+//
+// No resume alerts — the halt alert displays the scheduled resume time
+// inline ("Resume HH:MM ET"), which is the same info a separate post would
+// carry.
 
 // Build the right-of-pipe content shared by all halt variants. Pure formatter
 // — no API calls, no posting. Easy to test, easy to reason about.
@@ -1945,18 +1845,6 @@ async function fireHaltAlert(st){
   if(detect.dir === 'DOWN') return fireHaltDownAlert(st, snap);
   // Ambiguous — better to label "Halted" than to guess wrong
   return fireHaltGenericAlert(st, snap);
-}
-
-// Resume alert — independent function. Uses chgPct cached at halt time so
-// it routes to the same channels as its matching halt (no extra API call,
-// no risk of routing inconsistency).
-async function fireResumeAlert(st){
-  const {ticker, code, resumeTimeOriginal} = st;
-  const timeStr = resumeTimeOriginal || getET().timeStr;
-  const line = `\`${timeStr}\` \`${ticker}\` \`Resumed\` ${flag(ticker)}`;
-  const bigMover = Math.abs(st.chgPctAtHalt || 0) >= BIG_MOVER_HALT_THRESHOLD;
-  await postHalt({content: line}, bigMover);
-  console.log(`[Halt] ▶️ ${ticker} resumed (${code}) @ ${timeStr} chgAtHalt=${(st.chgPctAtHalt||0).toFixed(1)}%${bigMover ? ' (→ main-chat mirror)' : ''}`);
 }
 
 // ─── Session transition sync ──────────────────────────────────────────────────
