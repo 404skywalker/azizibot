@@ -1315,20 +1315,41 @@ function connectBZ(){
 }
 
 let lastNewsPoll=0;
+// First-poll baseline: on bot restart, register all currently-visible news
+// items in state.sentNews/state.sentPR WITHOUT firing alerts. Otherwise every
+// deploy re-fires PR alerts for the last 15 min of news. Same pattern as
+// firstHaltPoll.
+let firstNewsPoll=true;
 async function pollNews(){
   if(!isActive()) return;
   if(Date.now()-lastNewsPoll<5000) return;
   lastNewsPoll=Date.now();
   try{
     const r=await polyGet('/v2/reference/news?limit=50&order=desc&sort=published_utc');
-    const items=(r&&r.results)||[],cutoff=Date.now()-15*60*1000;
-    let matched=0;
+    const items=(r&&r.results||[]),cutoff=Date.now()-15*60*1000;
+    let matched=0, baselined=0;
     for(const n of items){
       if(!n.published_utc||new Date(n.published_utc).getTime()<cutoff) continue;
+      // On first poll after restart: mark every visible news as already-seen
+      // so we don't re-fire alerts for news that fired before the restart.
+      if(firstNewsPoll){
+        const id=(n.article_url||n.title||'').slice(0,100);
+        state.sentNews.add(id);
+        for(const t of (n.tickers||[]).map(x=>(x||'').toUpperCase())){
+          if(t) state.sentPR.add(`pr_${id}_${t}`);
+        }
+        baselined++;
+        continue;
+      }
       await handleNewsItem(n.title||'',(n.tickers||[]).filter(Boolean).map(t=>t.toUpperCase()),n.article_url||'',n.published_utc);
       matched++;
     }
-    if(matched>0) console.log(`[Poly News] ${matched} items processed`);
+    if(firstNewsPoll){
+      console.log(`[Poly News] startup baseline: ${baselined} pre-existing news item(s) skipped`);
+      firstNewsPoll=false;
+    } else if(matched>0){
+      console.log(`[Poly News] ${matched} items processed`);
+    }
   }catch(e){console.error('[Poly News] error:',e.message);}
 }
 
@@ -2102,6 +2123,7 @@ async function main(){
   console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/PR/SEC alerts SUPPRESSED'}`);
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt/resume alerts SUPPRESSED'}`);
+  console.log(`[Pollers]  news: 5s · halts: 5s · main loop: 20s`);
 
   // Check Discord session_start_limit before connecting
   try{
@@ -2147,9 +2169,16 @@ async function main(){
     await refreshGappers();
     const newT=[...new Set([...topGappers.map(g=>g.ticker),...dayWatchlist.keys(),...permanentWatch])].filter(t=>!subscribedTickers.has(t));
     if(newT.length) subscribeNewTickers(newT);
-    await pollNews();
     await syncHighsAtTransition(); // capture 4PM close prices within 20s
   },20*1000);
+
+  // News polling runs on its OWN 5s interval, decoupled from the main loop.
+  // Polygon's news endpoint is a small JSON; 5s polling gives near-real-time
+  // PR/news detection. Without this it was throttled to the 20s main-loop
+  // cadence, missing the 5s spec.
+  setInterval(async()=>{
+    try { await pollNews(); } catch(e){ console.error('[News] loop error:', e.message); }
+  }, 5*1000);
 
   // Halt polling runs on its OWN 5s interval, decoupled from the main loop.
   // NASDAQ RSS is a small XML document; 5s polling is conservative and gives
