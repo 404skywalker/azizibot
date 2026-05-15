@@ -1099,12 +1099,17 @@ async function fireNHOD(ticker,price){
   }
   if(tier.minVol>0){
     if(tier.name==='PRE'){
-      // Pre-market: Polygon day.v is always 0 before open — don't penalize live scanner tickers
-      // Only apply vol gate to watchlist-only tickers (they bypassed the scanner)
-      // Watchlist tickers: block if NO volume at all (yesterday's ghosts)
-      // Allow if they have ANY pre-market activity (peakVol or gapper.volume > 0)
-      if(isWatchOnly && checkVol===0){
-        console.log(`[NHOD] ${ticker} skip: PRE no volume (watch)`);return;
+      // Pre-market vol gate. Symmetric with MKT: fail if vol below floor
+      // UNLESS RVol bypass kicks in (3x relative volume with at least 10K
+      // absolute volume — lower abs floor than MKT's 100K because pre-market
+      // volumes are naturally lighter). The previous code waved through
+      // every pre-market ticker because the original author thought day.v
+      // was always 0 in pre-market — but our WS av accumulation + pre-warm
+      // session volume gives us real numbers, so we can enforce properly.
+      const liveRvolForGate = gapper.rvol || 0;
+      const rvolBypass = liveRvolForGate >= 3 && checkVol >= 10_000;
+      if(checkVol < tier.minVol && !rvolBypass){
+        console.log(`[NHOD] ${ticker} skip: PRE vol ${fmtN(checkVol)}<${fmtN(tier.minVol)} (rvol=${liveRvolForGate.toFixed(1)}x)`);return;
       }
     } else if(tier.name==='AH'){
       // AH: fresh names need 500K; day gainers with big peakVol bypass
@@ -1945,22 +1950,27 @@ function connectPriceWS(){
 }
 
 // Fetch today's 1-min aggregates (which include extended hours) and return
-// the highest price seen so far today. Critical for accurate NHOD detection
-// in pre-market/AH: snapshot.day.h only reflects the regular session
-// (9:30-4:00 ET) and is 0 during pre-market. Without this, the bot would
-// false-NHOD on any tick above the current minute's high.
-async function getSessionHigh(ticker){
+// the session HIGH and cumulative VOLUME. Critical for accurate NHOD
+// detection AND volume gating in pre-market/AH: snapshot.day.h and day.v
+// only reflect the regular session (9:30-4:00 ET) and are 0 during pre-
+// market for many tickers. Without this, the bot would false-NHOD on any
+// tick above the current minute's high AND wave through illiquid tickers
+// at the volume gate (the INBS case).
+async function getSessionData(ticker){
   const today = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York',
     year: 'numeric', month: '2-digit', day: '2-digit'
   }).format(new Date());
   try {
     const r = await polyGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}?adjusted=true&sort=desc&limit=500`);
-    if(!r || !r.results || !r.results.length) return 0;
-    let max = 0;
-    for(const b of r.results){ if((b.h||0) > max) max = b.h; }
-    return max;
-  } catch(e){ return 0; }
+    if(!r || !r.results || !r.results.length) return {high: 0, volume: 0};
+    let high = 0, volume = 0;
+    for(const b of r.results){
+      if((b.h||0) > high) high = b.h;
+      volume += (b.v||0);
+    }
+    return {high, volume};
+  } catch(e){ return {high: 0, volume: 0}; }
 }
 
 function subscribeNewTickers(tickers){
@@ -1978,18 +1988,18 @@ function subscribeNewTickers(tickers){
   for(const t of tickers){
     Promise.all([
       polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${t}`),
-      getSessionHigh(t), // true session high incl. pre-market/AH
-    ]).then(([snap, sessionHigh]) => {
+      getSessionData(t), // session high + volume incl. pre-market/AH
+    ]).then(([snap, sess]) => {
       const td = snap && snap.ticker;
       const dayH = (td && td.day && td.day.h) || 0;
       const dayV = (td && td.day && td.day.v) || 0;
       const s = state.tickers.get(t) || {high:0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]};
-      // Use the MAX of all available high signals — session high covers
-      // extended hours, day.h covers regular hours, existing s.high covers
-      // anything the scanner/WS already tracked.
-      const trueHigh = Math.max(s.high||0, dayH, sessionHigh);
+      // Use the MAX of all available signals. sessionHigh/sessionVol cover
+      // pre-market and AH where snapshot.day.h/day.v are 0 or unreliable.
+      const trueHigh = Math.max(s.high||0, dayH, sess.high||0);
+      const trueVol  = Math.max(s.peakVol||0, dayV, sess.volume||0);
       if(trueHigh > (s.high||0)) s.high = trueHigh;
-      if(dayV > (s.peakVol||0)) s.peakVol = dayV;
+      if(trueVol > (s.peakVol||0)) s.peakVol = trueVol;
       s.preWarmed = true; // mark ready for NHOD evaluation
       state.tickers.set(t, s);
     }).catch(()=>{
