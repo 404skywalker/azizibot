@@ -1167,10 +1167,33 @@ async function fireNHOD(ticker,price){
   // activity (94% gainers, 5x+ relative volume); ordinary +10–20% movers
   // on near-average volume don't qualify and stay on the longer cooldown.
   const isHot = (gapper.chgPct >= 50) || (gapper.rvol >= 5);
-  const cooldownMs = isHot ? 90*1000 : 5*60*1000;
+  // Progressive cooldown — first alert fires fast to catch the initial move,
+  // but each subsequent alert on the same ticker needs a longer gap so a
+  // grinder like HUBC/SKK pumping new highs every 2-3 minutes doesn't spam
+  // the channel. Caps at ~3-4 alerts per ticker per session naturally.
+  //
+  //   Alert #   Hot (chg≥50% OR rvol≥5x)   Normal
+  //   ────────  ──────────────────────────  ──────
+  //   1st  →    90 s                        5 min
+  //   2nd  →    3 min                       10 min
+  //   3rd  →    5 min                       15 min
+  //   4th+ →    8 min                       20 min
+  const currentCount = s.nhod || 0;
+  let cooldownMs, cdLabel;
+  if(isHot){
+    if(currentCount === 0)      { cooldownMs = 90*1000;     cdLabel = '90s';  }
+    else if(currentCount === 1) { cooldownMs = 3*60*1000;   cdLabel = '3min'; }
+    else if(currentCount === 2) { cooldownMs = 5*60*1000;   cdLabel = '5min'; }
+    else                        { cooldownMs = 8*60*1000;   cdLabel = '8min'; }
+  } else {
+    if(currentCount === 0)      { cooldownMs = 5*60*1000;   cdLabel = '5min';  }
+    else if(currentCount === 1) { cooldownMs = 10*60*1000;  cdLabel = '10min'; }
+    else if(currentCount === 2) { cooldownMs = 15*60*1000;  cdLabel = '15min'; }
+    else                        { cooldownMs = 20*60*1000;  cdLabel = '20min'; }
+  }
   if(s.lastAlertTime>0&&Date.now()-s.lastAlertTime<cooldownMs){
     const ageSec = Math.round((Date.now()-s.lastAlertTime)/1000);
-    console.log(`[NHOD] ${ticker} skip: ${isHot?'90s':'5min'} cooldown (last alert ${ageSec}s ago, hot=${isHot} chg=${gapper.chgPct.toFixed(0)}% rvol=${gapper.rvol.toFixed(1)}x)`);return;
+    console.log(`[NHOD] ${ticker} skip: ${cdLabel} cooldown (alert #${currentCount+1}, last ${ageSec}s ago, hot=${isHot} chg=${gapper.chgPct.toFixed(0)}% rvol=${gapper.rvol.toFixed(1)}x)`);return;
   }
 
   const nhod=(s.nhod||0)+1;
