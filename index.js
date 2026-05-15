@@ -1502,9 +1502,21 @@ function parseEtToUtcMs(dateStr, timeStr){
   } catch(e){ return 0; }
 }
 
+// Concurrency guard. setInterval(pollHalts, 5000) can spawn a second poll
+// before the first one finishes if the first is slow (RSS fetch + N halt
+// snapshots + N direction-detect aggregate fetches all serial). When that
+// happens, both invocations see the same haltState entries with
+// alertedHalt=false and both call fireHaltAlert → duplicate posts with
+// potentially different direction labels (the PIII duplicate case).
+let pollHaltsInProgress = false;
 async function pollHalts(){
-  // Internal throttle: 5s minimum between fetches (matches setInterval cadence)
+  if(pollHaltsInProgress){
+    console.log('[Halts] skipping tick — previous poll still in flight');
+    return;
+  }
+  // Internal throttle: 5s minimum between fetches (defense in depth)
   if(Date.now() - lastHaltPoll < 5_000) return;
+  pollHaltsInProgress = true;
   lastHaltPoll = Date.now();
   try {
     const xml = await rawGet('https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts', {
@@ -1583,13 +1595,18 @@ async function pollHalts(){
       }
 
       if(!st.alertedHalt){
+        // CRITICAL: mark as evaluated FIRST, before any await. If a second
+        // pollHalts invocation slips past the concurrency guard for any
+        // reason, it sees alertedHalt=true and skips — preventing the
+        // duplicate-alert race where two parallel runs both fire for the
+        // same halt entry with potentially different direction-detect results.
+        st.alertedHalt = true;
         const should = await shouldAlertHalt(ticker);
         if(should){
           await fireHaltAlert(st);
           st.firedHaltAlert = true;
           newHalts++;
         }
-        st.alertedHalt = true; // mark even if we didn't alert (avoids re-eval)
 
         // CRITICAL: if the halt is ALREADY over at first detection (we were
         // late), suppress the resume alert entirely. Require resumeAt be at
@@ -1678,6 +1695,8 @@ async function pollHalts(){
     }
   } catch(e){
     console.error('[Halts] error:', e.message);
+  } finally {
+    pollHaltsInProgress = false;
   }
 }
 
