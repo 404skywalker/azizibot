@@ -1729,11 +1729,19 @@ async function detectHaltDirection(ticker, haltedAtMs){
   // bars before. The "triggering move" that caused the LULD halt is best
   // captured by the OPEN→CLOSE of the bar containing the halt — the bar's
   // close IS the halt price, and the bar's open is the price 60s earlier.
-  // For opening halts (~09:30) where the bar contains "opening cross →
-  // halt price", this captures gap-down halts that a 3-min lookback misses
-  // (because pre-market was trending the other direction).
   const fromMs = haltedAtMs - 5 * 60 * 1000;
   const toMs = haltedAtMs;
+
+  // Opening halt = halt in the first 5 min of regular session. Only opening
+  // halts get the prev-close gap fallback — for mid-day halts, daily
+  // direction != halt direction (a stock can be down 30% on the day and
+  // still halt UP on a local bounce).
+  const haltET = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(new Date(haltedAtMs));
+  const [hh, mm] = haltET.split(':').map(Number);
+  const isOpeningHalt = hh === 9 && mm >= 30 && mm <= 35;
+
   try {
     const url = `/v2/aggs/ticker/${ticker}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=10`;
     const r = await polyGet(url);
@@ -1742,31 +1750,52 @@ async function detectHaltDirection(ticker, haltedAtMs){
     if(bars.length > 0){
       const lastBar = bars[bars.length - 1];
 
-      // Primary: in-bar move (opening cross → halt price for opening halts)
+      // Primary: in-bar O→C move. ANY move during the halt-triggering minute
+      // is informative — using 0.3% threshold (was 1%) catches halts where
+      // the trigger happens in the last seconds and O is close to C.
       if(lastBar.o > 0 && lastBar.c > 0){
         const inBarMove = (lastBar.c - lastBar.o) / lastBar.o * 100;
-        if(Math.abs(inBarMove) >= 1) return inBarMove > 0 ? 'UP' : 'DOWN';
+        if(Math.abs(inBarMove) >= 0.3) return inBarMove > 0 ? 'UP' : 'DOWN';
       }
-      // Secondary: prev-bar-close → halt-bar-close (1-min momentum)
+
+      // Secondary: high-low position of close within the bar. For halts UP,
+      // the close (= halt price = last print before halt) is essentially AT
+      // the bar's high. For halts DOWN, the close is at the bar's low. This
+      // catches the case where O→C is small but the bar still shows a clear
+      // spike-and-halt pattern (the PIII case: O=$9.05 H=$9.11 L=$9.04
+      // C=$9.11 — only +0.66% O→C but close-equals-high makes UP obvious).
+      if(lastBar.h > 0 && lastBar.l > 0 && lastBar.c > 0 && lastBar.h !== lastBar.l){
+        const range = lastBar.h - lastBar.l;
+        const closeFromHigh = (lastBar.h - lastBar.c) / range; // 0 = at high, 1 = at low
+        const closeFromLow  = (lastBar.c - lastBar.l) / range;
+        if(closeFromHigh < 0.1 && closeFromLow > 0.5) return 'UP';
+        if(closeFromLow  < 0.1 && closeFromHigh > 0.5) return 'DOWN';
+      }
+
+      // Tertiary: prev-bar close → halt-bar close (1-min momentum)
       if(bars.length >= 2){
         const prevBar = bars[bars.length - 2];
         if(prevBar.c > 0 && lastBar.c > 0){
           const move = (lastBar.c - prevBar.c) / prevBar.c * 100;
-          if(Math.abs(move) >= 1) return move > 0 ? 'UP' : 'DOWN';
+          if(Math.abs(move) >= 0.5) return move > 0 ? 'UP' : 'DOWN';
         }
       }
     }
 
-    // Tertiary: gap from prev day close. For opening halts where the bar
-    // containing the halt has only one print (or no useful O→C signal),
-    // the gap from prev close to halt price captures the direction.
-    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-    const prevC = snap && snap.ticker && snap.ticker.prevDay && snap.ticker.prevDay.c;
-    const haltP = (bars.length > 0 ? bars[bars.length-1].c : 0) ||
-                  (snap && snap.ticker && snap.ticker.lastTrade && snap.ticker.lastTrade.p);
-    if(prevC && haltP){
-      const gapMove = (haltP - prevC) / prevC * 100;
-      if(Math.abs(gapMove) >= 2) return gapMove > 0 ? 'UP' : 'DOWN';
+    // Quaternary: gap from prev day close. ONLY for opening halts — for
+    // mid-day halts, the prev-close gap reflects daily direction which is
+    // NOT the same as halt direction (a stock down 30% on the day can still
+    // halt UP on a local bounce). Without this guard, mid-day halts get
+    // misclassified by their daily trend.
+    if(isOpeningHalt){
+      const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+      const prevC = snap && snap.ticker && snap.ticker.prevDay && snap.ticker.prevDay.c;
+      const haltP = (bars.length > 0 ? bars[bars.length-1].c : 0) ||
+                    (snap && snap.ticker && snap.ticker.lastTrade && snap.ticker.lastTrade.p);
+      if(prevC && haltP){
+        const gapMove = (haltP - prevC) / prevC * 100;
+        if(Math.abs(gapMove) >= 2) return gapMove > 0 ? 'UP' : 'DOWN';
+      }
     }
 
     return null;
