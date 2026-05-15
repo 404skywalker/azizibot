@@ -13,16 +13,21 @@ const APP_ID        = '1493671812247322624';
 // in source. Source is pushed to a public GitHub repo, so any hardcoded
 // secret would be immediately scrapable. Set these in Railway → Variables:
 //   TOP_GAPPERS_WH   — single URL, for the 6/7AM gapper digest
-//   MAIN_CHAT_WH     — single URL, for NHOD/PR/SEC alerts
-//   HALT_ALERTS_WH   — comma-separated URLs (one per channel to broadcast to)
+//   MAIN_CHAT_WH     — single URL, for NHOD/PR/SEC/bell alerts AND for
+//                      halt/resume mirrors when |chgPct| ≥ 30%
+//   HALT_ALERTS_WH   — comma-separated URLs (every halt/resume goes here)
 // If any is missing, the corresponding alert type is suppressed with a
 // startup log message — the bot still runs, just doesn't post that category.
 const TOP_GAPPERS_WH = process.env.TOP_GAPPERS_WH || '';
 const MAIN_CHAT_WH   = process.env.MAIN_CHAT_WH || '';
-// Halt + resume alerts fan out to every URL in HALT_ALERT_WHS in parallel.
-// Pass a comma-separated list in HALT_ALERTS_WH to broadcast to multiple
-// channels (e.g. dedicated #halt-alerts plus the main chat).
+// Halt + resume alerts always fan out to every URL in HALT_ALERT_WHS in
+// parallel. Big movers (|chgPct| ≥ 30%) are additionally mirrored to
+// MAIN_CHAT_WH so they hit the primary feed without polluting main-chat
+// with every illiquid halt. Routing decision is made once at fireHaltAlert
+// using snap-fetched chgPct, cached on the halt state so the matching
+// resume alert mirrors to the same channels.
 const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || '').split(',').map(s=>s.trim()).filter(Boolean);
+const BIG_MOVER_HALT_THRESHOLD = 30; // % — mirror halts/resumes to main-chat when |chgPct| >= this
 
 // ─── Session tiers ────────────────────────────────────────────────────────────
 //
@@ -329,15 +334,26 @@ async function post(payload){
   payload.username='AziziBot';
   await postToWebhook(MAIN_CHAT_WH,payload);
 }
-// Halt + resume alerts broadcast to every webhook in HALT_ALERT_WHS in
-// parallel. If the list is empty, alerts are suppressed (logged only).
-async function postHalt(payload){
-  if(!HALT_ALERT_WHS.length){
+// Halt + resume alerts. ALWAYS go to every webhook in HALT_ALERT_WHS.
+// When alsoMain=true (caller determines via chgPct), ADDITIONALLY mirror to
+// MAIN_CHAT_WH so big-mover halts hit the primary feed.
+async function postHalt(payload, alsoMain = false){
+  const tasks = [];
+  if(HALT_ALERT_WHS.length){
+    payload.username='AziziBot';
+    for(const wh of HALT_ALERT_WHS){
+      tasks.push(postToWebhook(wh, payload));
+    }
+  }
+  if(alsoMain && MAIN_CHAT_WH){
+    payload.username='AziziBot';
+    tasks.push(postToWebhook(MAIN_CHAT_WH, payload));
+  }
+  if(!tasks.length){
     console.log('[Halt] suppressed (no webhooks configured)');
     return;
   }
-  payload.username='AziziBot';
-  await Promise.all(HALT_ALERT_WHS.map(wh => postToWebhook(wh, payload)));
+  await Promise.all(tasks);
 }
 function discordRest(method,path,body=null){
   return new Promise((resolve,reject)=>{
@@ -1794,20 +1810,31 @@ async function fireHaltAlert(st){
     after.push(`Resume ${resumeTimeOriginal.slice(0,5)} ET`);
   }
 
+  // Big-mover routing: cache chgPct on the halt state so the matching resume
+  // alert (fired minutes later) mirrors to the same channels without an
+  // extra API call. |chgPct| >= 30% triggers main-chat mirror.
+  const chgPct = (s && typeof s.chgPct === 'number') ? s.chgPct : 0;
+  st.chgPctAtHalt = chgPct;
+  const bigMover = Math.abs(chgPct) >= BIG_MOVER_HALT_THRESHOLD;
+
   const line = `\`${timeStr}\` \`${ticker}\` \`${haltLabel}\` ${flag(ticker)} | ${after.join(' · ')}`;
-  await postHalt({content: line});
-  console.log(`[Halt] 🛑 ${ticker} ${code} ${haltLabel} @ ${timeStr}`);
+  await postHalt({content: line}, bigMover);
+  console.log(`[Halt] 🛑 ${ticker} ${code} ${haltLabel} @ ${timeStr} chg=${chgPct.toFixed(1)}%${bigMover ? ' (→ main-chat mirror)' : ''}`);
 }
 
 // Format resume alert in NuntioBot style (minimal):
 //   `13:44:00` `FCUV` `Resumed` 🇺🇸
 // Timestamp = scheduled resume time from RSS if known, else current time.
+// Routes to the same channels as the matching halt alert (using cached
+// chgPctAtHalt). If the halt fired before chgPct was captured (very old
+// state), defaults to halt-alerts only.
 async function fireResumeAlert(st){
   const {ticker, code, resumeTimeOriginal} = st;
   const timeStr = resumeTimeOriginal || getET().timeStr;
   const line = `\`${timeStr}\` \`${ticker}\` \`Resumed\` ${flag(ticker)}`;
-  await postHalt({content: line});
-  console.log(`[Halt] ▶️ ${ticker} resumed (${code}) @ ${timeStr}`);
+  const bigMover = Math.abs(st.chgPctAtHalt || 0) >= BIG_MOVER_HALT_THRESHOLD;
+  await postHalt({content: line}, bigMover);
+  console.log(`[Halt] ▶️ ${ticker} resumed (${code}) @ ${timeStr}${bigMover ? ' (→ main-chat mirror)' : ''}`);
 }
 
 // ─── Session transition sync ──────────────────────────────────────────────────
