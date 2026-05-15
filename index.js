@@ -1842,7 +1842,7 @@ async function postHaltLine(st, snap, label){
   const {ticker, code, haltTimeOriginal} = st;
   const timeStr = haltTimeOriginal || getET().timeStr;
   const right   = buildHaltLineRight(st, snap);
-  const line    = `\`${timeStr}\` \`${ticker}\` \`${label}\` ${flag(ticker)} | ${right}`;
+  const line    = `\`${timeStr}\` **${ticker}** \`${label}\` ${flag(ticker)} | ${right}`;
 
   const chgPct  = (snap && typeof snap.chgPct === 'number') ? snap.chgPct : 0;
   st.chgPctAtHalt = chgPct;
