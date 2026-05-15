@@ -1222,10 +1222,11 @@ async function fireNHOD(ticker,price){
 const DROP_RE =/offering|public offering|convertible|shelf|ATM offering|at-the-market|direct offering|registered direct|dilut|warrant|prospectus|424B|S-1|S-3|secondary offering|note offering|senior notes|debenture|equity financ|private placement|underwritten|priced offering|prices offering/i;
 const SPIKE_RE=/collaboration|agreement|partnership|FDA|approval|cleared|grant|award|contract|trial|data|results|positive|breakthrough|milestone|license|acqui|merger|acquisition|joint venture|\bJV\b|phase|cohort|study|efficacy|safety|quarterly|financial results|earnings|revenue|guidance|raises|secures|closes|signs|launches|wins|receives|completes|announces/i;
 
-// Qualifier specifically for news/PR alerts. Looser than shouldAlertHalt
-// because news itself is a strong filter (Polygon only carries newsworthy
-// items in the first place). Catches RKDA-class earnings movers that would
-// fail the halt-volume gate (1M shares) but are still trader-relevant.
+// Qualifier for news/PR alerts. PHILOSOPHY: the news IS the catalyst — we
+// alert BEFORE the price moves, not after. So no movement or dollar-volume
+// gate; just confirm the ticker is a tradeable equity that's not totally
+// dormant. Different from shouldAlertHalt (halts need movement context;
+// news doesn't).
 const newsQualCache = new Map(); // ticker → {result, ts} — 1-min cache
 async function isQualifyingForNews(ticker){
   // Tracked tickers always qualify — no API call needed
@@ -1236,8 +1237,6 @@ async function isQualifyingForNews(ticker){
     return true;
   }
   if(isBadTicker(ticker) || isEtf(ticker)) return false;
-  // Brief cache to avoid hammering snapshot endpoint when many news items
-  // mention the same ticker in quick succession
   const cached = newsQualCache.get(ticker);
   if(cached && Date.now() - cached.ts < 60_000) return cached.result;
   let result = false;
@@ -1247,14 +1246,20 @@ async function isQualifyingForNews(ticker){
     if(td){
       const isOTC = /OTC|GREY|PINK|EXPERT/i.test(td.primaryExchange || '');
       if(!isOTC){
-        const price   = (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || 0;
-        const dayVol  = (td.day && td.day.v) || 0;
-        const chgPct  = (typeof td.todaysChangePerc === 'number') ? td.todaysChangePerc : 0;
-        const dollarVol = dayVol * price;
-        // Wider price band, lower volume bar than halt qualifier
-        result = price >= 0.20 && price <= 100 &&
-                 Math.abs(chgPct) >= 3 &&
-                 dollarVol >= 500_000;
+        const price = (td.lastTrade && td.lastTrade.p) ||
+                      (td.day && td.day.c) ||
+                      (td.prevDay && td.prevDay.c) || 0;
+        const dayVol = (td.day && td.day.v) || 0;
+        const prevDayVol = (td.prevDay && td.prevDay.v) || 0;
+        // Price band keeps focus on small/mid-cap (where news matters most)
+        // and skips large-cap routine news (AAPL, NVDA, META). Lower floor
+        // of $0.01 catches reverse-split/going-concern news on penny stocks
+        // (EZGO class) that have real significance.
+        // "Alive" signal: any meaningful intraday volume OR meaningful
+        // volume yesterday. Catches early pre-market news for stocks with
+        // not-yet-built-up volume today (ELAB / QUCY class at 6-7 AM).
+        result = price >= 0.01 && price <= 100 &&
+                 (dayVol >= 10_000 || prevDayVol >= 100_000);
       }
     }
   } catch(e){}
@@ -1330,16 +1335,24 @@ async function pollNews(){
     let matched=0, baselined=0;
     for(const n of items){
       if(!n.published_utc||new Date(n.published_utc).getTime()<cutoff) continue;
-      // On first poll after restart: mark every visible news as already-seen
-      // so we don't re-fire alerts for news that fired before the restart.
+      // On first poll after restart: items older than 3 min were almost
+      // certainly fired before the restart — baseline them to avoid duplicates.
+      // Items NEWER than 3 min fire normally even on first poll; we'd rather
+      // risk a rare duplicate than miss a fresh PR drop during a deploy
+      // window. Same philosophy as halt's firstPoll baseline but with a
+      // fresh-news escape hatch.
       if(firstNewsPoll){
-        const id=(n.article_url||n.title||'').slice(0,100);
-        state.sentNews.add(id);
-        for(const t of (n.tickers||[]).map(x=>(x||'').toUpperCase())){
-          if(t) state.sentPR.add(`pr_${id}_${t}`);
+        const age = Date.now() - new Date(n.published_utc).getTime();
+        if(age > 3*60*1000){
+          const id=(n.article_url||n.title||'').slice(0,100);
+          state.sentNews.add(id);
+          for(const t of (n.tickers||[]).map(x=>(x||'').toUpperCase())){
+            if(t) state.sentPR.add(`pr_${id}_${t}`);
+          }
+          baselined++;
+          continue;
         }
-        baselined++;
-        continue;
+        // < 3 min old → fall through and fire normally
       }
       await handleNewsItem(n.title||'',(n.tickers||[]).filter(Boolean).map(t=>t.toUpperCase()),n.article_url||'',n.published_utc);
       matched++;
@@ -1892,18 +1905,25 @@ function connectPriceWS(){
           if(liveG&&(liveG.price>10||liveG.chgPct<5)) continue;
           const s=state.tickers.get(ticker);
           if(!s) continue;
-          // Pull volume + daily high from A (per-minute aggregate) events.
-          // av = accumulated daily volume. This is critical for watchlist-only
-          // tickers that didn't pass the scanner this cycle — without it,
-          // s.peakVol stays at the scanner value (often 0) and the vol gate
-          // misfires. h = current minute high; used to bootstrap s.high when
-          // state was just created and never seen a price yet.
+          // Pull volume + minute high from A (per-minute aggregate) events.
+          // av = accumulated daily volume.
+          // h  = current minute high. We accumulate the SESSION high here:
+          // any minute whose high exceeds s.high updates s.high. Previously
+          // we only did this when s.high===0 (bootstrap), which meant the
+          // bot only ever knew the FIRST minute's high — every subsequent
+          // tick above that one minute looked like a "new high of day"
+          // even when the actual session high was reached hours earlier.
           if(msg.ev==='A'){
             const av=+msg.av||0;
             if(av>(s.peakVol||0)) s.peakVol=av;
             const dh=+msg.h||0;
-            if((!s.high||s.high===0)&&dh>0) s.high=dh;
+            if(dh > 0 && dh > (s.high||0)) s.high = dh;
           }
+          // Skip NHOD evaluation until the pre-warm has bootstrapped s.high
+          // with the true session high. Without this, a WS trade arriving in
+          // the ~200ms window between subscription and pre-warm completion
+          // would fire NHOD against an uninitialized s.high.
+          if(!s.preWarmed) continue;
           if(!s.priceHistory) s.priceHistory=[];
           s.priceHistory.push({price,time:Date.now()});
           if(s.priceHistory.length>60) s.priceHistory.shift();
@@ -1924,6 +1944,25 @@ function connectPriceWS(){
   ws.on('close',code=>{console.log(`[PriceWS] closed (${code}), reconnecting...`);setTimeout(connectPriceWS,5000);});
 }
 
+// Fetch today's 1-min aggregates (which include extended hours) and return
+// the highest price seen so far today. Critical for accurate NHOD detection
+// in pre-market/AH: snapshot.day.h only reflects the regular session
+// (9:30-4:00 ET) and is 0 during pre-market. Without this, the bot would
+// false-NHOD on any tick above the current minute's high.
+async function getSessionHigh(ticker){
+  const today = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(new Date());
+  try {
+    const r = await polyGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}?adjusted=true&sort=desc&limit=500`);
+    if(!r || !r.results || !r.results.length) return 0;
+    let max = 0;
+    for(const b of r.results){ if((b.h||0) > max) max = b.h; }
+    return max;
+  } catch(e){ return 0; }
+}
+
 function subscribeNewTickers(tickers){
   if(!ws||ws.readyState!==WebSocket.OPEN||!tickers.length) return;
   ws.send(JSON.stringify({action:'subscribe',params:tickers.map(t=>`T.${t},A.${t}`).join(',')}));
@@ -1937,16 +1976,28 @@ function subscribeNewTickers(tickers){
   // populated from day.h/day.v within ~200ms of subscribe, before any
   // meaningful tick volume arrives.
   for(const t of tickers){
-    polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${t}`).then(snap => {
+    Promise.all([
+      polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${t}`),
+      getSessionHigh(t), // true session high incl. pre-market/AH
+    ]).then(([snap, sessionHigh]) => {
       const td = snap && snap.ticker;
-      if(!td) return;
-      const dayH = (td.day && td.day.h) || 0;
-      const dayV = (td.day && td.day.v) || 0;
+      const dayH = (td && td.day && td.day.h) || 0;
+      const dayV = (td && td.day && td.day.v) || 0;
       const s = state.tickers.get(t) || {high:0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]};
-      if(dayH > (s.high||0)) s.high = dayH;
+      // Use the MAX of all available high signals — session high covers
+      // extended hours, day.h covers regular hours, existing s.high covers
+      // anything the scanner/WS already tracked.
+      const trueHigh = Math.max(s.high||0, dayH, sessionHigh);
+      if(trueHigh > (s.high||0)) s.high = trueHigh;
       if(dayV > (s.peakVol||0)) s.peakVol = dayV;
+      s.preWarmed = true; // mark ready for NHOD evaluation
       state.tickers.set(t, s);
-    }).catch(()=>{ /* non-critical pre-warm; main snapshot fetch on fireNHOD will recover */ });
+    }).catch(()=>{
+      // Pre-warm failed (rare) — still mark as preWarmed so we don't block
+      // NHOD forever. fireNHOD's own snapshot fetch will recover.
+      const s = state.tickers.get(t);
+      if(s){ s.preWarmed = true; state.tickers.set(t, s); }
+    });
   }
 }
 
