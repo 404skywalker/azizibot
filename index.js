@@ -1707,6 +1707,24 @@ async function pollHalts(){
                        || grab(/<ndaq:ResumptionQuoteTime[^>]*>([^<]+)<\/ndaq:ResumptionQuoteTime>/i);
 
       const haltedAt = parseEtToUtcMs(haltDate, haltTime);
+
+      // ──────────────────────────────────────────────────────────────────
+      // STALE HALT SKIP — root cause fix for the weekend re-fire bug.
+      //
+      // NASDAQ keeps halts visible in its RSS feed for hours/days after
+      // they occurred (especially over weekends when markets are closed).
+      // If a halt is older than STALE_HALT_THRESHOLD_MS we treat it as
+      // stale: do not create state, do not fire, do not track it.
+      //
+      // Without this skip, the haltState pruning at end of pollHalts
+      // would delete the entry every poll (because it's >24h old),
+      // and the next poll would re-create it and re-fire — infinite
+      // loop, every 5s, for as long as the halt stayed in the RSS feed.
+      // That was the actual cause of the duplicate-alert spam.
+      // ──────────────────────────────────────────────────────────────────
+      const STALE_HALT_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+      if(haltedAt > 0 && haltedAt < Date.now() - STALE_HALT_THRESHOLD_MS) continue;
+
       const key = `${ticker}_${haltDate}_${haltTime}`;
 
       let st = haltState.get(key);
@@ -1779,13 +1797,18 @@ async function pollHalts(){
     } else if(newHalts) {
       console.log(`[Halts] ${newHalts} halt(s)`);
     }
-    // Prune state older than 24h
+    // Prune haltState older than 24h to keep memory bounded. Note: we do
+    // NOT prune haltFireCount here. The fire counter is a "lifetime never
+    // fire again" record — if we deleted it and the same halt reappeared
+    // in NASDAQ's RSS feed (which happens regularly over weekends), the
+    // bot would re-create state and re-fire. The stale-halt skip above
+    // catches most of these cases, but keeping the fire counter is
+    // defense-in-depth regardless.
     const cutoff = Date.now() - 24*60*60*1000;
     let pruned = 0;
     for(const [k, st] of haltState){
       if((st.haltedAt || 0) < cutoff){
         haltState.delete(k);
-        haltFireCount.delete(k);
         pruned++;
       }
     }
