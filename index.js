@@ -1579,6 +1579,76 @@ let lastHaltPoll = 0;
 // were already in effect before we came online. Prevents restart noise.
 let firstHaltPoll = true;
 
+// ─── Defensive duplicate-alert prevention ─────────────────────────────────
+// Three independent layers to guarantee a halt cannot spam:
+//
+//   1. Per-key fire counter — refuse to fire the same halt key more than
+//      MAX_FIRES_PER_KEY times in this process lifetime. Hard ceiling.
+//
+//   2. Disk-persisted state — haltState and fire counts saved to a JSON
+//      file after every fire decision. Bot restarts no longer lose
+//      dedup state, so a stale halt in the RSS feed can't be re-fired
+//      just because the process bounced.
+//
+//   3. Global rate limiter — refuse to send more than
+//      MAX_ALERTS_PER_MINUTE halt alerts in any 60-second window,
+//      regardless of how many distinct halts. Stops spam even from a
+//      bug we haven't found yet.
+//
+// All three log a clear [BLOCKED] line when they trigger, so logs make
+// it obvious which guard fired and why.
+
+const HALT_STATE_FILE     = './halt-state.json';
+const MAX_FIRES_PER_KEY   = 1;
+const MAX_ALERTS_PER_MIN  = 5;
+const haltFireCount       = new Map();   // key → number of times fired
+const recentAlertTimes    = [];          // rolling timestamps for rate limit
+
+// Load persisted state on startup. If we have prior state we DON'T need
+// to baseline — the saved fire counts already protect us from re-firing.
+try {
+  if(fs.existsSync(HALT_STATE_FILE)){
+    const raw = fs.readFileSync(HALT_STATE_FILE, 'utf-8');
+    const saved = JSON.parse(raw);
+    for(const [k, v] of Object.entries(saved.haltState || {})) haltState.set(k, v);
+    for(const [k, v] of Object.entries(saved.haltFireCount || {})) haltFireCount.set(k, v);
+    if(haltState.size > 0 || haltFireCount.size > 0){
+      firstHaltPoll = false;
+      console.log(`[Halts] restored state from disk: ${haltState.size} halt(s), ${haltFireCount.size} fire record(s)`);
+    }
+  }
+} catch(e){
+  console.error('[Halts] failed to load persisted state:', e.message);
+}
+
+function saveHaltState(){
+  try {
+    const data = {
+      haltState: Object.fromEntries(haltState),
+      haltFireCount: Object.fromEntries(haltFireCount),
+      savedAt: Date.now(),
+    };
+    fs.writeFileSync(HALT_STATE_FILE, JSON.stringify(data));
+  } catch(e){
+    console.error('[Halts] failed to save state:', e.message);
+  }
+}
+
+// Returns true if we're allowed to send another alert right now.
+// Side effect: records this alert's timestamp on success.
+function checkHaltRateLimit(){
+  const now = Date.now();
+  while(recentAlertTimes.length > 0 && recentAlertTimes[0] < now - 60_000){
+    recentAlertTimes.shift();
+  }
+  if(recentAlertTimes.length >= MAX_ALERTS_PER_MIN){
+    console.error(`[Halts] [BLOCKED] rate limit: ${recentAlertTimes.length} alerts in last 60s, max=${MAX_ALERTS_PER_MIN}`);
+    return false;
+  }
+  recentAlertTimes.push(now);
+  return true;
+}
+
 // Parse "MM/DD/YYYY" + "HH:MM:SS" (NASDAQ publishes everything in ET) into
 // UTC ms for comparison with Date.now(). DST handled approximately — sub-day
 // drift is irrelevant for halt-recency math.
@@ -1674,11 +1744,30 @@ async function pollHalts(){
         // duplicate-alert race where two parallel runs both fire for the
         // same halt entry with potentially different direction-detect results.
         st.alertedHalt = true;
+
+        // Defensive guard #1: per-key fire counter. Even if alertedHalt
+        // somehow gets reset (state map cleared, key collision, anything),
+        // refuse to fire the same key more than MAX_FIRES_PER_KEY times.
+        const fireCount = haltFireCount.get(key) || 0;
+        if(fireCount >= MAX_FIRES_PER_KEY){
+          console.error(`[Halts] [BLOCKED] ${ticker} key=${key} already fired ${fireCount}x in lifetime`);
+          saveHaltState();
+          continue;
+        }
+
         const should = await shouldAlertHalt(ticker);
         if(should){
+          // Defensive guard #2: global rate limiter
+          if(!checkHaltRateLimit()){
+            saveHaltState();
+            continue;
+          }
+
           await fireHaltAlert(st);
           st.firedHaltAlert = true;
+          haltFireCount.set(key, fireCount + 1);
           newHalts++;
+          saveHaltState();
         }
       }
     }
@@ -1686,14 +1775,21 @@ async function pollHalts(){
     if(firstHaltPoll){
       console.log(`[Halts] startup baseline: ${baselined} pre-existing halt(s) skipped`);
       firstHaltPoll = false;
+      saveHaltState();
     } else if(newHalts) {
       console.log(`[Halts] ${newHalts} halt(s)`);
     }
     // Prune state older than 24h
     const cutoff = Date.now() - 24*60*60*1000;
+    let pruned = 0;
     for(const [k, st] of haltState){
-      if((st.haltedAt || 0) < cutoff) haltState.delete(k);
+      if((st.haltedAt || 0) < cutoff){
+        haltState.delete(k);
+        haltFireCount.delete(k);
+        pruned++;
+      }
     }
+    if(pruned > 0) saveHaltState();
   } catch(e){
     console.error('[Halts] error:', e.message);
   } finally {
