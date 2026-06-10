@@ -1916,10 +1916,11 @@ async function snapForHalt(ticker){
 async function detectHaltDirectionVerbose(ticker, haltedAtMs){
   if(!haltedAtMs) return {dir: null, method: 'no-halt-time', detail: ''};
 
-  const fromMs = haltedAtMs - 5 * 60 * 1000;
-  const toMs   = haltedAtMs;
+  // Pull a slightly wider window so we have multiple complete bars even if
+  // the halt-minute bar itself is partial/missing at poll time.
+  const fromMs = haltedAtMs - 6 * 60 * 1000;
+  const toMs   = haltedAtMs + 60 * 1000; // include the halt minute if present
 
-  // Opening halt check (for quaternary gating)
   const haltET = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false
   }).format(new Date(haltedAtMs));
@@ -1927,62 +1928,87 @@ async function detectHaltDirectionVerbose(ticker, haltedAtMs){
   const isOpeningHalt = hh === 9 && mm >= 30 && mm <= 35;
 
   try {
-    const url = `/v2/aggs/ticker/${ticker}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=10`;
+    const url = `/v2/aggs/ticker/${ticker}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=15`;
     const r = await polyGet(url);
     const bars = (r && r.results) || [];
 
-    if(bars.length > 0){
-      const lb = bars[bars.length - 1];
-      const barStr = `O=$${(lb.o||0).toFixed(3)} H=$${(lb.h||0).toFixed(3)} L=$${(lb.l||0).toFixed(3)} C=$${(lb.c||0).toFixed(3)}`;
-
-      // Primary: in-bar O→C
-      if(lb.o > 0 && lb.c > 0){
-        const m = (lb.c - lb.o) / lb.o * 100;
-        if(Math.abs(m) >= 0.3){
-          return {dir: m > 0 ? 'UP' : 'DOWN', method: 'primary/in-bar-oc', detail: `${barStr} O→C ${m.toFixed(2)}%`};
-        }
-      }
-
-      // Secondary: H/L position of close
-      if(lb.h > 0 && lb.l > 0 && lb.c > 0 && lb.h !== lb.l){
-        const range = lb.h - lb.l;
-        const cFromH = (lb.h - lb.c) / range; // 0 = at high, 1 = at low
-        const cFromL = (lb.c - lb.l) / range;
-        if(cFromH < 0.1 && cFromL > 0.5){
-          return {dir: 'UP', method: 'secondary/close-at-high', detail: `${barStr} cFromH=${cFromH.toFixed(2)} cFromL=${cFromL.toFixed(2)}`};
-        }
-        if(cFromL < 0.1 && cFromH > 0.5){
-          return {dir: 'DOWN', method: 'secondary/close-at-low', detail: `${barStr} cFromH=${cFromH.toFixed(2)} cFromL=${cFromL.toFixed(2)}`};
-        }
-      }
-
-      // Tertiary: prev-bar close → halt-bar close
-      if(bars.length >= 2){
-        const pb = bars[bars.length - 2];
-        if(pb.c > 0 && lb.c > 0){
-          const m = (lb.c - pb.c) / pb.c * 100;
-          if(Math.abs(m) >= 0.5){
-            return {dir: m > 0 ? 'UP' : 'DOWN', method: 'tertiary/1min-momentum', detail: `prev.c=$${pb.c.toFixed(3)} curr.c=$${lb.c.toFixed(3)} move ${m.toFixed(2)}%`};
-          }
-        }
-      }
-    }
-
-    // Quaternary: prev-close gap (opening halts only)
-    if(isOpeningHalt){
+    // Also grab the snapshot's day change as an independent corroborator.
+    let dayChg = null, lastPrice = 0, prevC = 0;
+    try {
       const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-      const prevC = snap && snap.ticker && snap.ticker.prevDay && snap.ticker.prevDay.c;
-      const haltP = (bars.length > 0 ? bars[bars.length-1].c : 0) ||
-                    (snap && snap.ticker && snap.ticker.lastTrade && snap.ticker.lastTrade.p);
-      if(prevC && haltP){
-        const g = (haltP - prevC) / prevC * 100;
-        if(Math.abs(g) >= 2){
-          return {dir: g > 0 ? 'UP' : 'DOWN', method: 'quaternary/opening-gap', detail: `prevC=$${prevC.toFixed(3)} haltP=$${haltP.toFixed(3)} gap ${g.toFixed(2)}%`};
-        }
+      const td = snap && snap.ticker;
+      if(td){
+        dayChg   = (typeof td.todaysChangePerc === 'number') ? td.todaysChangePerc : null;
+        lastPrice= (td.lastTrade && td.lastTrade.p) || (td.day && td.day.c) || 0;
+        prevC    = (td.prevDay && td.prevDay.c) || 0;
       }
+    } catch(e){}
+
+    if(bars.length === 0){
+      // No bar data at all. Last resort: opening-gap for opening halts only.
+      if(isOpeningHalt && prevC && lastPrice){
+        const g = (lastPrice - prevC) / prevC * 100;
+        if(Math.abs(g) >= 2)
+          return {dir: g > 0 ? 'UP' : 'DOWN', method: 'opening-gap-only', detail: `prevC=$${prevC.toFixed(3)} last=$${lastPrice.toFixed(3)} gap ${g.toFixed(2)}%`};
+      }
+      return {dir: null, method: 'no-bars', detail: 'no minute bars in window'};
     }
 
-    return {dir: null, method: 'ambiguous', detail: `${bars.length} bar(s), no layer hit threshold`};
+    // ── Collect independent directional signals; require agreement. ──
+    // Each signal votes UP (+1) / DOWN (-1) / abstain (0). We only emit a
+    // confident dir when the net vote is clear AND no strong signal opposes
+    // it. A single partial bar can no longer flip the label on its own.
+    const firstBar = bars[0];
+    const lastBar  = bars[bars.length - 1];
+    const votes = [];
+
+    // Signal A: window trajectory (first open → last close). Robust to a
+    // single partial bar because it spans the whole approach to the halt.
+    if(firstBar.o > 0 && lastBar.c > 0){
+      const m = (lastBar.c - firstBar.o) / firstBar.o * 100;
+      if(Math.abs(m) >= 0.5) votes.push({sig:'trajectory', v: m > 0 ? 1 : -1, n:`win O→C ${m.toFixed(2)}%`});
+    }
+
+    // Signal B: where did the extreme print happen? An LULD-UP halt prints a
+    // fresh HIGH at the end; an LULD-DOWN halt prints a fresh LOW at the end.
+    // Compare the window's max-high bar index vs max-low bar index — whichever
+    // extreme is more recent indicates the halt direction.
+    let hiIdx = 0, loIdx = 0, hiV = -Infinity, loV = Infinity;
+    bars.forEach((b, i) => {
+      if((b.h||0) > hiV){ hiV = b.h; hiIdx = i; }
+      if((b.l||Infinity) < loV){ loV = b.l; loIdx = i; }
+    });
+    if(hiIdx !== loIdx) votes.push({sig:'extreme-timing', v: hiIdx > loIdx ? 1 : -1, n:`hiIdx=${hiIdx} loIdx=${loIdx}`});
+
+    // Signal C: day change sign (independent of bar data entirely). Weaker —
+    // a stock can halt down while green on the day — so only counts when it
+    // agrees; never used as a sole decider for mid-day halts.
+    if(dayChg !== null && Math.abs(dayChg) >= 1)
+      votes.push({sig:'day-chg', v: dayChg > 0 ? 1 : -1, n:`dayChg ${dayChg.toFixed(1)}%`, weak:true});
+
+    // Signal D: opening-gap, opening halts only.
+    if(isOpeningHalt && prevC && lastBar.c > 0){
+      const g = (lastBar.c - prevC) / prevC * 100;
+      if(Math.abs(g) >= 2) votes.push({sig:'opening-gap', v: g > 0 ? 1 : -1, n:`gap ${g.toFixed(2)}%`});
+    }
+
+    const detail = votes.map(v=>`${v.sig}:${v.v>0?'UP':'DOWN'}(${v.n})`).join(' | ') || 'no votes';
+
+    if(votes.length === 0)
+      return {dir: null, method: 'no-signal', detail};
+
+    const net = votes.reduce((s,v)=>s+v.v, 0);
+    const strongVotes = votes.filter(v=>!v.weak);
+    const hasUp   = strongVotes.some(v=>v.v > 0);
+    const hasDown = strongVotes.some(v=>v.v < 0);
+
+    // Conflict between two STRONG signals → don't guess, post generic "Halted".
+    if(hasUp && hasDown)
+      return {dir: null, method: 'conflict', detail};
+
+    if(net > 0) return {dir: 'UP',   method: 'vote', detail};
+    if(net < 0) return {dir: 'DOWN', method: 'vote', detail};
+    return {dir: null, method: 'tie', detail};
   } catch(e){
     console.error(`[Halt] direction detect failed for ${ticker}: ${e.message}`);
     return {dir: null, method: 'error', detail: e.message};
