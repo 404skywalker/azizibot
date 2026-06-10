@@ -1055,11 +1055,23 @@ async function refreshGappers(){
       // Existing ticker: keep max of current price and WS-tracked high
       const initHigh = ex.high>0 ? Math.max(g.price,ex.high) : Math.max(g.price,g.dayHigh||0);
       const peakVol = Math.max(g.volume||0, ex.peakVol||0);
+      const wasNew = !state.tickers.has(g.ticker) || !ex.preWarmed;
       state.tickers.set(g.ticker,{...ex,...g,high:initHigh,peakVol});
+      // Pre-warm any gapper that hasn't been seeded with its true session
+      // high yet. day.h/g.dayHigh miss the pre-market high, so without this
+      // a watchlist/gapper ticker can false-NHOD on a mid-range tick.
+      if(wasNew){
+        const s=state.tickers.get(g.ticker);
+        if(s && !s.preWarmPending){ s.preWarmPending=true; prewarmTicker(g.ticker); }
+      }
     }
     for(const [ticker,g] of dayWatchlist){
-      if(!state.tickers.has(ticker))
-        state.tickers.set(ticker,{high:g.high,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]});
+      if(!state.tickers.has(ticker)){
+        state.tickers.set(ticker,{high:g.high||0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[],preWarmPending:true});
+        // Watchlist tickers are NOT pre-warmed elsewhere — seed them here so
+        // their NHOD baseline is the true session high, not a stale scan value.
+        prewarmTicker(ticker);
+      }
     }
     // Ensure permanentWatch tickers always have a state entry
     for(const ticker of permanentWatch){
@@ -1084,6 +1096,7 @@ async function fireNHOD(ticker,price){
 
   const s=state.tickers.get(ticker);
   if(!s)                  {console.log(`[NHOD] ${ticker} skip: no state`);return;}
+  if(!s.preWarmed)        {console.log(`[NHOD] ${ticker} skip: not pre-warmed (no true session high yet)`);return;}
   if(price<=s.high+0.001) {console.log(`[NHOD] ${ticker} skip: $${price.toFixed(4)} not above high $${s.high.toFixed(4)}`);return;}
 
   const {etMin,timeStr}=getET();
@@ -2288,11 +2301,29 @@ function connectPriceWS(){
             const av=+msg.av||0;
             if(av>(s.peakVol||0)) s.peakVol=av;
             const dh=+msg.h||0;
-            if(dh > 0 && dh > (s.high||0)) s.high = dh;
+            // Only RAISE an already-established session high from a minute
+            // high. A single minute's high must NEVER become the baseline:
+            // doing so loses the true session high (set earlier in the day)
+            // and causes false NHODs when a later, lower minute is mistaken
+            // for the day high. The true baseline comes only from pre-warm
+            // (getSessionData) or day.h — never from one A event.
+            if(dh > 0 && s.preWarmed && dh > (s.high||0)) s.high = dh;
           }
           if(!s.priceHistory) s.priceHistory=[];
           s.priceHistory.push({price,time:Date.now()});
           if(s.priceHistory.length>60) s.priceHistory.shift();
+          // Guard: never evaluate NHOD until the ticker has been pre-warmed
+          // with its true session high/volume. If it hasn't, kick off a
+          // pre-warm now and skip this tick — fireNHOD against an
+          // un-pre-warmed state is the root cause of false pre-market NHODs.
+          if(!s.preWarmed){
+            if(!s.preWarmPending){
+              s.preWarmPending=true;
+              state.tickers.set(ticker,s);
+              prewarmTicker(ticker);
+            }
+            continue;
+          }
           const prevHigh=s.high;
           if(price>prevHigh+0.001){
             const last=wsDebounce.get(ticker)||0;
@@ -2334,41 +2365,47 @@ async function getSessionData(ticker){
   } catch(e){ return {high: 0, volume: 0}; }
 }
 
+// Seed state.high (true session high) and peakVol for a single ticker from
+// snapshot.day + getSessionData (which covers pre-market/AH). Sets preWarmed
+// so NHOD evaluation is unblocked. Idempotent and safe to call repeatedly.
+function prewarmTicker(t){
+  return Promise.all([
+    polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${t}`),
+    getSessionData(t), // session high + volume incl. pre-market/AH
+  ]).then(([snap, sess]) => {
+    const td = snap && snap.ticker;
+    const dayH = (td && td.day && td.day.h) || 0;
+    const dayV = (td && td.day && td.day.v) || 0;
+    const s = state.tickers.get(t) || {high:0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]};
+    // Use the MAX of all available signals. sessionHigh/sessionVol cover
+    // pre-market and AH where snapshot.day.h/day.v are 0 or unreliable.
+    const trueHigh = Math.max(s.high||0, dayH, sess.high||0);
+    const trueVol  = Math.max(s.peakVol||0, dayV, sess.volume||0);
+    if(trueHigh > (s.high||0)) s.high = trueHigh;
+    if(trueVol > (s.peakVol||0)) s.peakVol = trueVol;
+    s.preWarmed = true; // mark ready for NHOD evaluation
+    s.preWarmPending = false;
+    state.tickers.set(t, s);
+  }).catch(()=>{
+    // Pre-warm failed (rare). Leave preWarmed=false so a later tick retries,
+    // but clear the pending flag so the retry can actually fire.
+    const s = state.tickers.get(t);
+    if(s){ s.preWarmPending = false; state.tickers.set(t, s); }
+  });
+}
+
 function subscribeNewTickers(tickers){
   if(!ws||ws.readyState!==WebSocket.OPEN||!tickers.length) return;
   ws.send(JSON.stringify({action:'subscribe',params:tickers.map(t=>`T.${t},A.${t}`).join(',')}));
   tickers.forEach(t=>subscribedTickers.add(t));
   console.log(`[PriceWS] +subscribed: ${tickers.join(', ')}`);
-  // PRE-WARM: fetch snapshot for each newly subscribed ticker so state.high
-  // and state.peakVol are seeded BEFORE the first WS tick arrives. Closes
-  // the race where a fresh subscription's first trade tick triggers fireNHOD
-  // against an uninitialized state (s.high=0) — that path would either fire
-  // a false NHOD or skip due to synthetic data. With pre-warm, state is
-  // populated from day.h/day.v within ~200ms of subscribe, before any
-  // meaningful tick volume arrives.
+  // PRE-WARM: seed state.high and state.peakVol BEFORE the first WS tick so
+  // NHOD evaluates against the true session high (closes the false-NHOD race
+  // where a fresh subscription's first minute high becomes a bogus baseline).
   for(const t of tickers){
-    Promise.all([
-      polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${t}`),
-      getSessionData(t), // session high + volume incl. pre-market/AH
-    ]).then(([snap, sess]) => {
-      const td = snap && snap.ticker;
-      const dayH = (td && td.day && td.day.h) || 0;
-      const dayV = (td && td.day && td.day.v) || 0;
-      const s = state.tickers.get(t) || {high:0,nhod:0,lastAlertPrice:0,lastAlertTime:0,priceHistory:[]};
-      // Use the MAX of all available signals. sessionHigh/sessionVol cover
-      // pre-market and AH where snapshot.day.h/day.v are 0 or unreliable.
-      const trueHigh = Math.max(s.high||0, dayH, sess.high||0);
-      const trueVol  = Math.max(s.peakVol||0, dayV, sess.volume||0);
-      if(trueHigh > (s.high||0)) s.high = trueHigh;
-      if(trueVol > (s.peakVol||0)) s.peakVol = trueVol;
-      s.preWarmed = true; // mark ready for NHOD evaluation
-      state.tickers.set(t, s);
-    }).catch(()=>{
-      // Pre-warm failed (rare) — still mark as preWarmed so we don't block
-      // NHOD forever. fireNHOD's own snapshot fetch will recover.
-      const s = state.tickers.get(t);
-      if(s){ s.preWarmed = true; state.tickers.set(t, s); }
-    });
+    const s = state.tickers.get(t);
+    if(s) s.preWarmPending = true;
+    prewarmTicker(t);
   }
 }
 
