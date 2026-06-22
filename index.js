@@ -2380,7 +2380,14 @@ async function getSessionData(ticker){
     year: 'numeric', month: '2-digit', day: '2-digit'
   }).format(new Date());
   try {
-    const r = await polyGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}?adjusted=true&sort=desc&limit=500`);
+    // CRITICAL: a full session runs 04:00–20:00 ET = 960 one-minute bars.
+    // With limit=500 + sort=desc, late in the day the query would only reach
+    // back ~8 hours, CUTTING OFF the morning bars — so a ticker that set its
+    // true high-of-day at 07:30 would report a too-low high after ~noon, and
+    // any later tick above that truncated high false-fired NHOD. We sort=asc
+    // and request the whole day (limit 1500 > 960) so the morning high is
+    // always included regardless of what time the query runs.
+    const r = await polyGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}?adjusted=true&sort=asc&limit=1500`);
     if(!r || !r.results || !r.results.length) return {high: 0, volume: 0};
     let high = 0, volume = 0;
     for(const b of r.results){
