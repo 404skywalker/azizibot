@@ -1850,7 +1850,7 @@ async function pollHalts(){
           continue;
         }
 
-        const should = await shouldAlertHalt(ticker);
+        const should = await shouldAlertHalt(ticker, code);
         if(should){
           // Defensive guard #2: global rate limiter
           if(!checkHaltRateLimit()){
@@ -1909,7 +1909,16 @@ async function pollHalts(){
 //   - not OTC / ETF / bad ticker pattern
 // Filters out illiquid microcap LUDPs (SRL/TCGL/JMG class) that LUDP'd on a
 // 5K-share spike — those halts/resumes aren't actionable.
-async function shouldAlertHalt(ticker){
+// News-pending halt codes. For these, the NEWS is the catalyst — they fire
+// BEFORE the price has moved, so the movement/liquidity gates that apply to
+// volatility halts would wrongly suppress them (e.g. SRXH reverse-split halt
+// at 6:45 AM with ~0% change and thin volume). We alert these on a basic
+// sanity check only.
+const NEWS_PENDING_CODES = new Set(['T1','T2','T12']);
+
+async function shouldAlertHalt(ticker, code){
+  // Tracked tickers (today's gappers, day watchlist, permanent watch) always
+  // alert on ANY halt code — no gates. If it's on our radar, we want it.
   if(topGappers.some(g => g.ticker === ticker) ||
      dayWatchlist.has(ticker) ||
      permanentWatch.has(ticker)){
@@ -1928,12 +1937,21 @@ async function shouldAlertHalt(ticker){
     const chgPct  = (typeof td.todaysChangePerc === 'number') ? td.todaysChangePerc : 0;
     const dollarVol = dayVol * price;
 
-    // Price range — kept slightly wider than before ($50 ceiling) to catch
-    // mid-cap halts on real catalysts, but with the liquidity guard below.
+    // ── Untracked NEWS-PENDING halts (T1/T2/T12) ──────────────────────────
+    // The news IS the catalyst; these fire before movement. Skip the
+    // mover/liquidity floors — keep only a basic "real, sane equity" check:
+    // not OTC (already checked), reasonable price, and an existent listing.
+    // This is what catches SRXH-type reverse-split / buyout news halts.
+    if(NEWS_PENDING_CODES.has(code)){
+      if(price < 0.10 || price > 100) return false; // sanity band only
+      return true;
+    }
+
+    // ── Untracked VOLATILITY / other halts (T5/LUDP/…) ────────────────────
+    // Keep the strict gates: a halt on a dead ticker that merely tapped a
+    // limit band isn't actionable. Require real movement + liquidity.
     if(price < 0.50 || price > 50) return false;
-    // Real mover today, not just noise that touched a limit band
     if(Math.abs(chgPct) < 5) return false;
-    // Liquidity floor — both share volume AND dollar volume must clear bar
     if(dayVol < 1_000_000) return false;
     if(dollarVol < 2_000_000) return false;
     return true;
