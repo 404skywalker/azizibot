@@ -905,6 +905,7 @@ let topGappers=[];
 const dayWatchlist=new Map();
 const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set(),bellPosted:new Set()};
 const wsDebounce=new Map();
+const lungeDebounce=new Map(); // ticker → last explosive-move alert time (ms)
 const closePrice=new Map(); // ticker → price at 4PM close
 // recentRunners: tickers that qualified as gappers in the last 5 days
 // Used to expand news coverage beyond just today's movers
@@ -1285,7 +1286,70 @@ async function fireNHOD(ticker,price){
   console.log(`[ALERT] posted OK`);
 }
 
-// ─── News / PR alerts ─────────────────────────────────────────────────────────
+// ─── Explosive move ("lunge") alert ───────────────────────────────────────────
+// Catches violent parabolic moves in real time — the kind where a stock runs
+// tens of percent in a couple of minutes on heavy volume (e.g. PLSM 6/24:
+// ~$3.50→$11 in ~7 min). This is distinct from NHOD: NHOD says "tagged a new
+// high"; this says "moving violently RIGHT NOW". Posts to #main-chat.
+//
+// STRICT thresholds — tuned so only genuinely explosive moves fire, not normal
+// momentum. All three must hold:
+//   1. Velocity: price up >= LUNGE_MIN_PCT over the last <= LUNGE_WINDOW_MS,
+//      measured from the lowest price in that window to the current price.
+//   2. Volume surge: the last minute's accumulated volume shows a real burst
+//      (peakVol-derived) — we require a minute-volume floor so thin pops don't
+//      qualify.
+//   3. Price floor: ignore sub-$0.50 tickers where % moves are noise.
+const LUNGE_WINDOW_MS = 3 * 60 * 1000; // look back 3 minutes
+const LUNGE_MIN_PCT   = 25;            // >= 25% move within the window
+const LUNGE_MIN_VEL   = 8;             // AND >= 8%/min average velocity
+const LUNGE_MIN_MINVOL= 300000;        // >= 300K shares in the burst minute
+const LUNGE_COOLDOWN  = 5 * 60 * 1000; // one lunge alert per ticker / 5 min
+const LUNGE_MIN_PRICE = 0.50;
+
+async function fireLunge(ticker, price, minuteVol){
+  if(!isActive()) return;
+  if(price < LUNGE_MIN_PRICE) return;
+
+  const s = state.tickers.get(ticker);
+  if(!s || !s.preWarmed) return; // need real state, not a cold ticker
+
+  // Cooldown
+  const lastLunge = lungeDebounce.get(ticker) || 0;
+  if(Date.now() - lastLunge < LUNGE_COOLDOWN) return;
+
+  // Velocity from price history within the window.
+  const hist = (s.priceHistory || []).filter(h => h.time >= Date.now() - LUNGE_WINDOW_MS);
+  if(hist.length < 3) return; // not enough ticks to judge a move
+
+  const windowLow = Math.min(...hist.map(h => h.price));
+  if(windowLow <= 0) return;
+
+  const movePct = (price - windowLow) / windowLow * 100;
+  if(movePct < LUNGE_MIN_PCT) return;
+
+  // Average velocity over the actual elapsed span (cap denom at window).
+  const spanMs  = Math.max(60 * 1000, Date.now() - hist[0].time);
+  const spanMin = spanMs / 60000;
+  const velPerMin = movePct / spanMin;
+  if(velPerMin < LUNGE_MIN_VEL) return;
+
+  // Volume burst: the triggering minute must carry real size.
+  if((minuteVol || 0) < LUNGE_MIN_MINVOL) return;
+
+  lungeDebounce.set(ticker, Date.now());
+
+  const { timeStr } = getET();
+  const timeShort = timeStr.slice(0,5);
+  const dayV = s.peakVol || 0;
+  const volStr = dayV > 0 ? ` | **Vol:** ${fmtNS(dayV)}` : '';
+  // Distinct `LUNGE` pill so it reads differently from NHOD at a glance.
+  const line = `\`${timeShort}\` 🚀 **${ticker}** ${priceFlag(price)} \`+${movePct.toFixed(0)}%\` · \`LUNGE\` ~ ${flag(ticker)} | **Vel:** ${velPerMin.toFixed(0)}%/min${volStr}`;
+
+  console.log(`[LUNGE] ${ticker} $${price.toFixed(4)} +${movePct.toFixed(0)}% in ${spanMin.toFixed(1)}min (${velPerMin.toFixed(0)}%/min) minVol=${fmtN(minuteVol||0)}`);
+  await post({content:line});
+  console.log(`[LUNGE] posted OK`);
+}
 const DROP_RE =/offering|public offering|convertible|shelf|ATM offering|at-the-market|direct offering|registered direct|dilut|warrant|prospectus|424B|S-1|S-3|secondary offering|note offering|senior notes|debenture|equity financ|private placement|underwritten|priced offering|prices offering/i;
 const SPIKE_RE=/collaboration|agreement|partnership|FDA|approval|cleared|grant|award|contract|trial|data|results|positive|breakthrough|milestone|license|acqui|merger|acquisition|joint venture|\bJV\b|phase|cohort|study|efficacy|safety|quarterly|financial results|earnings|revenue|guidance|raises|secures|closes|signs|launches|wins|receives|completes|announces/i;
 
@@ -2315,7 +2379,12 @@ function connectPriceWS(){
           const watchG=dayWatchlist.get(ticker);
           const permW=permanentWatch.has(ticker);
           if(!liveG&&!watchG&&!permW) continue;
-          if(liveG&&(liveG.price>10||liveG.chgPct<5)) continue;
+          // NHOD strategy is intentionally low-price/small-cap: gate it at
+          // >$10 or <5% change. But an explosive "lunge" can run a ticker
+          // ABOVE $10 (e.g. PLSM $3.50→$11), so we must NOT skip the whole
+          // tick here — we only suppress the NHOD path for gated tickers and
+          // still allow fireLunge to evaluate.
+          const nhodGated = !!(liveG && (liveG.price>10 || liveG.chgPct<5));
           const s=state.tickers.get(ticker);
           if(!s) continue;
           // Pull volume + minute high from A (per-minute aggregate) events.
@@ -2334,6 +2403,9 @@ function connectPriceWS(){
             // for the day high. The true baseline comes only from pre-warm
             // (getSessionData) or day.h — never from one A event.
             if(dh > 0 && s.preWarmed && dh > (s.high||0)) s.high = dh;
+            // Track this minute's volume (msg.v = volume for THIS aggregate
+            // bar) for the explosive-move detector's volume-burst gate.
+            s.lastMinuteVol = +msg.v||0;
           }
           if(!s.priceHistory) s.priceHistory=[];
           s.priceHistory.push({price,time:Date.now()});
@@ -2351,7 +2423,7 @@ function connectPriceWS(){
             continue;
           }
           const prevHigh=s.high;
-          if(price>prevHigh+0.001){
+          if(!nhodGated && price>prevHigh+0.001){
             const last=wsDebounce.get(ticker)||0;
             if(Date.now()-last>10000){
               console.log(`[PriceWS] ${ticker} NEW HIGH $${price.toFixed(4)} (was $${prevHigh.toFixed(4)}) peakVol=${fmtN(s.peakVol||0)}`);
@@ -2359,6 +2431,10 @@ function connectPriceWS(){
               fireNHOD(ticker,price).catch(e=>console.error(`[fireNHOD] ${ticker}:`,e.message));
             }
           }
+          // Explosive-move ("lunge") check — independent of NHOD and of the
+          // >$10 gate above. A violent run can fire here even when it isn't a
+          // fresh high or is priced over $10. Strict thresholds inside.
+          fireLunge(ticker, price, s.lastMinuteVol).catch(e=>console.error(`[fireLunge] ${ticker}:`,e.message));
         }
       }
     }catch(e){console.error('[PriceWS] parse error:',e.message);}
