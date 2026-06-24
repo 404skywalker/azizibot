@@ -1168,6 +1168,15 @@ async function fireNHOD(ticker,price){
       }
     } catch(e){ /* fall through; gates below will reject if data still bad */ }
   }
+  // Sub-$0.50 liquidity floor: penny names under $0.50 must have >300K volume
+  // to alert. These tickers throw the most low-quality NHOD noise (tiny moves
+  // on near-zero volume), so we require real participation before alerting.
+  // checkVol here is the max of scanner volume, peakVol, and the freshened
+  // day volume — the most complete figure available at alert time.
+  if(price < 0.50 && checkVol < 300_000){
+    console.log(`[NHOD] ${ticker} skip: <$0.50 needs >300K vol (have ${fmtN(checkVol)})`);
+    return;
+  }
   if(tier.minVol>0){
     if(tier.name==='PRE'){
       // Pre-market vol gate. Lower floor than MKT because pre-market volumes
