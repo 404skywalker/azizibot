@@ -1098,6 +1098,36 @@ async function fireNHOD(ticker,price){
   const s=state.tickers.get(ticker);
   if(!s)                  {console.log(`[NHOD] ${ticker} skip: no state`);return;}
   if(!s.preWarmed)        {console.log(`[NHOD] ${ticker} skip: not pre-warmed (no true session high yet)`);return;}
+
+  // ALERT-TIME RE-VERIFICATION of the true session high. s.high is maintained
+  // incrementally (pre-warm seed + WS minute highs), but every false-NHOD
+  // we've seen traces to s.high being seeded too low at some boundary
+  // (morning-bar cutoff, pre-market timing, day rollover). Before posting we
+  // re-pull the authoritative session high from aggregates + snapshot.day.h
+  // and reconcile. If the verified high is at/above the alert price, this is
+  // NOT a new high — suppress. This makes NHOD self-correcting regardless of
+  // how s.high was seeded.
+  try {
+    const [sess, snapV] = await Promise.all([
+      getSessionData(ticker),
+      polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`),
+    ]);
+    const tdV   = snapV && snapV.ticker;
+    const dayHV = (tdV && tdV.day && tdV.day.h) || 0;
+    const verifiedHigh = Math.max(s.high||0, sess.high||0, dayHV);
+    if(verifiedHigh > (s.high||0)) s.high = verifiedHigh; // heal the baseline
+    // The triggering price must clear the VERIFIED high, not just the
+    // possibly-stale running one. Small epsilon so equal-to-high isn't "new".
+    if(price <= verifiedHigh + 0.001){
+      console.log(`[NHOD] ${ticker} skip: $${price.toFixed(4)} not above VERIFIED session high $${verifiedHigh.toFixed(4)} (sess=${(sess.high||0).toFixed(4)} dayH=${dayHV.toFixed(4)})`);
+      state.tickers.set(ticker,{...s});
+      return;
+    }
+  } catch(e){
+    // Verification fetch failed — fall back to the incremental guard rather
+    // than posting blind. Better to occasionally miss than to false-fire.
+    if(price<=s.high+0.001){console.log(`[NHOD] ${ticker} skip: verify failed + $${price.toFixed(4)} not above high $${s.high.toFixed(4)}`);return;}
+  }
   if(price<=s.high+0.001) {console.log(`[NHOD] ${ticker} skip: $${price.toFixed(4)} not above high $${s.high.toFixed(4)}`);return;}
 
   const {etMin,timeStr}=getET();
