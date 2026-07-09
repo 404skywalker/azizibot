@@ -1107,6 +1107,7 @@ async function fireNHOD(ticker,price){
   // and reconcile. If the verified high is at/above the alert price, this is
   // NOT a new high — suppress. This makes NHOD self-correcting regardless of
   // how s.high was seeded.
+  let dayOpen=0, dayLow=0, dayHighV=0, dayChgV=null; // for the momentum gate below
   try {
     const [sess, snapV] = await Promise.all([
       getSessionData(ticker),
@@ -1114,6 +1115,11 @@ async function fireNHOD(ticker,price){
     ]);
     const tdV   = snapV && snapV.ticker;
     const dayHV = (tdV && tdV.day && tdV.day.h) || 0;
+    // Stash day range/change for the momentum gate (which runs after freshen).
+    dayOpen  = (tdV && tdV.day && tdV.day.o) || 0;
+    dayLow   = (tdV && tdV.day && tdV.day.l) || 0;
+    dayHighV = Math.max(dayHV, sess.high||0);
+    dayChgV  = (tdV && typeof tdV.todaysChangePerc==='number') ? tdV.todaysChangePerc : null;
     const verifiedHigh = Math.max(s.high||0, sess.high||0, dayHV);
     if(verifiedHigh > (s.high||0)) s.high = verifiedHigh; // heal the baseline
     // The triggering price must clear the VERIFIED high, not just the
@@ -1177,6 +1183,32 @@ async function fireNHOD(ticker,price){
     console.log(`[NHOD] ${ticker} skip: <$0.50 needs >300K vol (have ${fmtN(checkVol)})`);
     return;
   }
+
+  // ── MOMENTUM GATE: must be actually MOVING (up AND with range) ────────────
+  // Kills flat-chopper charts like COOT (opened $0.53, chopped $0.44–0.48 all
+  // day, tagged "NHOD" mid-range at $0.46 — no trend, no move, pure noise).
+  // Two conditions, BOTH required for non-watchlist tickers:
+  //   1. Up on the day: today's change >= MIN_DAY_CHG%. A stock flat or red
+  //      on the day is not making a meaningful new high.
+  //   2. Real intraday range: (high - low) / low >= MIN_RANGE_PCT. A stock
+  //      grinding in a tight band has no range to break out of.
+  // Watchlist/permanentWatch tickers are exempt (you're tracking them on
+  // purpose and want every high). This gate applies to gapper/live tickers.
+  const MIN_DAY_CHG = 15;    // >= 15% up on the day
+  const MIN_RANGE_PCT = 15;  // >= 15% high-to-low intraday range
+  if(!isWatchOnly){
+    const effChg = (dayChgV !== null) ? dayChgV : (gapper.chgPct || 0);
+    const rangePct = (dayLow > 0 && dayHighV > 0) ? (dayHighV - dayLow) / dayLow * 100 : 0;
+    if(effChg < MIN_DAY_CHG){
+      console.log(`[NHOD] ${ticker} skip: not moving — day chg ${effChg.toFixed(1)}% < ${MIN_DAY_CHG}% (flat/red)`);
+      return;
+    }
+    if(rangePct < MIN_RANGE_PCT){
+      console.log(`[NHOD] ${ticker} skip: no range — H/L range ${rangePct.toFixed(1)}% < ${MIN_RANGE_PCT}% (chopper, L=$${dayLow.toFixed(4)} H=$${dayHighV.toFixed(4)})`);
+      return;
+    }
+  }
+
   if(tier.minVol>0){
     if(tier.name==='PRE'){
       // Pre-market vol gate. Lower floor than MKT because pre-market volumes
