@@ -2684,12 +2684,56 @@ let discordSessionId=null, discordResumeUrl=null, discordHbAck=true;
 let discordFailCount=0, discordLastConnect=0;
 const DISCORD_MAX_BACKOFF=5*60*1000; // 5 min max backoff
 
+// ⚠️ RECONNECT STORM FIX (1006 loop). Three stacked bugs caused a self-feeding
+// storm: (1) connectDiscord() called terminate() on the old socket, which FIRES
+// that socket's own 'close' handler, which scheduled ANOTHER connectDiscord();
+// (2) orphaned sockets had no idea they'd been replaced, so every dead socket
+// kept scheduling its own reconnect; (3) no guard against overlapping timers.
+// Net: 1 disconnect -> 2 reconnects -> 4 -> 8, dozens of live sockets inside one
+// second, none alive long enough to deliver a message. Alerts fired into dying
+// sockets and vanished. Fix: stamp every socket with a generation id and let ONLY
+// the current generation reconnect; funnel all reconnects through a single-flight
+// timer so there is never more than one pending.
+let discordGen=0;            // increments on every connect attempt
+let discordReconnectTimer=null;
+
+function scheduleDiscordReconnect(resume, delay, reason){
+  if(discordReconnectTimer){
+    console.log(`[Discord] reconnect already pending — ignoring duplicate (${reason})`);
+    return;
+  }
+  console.log(`[Discord] ${reason} → ${resume?'RESUME':'IDENTIFY'} in ${Math.round(delay/1000)}s`);
+  discordReconnectTimer=setTimeout(()=>{
+    discordReconnectTimer=null;
+    connectDiscord(resume);
+  }, delay);
+}
+
 function connectDiscord(resume=false){
-  if(wsDiscord){try{wsDiscord.terminate();}catch(e){}}
+  // Any pending reconnect is now superseded by this attempt.
+  if(discordReconnectTimer){clearTimeout(discordReconnectTimer);discordReconnectTimer=null;}
+
+  const myGen = ++discordGen;   // this socket's identity
+
+  // Detach the OLD socket's handlers BEFORE terminating it, so its close event
+  // cannot schedule a competing reconnect. This is the core of the storm fix.
+  if(wsDiscord){
+    try{wsDiscord.removeAllListeners();}catch(e){}
+    try{wsDiscord.terminate();}catch(e){}
+  }
+  if(discordHB){clearInterval(discordHB);discordHB=null;}
+
   const url=(resume&&discordResumeUrl)||'wss://gateway.discord.gg/?v=10&encoding=json';
   wsDiscord=new WebSocket(url);
-  wsDiscord.on('open',()=>console.log(`[Discord] Connected${resume?' (resume)':''}`));
+  const sock=wsDiscord;         // capture — wsDiscord may be reassigned later
+  const isCurrent=()=> (myGen===discordGen && wsDiscord===sock);
+
+  wsDiscord.on('open',()=>{
+    if(!isCurrent())return;
+    console.log(`[Discord] Connected${resume?' (resume)':''} [gen ${myGen}]`);
+  });
   wsDiscord.on('message',async data=>{
+    if(!isCurrent())return;   // stale socket — ignore everything it says
     try{
       const msg=JSON.parse(data.toString());
       if(msg.s) discordSeq=msg.s;
@@ -2702,24 +2746,28 @@ function connectDiscord(resume=false){
         let missedAcks = 0;
         if(discordHB) clearInterval(discordHB);
         discordHbAck = true;
-        discordHB = setInterval(()=>{
+        const hb = setInterval(()=>{
+          // If this socket has been superseded, kill our own timer and stop.
+          // (Previously a stale heartbeat could terminate the CURRENT socket.)
+          if(!isCurrent()){clearInterval(hb);return;}
           if(!discordHbAck){
             missedAcks++;
             if(missedAcks>=2){
-              console.log('[Discord] Heartbeat ACK missed twice — reconnecting');
+              console.log(`[Discord] Heartbeat ACK missed twice [gen ${myGen}] — terminating socket`);
               missedAcks=0;
-              clearInterval(discordHB);
-              discordHB=null;
-              try{wsDiscord.terminate();}catch(e){}
+              clearInterval(hb);
+              if(discordHB===hb) discordHB=null;
+              try{sock.terminate();}catch(e){}   // close handler will reconnect
               return;
             }
           } else {
             missedAcks=0;
           }
           discordHbAck=false;
-          if(wsDiscord&&wsDiscord.readyState===WebSocket.OPEN)
-            wsDiscord.send(JSON.stringify({op:1,d:discordSeq}));
+          if(sock.readyState===WebSocket.OPEN)
+            sock.send(JSON.stringify({op:1,d:discordSeq}));
         }, hbInterval);
+        discordHB = hb;
 
         if(resume&&discordSessionId&&discordSeq){
           // Resume existing session
@@ -2730,8 +2778,8 @@ function connectDiscord(resume=false){
         }
       }
       if(msg.op===11) discordHbAck=true; // Heartbeat ACK
-      if(msg.op===7)  { console.log('[Discord] Reconnect requested'); setTimeout(()=>connectDiscord(true),1000); }
-      if(msg.op===9)  { console.log('[Discord] Invalid session'); discordSessionId=null; setTimeout(()=>connectDiscord(false),5000); }
+      if(msg.op===7)  { scheduleDiscordReconnect(true, 1000, 'op7 reconnect requested'); }
+      if(msg.op===9)  { discordSessionId=null; discordSeq=null; scheduleDiscordReconnect(false, 5000, 'op9 invalid session'); }
       if(msg.op===0){
         if(msg.t==='READY'){
           discordSessionId=msg.d.session_id;
@@ -2746,31 +2794,41 @@ function connectDiscord(resume=false){
       }
     }catch(e){}
   });
-  wsDiscord.on('error',err=>console.error('[Discord] error:',err.message));
-  wsDiscord.on('close',code=>{
-    if(discordHB){clearInterval(discordHB);discordHB=null;}
-    console.log(`[Discord] closed (${code})`);
-    if(code===4004){console.error('[Discord] Bad token — update DISCORD_TOKEN in Railway');setTimeout(()=>connectDiscord(false),30000);return;}
-    // Try to resume on abnormal close, fresh connect otherwise
-    // 1000/1001 = clean close → fresh IDENTIFY with backoff
-    // 1006/4000 = abnormal close → RESUME (does NOT burn session limit)
-    // 4004/4014 = auth error → long delay, no resume
-    const canResume = !!(discordSessionId && discordSeq &&
-                      code !== 1000 && code !== 1001 &&
-                      code !== 4004 && code !== 4014);
+  wsDiscord.on('error',err=>{
+    if(!isCurrent())return;                    // stale socket — stay silent
+    console.error('[Discord] error:',err.message);
+  });
 
-    if(code===4004){
+  wsDiscord.on('close',code=>{
+    // A stale socket (already replaced) must NOT schedule a reconnect. This single
+    // guard is what stops the 1006 storm — previously every orphan bred a new one.
+    if(!isCurrent()){
+      console.log(`[Discord] stale socket closed (${code}) [gen ${myGen}] — ignored`);
+      return;
+    }
+    if(discordHB){clearInterval(discordHB);discordHB=null;}
+
+    // 4004 = bad token. Long pause; no resume. (Handled ONCE — the old code had
+    // this block duplicated, so it scheduled two reconnects on every 4004.)
+    if(code===4004||code===4014){
       console.error('[Discord] Bad token — update DISCORD_TOKEN in Railway. Pausing 5min.');
-      setTimeout(()=>connectDiscord(false), 5*60*1000);
+      discordSessionId=null; discordSeq=null;
+      scheduleDiscordReconnect(false, 5*60*1000, `closed (${code}) BAD TOKEN`);
       return;
     }
 
-    // Exponential backoff: 5s, 10s, 20s, 40s... max 5min
-    // RESUME does not count against session_start_limit so backoff only for fresh connects
+    // 1000/1001 = clean close  → fresh IDENTIFY with backoff
+    // 1006/4000 = abnormal     → RESUME (does not burn session_start_limit)
+    const canResume = !!(discordSessionId && discordSeq && code!==1000 && code!==1001);
+
     discordFailCount++;
-    const backoff = canResume ? 3000 : Math.min(5000 * Math.pow(2, discordFailCount-1), DISCORD_MAX_BACKOFF);
-    console.log(`[Discord] closed (${code}) → ${canResume?'RESUME':'IDENTIFY (#'+discordFailCount+')'} in ${Math.round(backoff/1000)}s`);
-    setTimeout(()=>connectDiscord(canResume), backoff);
+    // Even RESUMEs now back off. A flat 3s retry against a gateway that keeps
+    // dropping us is what let this spin hot. Floor 3s, doubling, capped.
+    const backoff = canResume
+      ? Math.min(3000 * Math.pow(2, Math.max(0,discordFailCount-1)), 60000)
+      : Math.min(5000 * Math.pow(2, discordFailCount-1), DISCORD_MAX_BACKOFF);
+
+    scheduleDiscordReconnect(canResume, backoff, `closed (${code}) [gen ${myGen}] #${discordFailCount}`);
   });
 }
 
