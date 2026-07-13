@@ -1194,19 +1194,36 @@ async function fireNHOD(ticker,price){
   //      grinding in a tight band has no range to break out of.
   // Watchlist/permanentWatch tickers are exempt (you're tracking them on
   // purpose and want every high). This gate applies to gapper/live tickers.
+  //
+  // ⚠️ MKT-ONLY. This gate reads snapshot.day.l / day.c, which Polygon does NOT
+  // populate before the 9:30 open — pre-market snapshots come back day.l=0,
+  // day.c=0. The old code computed rangePct as 0 when day.l was 0 and then
+  // compared 0 < 15 → skip, so a MISSING input became a REJECTION and EVERY
+  // pre-market NHOD was silently killed (AMIX $8.32 +22%, real breakout, ate a
+  // "no range — L=$0.0000" skip). The gate was only ever built to kill COOT-type
+  // flat choppers during regular hours; pre-market/AH the tier gain % (>=10%
+  // early, >=20% late) is already the quality filter, by design (see header).
+  // So: run the gate during MKT only, and FAIL OPEN — if the low/high are
+  // missing or zero we alert and log loudly rather than silently rejecting.
   const MIN_DAY_CHG = 15;    // >= 15% up on the day
   const MIN_RANGE_PCT = 15;  // >= 15% high-to-low intraday range
-  if(!isWatchOnly){
+  if(!isWatchOnly && tier.name === 'MKT'){
     const effChg = (dayChgV !== null) ? dayChgV : (gapper.chgPct || 0);
-    const rangePct = (dayLow > 0 && dayHighV > 0) ? (dayHighV - dayLow) / dayLow * 100 : 0;
+    const haveRange = (dayLow > 0 && dayHighV > 0);
+    const rangePct = haveRange ? (dayHighV - dayLow) / dayLow * 100 : null;
     if(effChg < MIN_DAY_CHG){
       console.log(`[NHOD] ${ticker} skip: not moving — day chg ${effChg.toFixed(1)}% < ${MIN_DAY_CHG}% (flat/red)`);
       return;
     }
-    if(rangePct < MIN_RANGE_PCT){
+    if(!haveRange){
+      // Fail OPEN, never closed. Bad data must not masquerade as a chopper.
+      console.log(`[NHOD] ${ticker} momentum gate SKIPPED (no valid H/L: L=$${dayLow} H=$${dayHighV}) — alerting anyway, day chg ${effChg.toFixed(1)}%`);
+    } else if(rangePct < MIN_RANGE_PCT){
       console.log(`[NHOD] ${ticker} skip: no range — H/L range ${rangePct.toFixed(1)}% < ${MIN_RANGE_PCT}% (chopper, L=$${dayLow.toFixed(4)} H=$${dayHighV.toFixed(4)})`);
       return;
     }
+  } else if(!isWatchOnly){
+    console.log(`[NHOD] ${ticker} momentum gate N/A in ${tier.name} (day.l/day.c unset pre-open; tier gain % is the filter)`);
   }
 
   if(tier.minVol>0){
