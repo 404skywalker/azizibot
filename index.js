@@ -2367,8 +2367,20 @@ async function checkMorningSnapshot(){
     const dot=g.chgPct>=200?'🔴':g.chgPct>=100?'🟠':g.chgPct>=50?'🟡':'🟢';
     return`${dot} **${g.ticker}** \`${priceFlag(g.price)}\` \`+${g.chgPct.toFixed(1)}%\` | $${g.price.toFixed(4)} | Vol: ${fmtN(g.volume)} | RVol: ${fmtRVol(g.rvol)}`;
   }).join('\n');
-  await post({embeds:[{title:`${hh===6?'🌅 6AM':'☀️ 7AM'} Pre-Market Gappers`,description:rows||'No data',color:0x00d4ff,footer:{text:`AziziBot · ${getET().timeStr} ET`},timestamp:new Date().toISOString()}]});
-  console.log(`[${getET().timeStr}] Morning snapshot posted`);
+  // Route the pre-market gapper digest to #top-gappers (TOP_GAPPERS_WH), NOT
+  // main chat. This previously called post(), which posts to MAIN_CHAT_WH — so
+  // TOP_GAPPERS_WH was declared and health-checked but never actually used, and
+  // every 6/7AM digest landed in #main-chat. Fall back to MAIN_CHAT_WH only if
+  // TOP_GAPPERS_WH is unset, so the digest can never silently vanish.
+  const digestPayload={embeds:[{title:`${hh===6?'🌅 6AM':'☀️ 7AM'} Pre-Market Gappers`,description:rows||'No data',color:0x00d4ff,footer:{text:`AziziBot · ${getET().timeStr} ET`},timestamp:new Date().toISOString()}]};
+  const digestTarget=TOP_GAPPERS_WH||MAIN_CHAT_WH;
+  if(!digestTarget){
+    console.log('[Gappers] digest suppressed (neither TOP_GAPPERS_WH nor MAIN_CHAT_WH set)');
+  } else {
+    if(!TOP_GAPPERS_WH) console.log('[Gappers] TOP_GAPPERS_WH unset — digest falling back to #main-chat');
+    await postToWebhook(digestTarget, digestPayload);
+    console.log(`[${getET().timeStr}] Morning snapshot posted → ${TOP_GAPPERS_WH?'#top-gappers':'#main-chat (fallback)'}`);
+  }
 }
 
 // ─── Market bell alerts: 5 min to open + 5 min to close ───────────────────────
