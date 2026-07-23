@@ -1108,11 +1108,14 @@ async function fireNHOD(ticker,price){
   // NOT a new high — suppress. This makes NHOD self-correcting regardless of
   // how s.high was seeded.
   let dayOpen=0, dayLow=0, dayHighV=0, dayChgV=null; // for the momentum gate below
+  let actBars=null, actRecent=null;                   // chart-activity (log-only)
   try {
     const [sess, snapV] = await Promise.all([
       getSessionData(ticker),
       polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`),
     ]);
+    actBars   = (typeof sess.activeBars==='number') ? sess.activeBars : null;
+    actRecent = (typeof sess.recentBars==='number') ? sess.recentBars : null;
     const tdV   = snapV && snapV.ticker;
     const dayHV = (tdV && tdV.day && tdV.day.h) || 0;
     // Stash day range/change for the momentum gate (which runs after freshen).
@@ -1236,11 +1239,16 @@ async function fireNHOD(ticker,price){
     const PRE_MIN_RVOL = 2;    // or show real relative volume
     const qChg  = gapper.chgPct || 0;
     const qRvol = gapper.rvol   || 0;
+    // Chart-activity readout — LOG ONLY, gates nothing yet. Collect real numbers
+    // across a session, then set a floor from what's actually observed.
+    const actStr = (actBars===null)
+      ? 'activity n/a'
+      : `activity ${actBars} bars traded (${actRecent} in last 30m)`;
     if(qChg < PRE_MIN_CHG && qRvol < PRE_MIN_RVOL){
-      console.log(`[NHOD] ${ticker} skip: ${tier.name} low conviction — chg ${qChg.toFixed(1)}%<${PRE_MIN_CHG}% AND rvol ${qRvol.toFixed(1)}x<${PRE_MIN_RVOL}x (flat mover, vol ${fmtN(checkVol)})`);
+      console.log(`[NHOD] ${ticker} skip: ${tier.name} low conviction — chg ${qChg.toFixed(1)}%<${PRE_MIN_CHG}% AND rvol ${qRvol.toFixed(1)}x<${PRE_MIN_RVOL}x (flat mover, vol ${fmtN(checkVol)}, ${actStr})`);
       return;
     }
-    console.log(`[NHOD] ${ticker} ${tier.name} quality OK — chg ${qChg.toFixed(1)}% rvol ${qRvol.toFixed(1)}x (momentum gate N/A pre-open)`);
+    console.log(`[NHOD] ${ticker} ${tier.name} quality OK — chg ${qChg.toFixed(1)}% rvol ${qRvol.toFixed(1)}x vol ${fmtN(checkVol)} | ${actStr}`);
   }
 
   if(tier.minVol>0){
@@ -2599,14 +2607,25 @@ async function getSessionData(ticker){
     // and request the whole day (limit 1500 > 960) so the morning high is
     // always included regardless of what time the query runs.
     const r = await polyGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}?adjusted=true&sort=asc&limit=1500`);
-    if(!r || !r.results || !r.results.length) return {high: 0, volume: 0};
-    let high = 0, volume = 0;
+    if(!r || !r.results || !r.results.length) return {high: 0, volume: 0, bars: 0, activeBars: 0, recentBars: 0};
+    let high = 0, volume = 0, activeBars = 0, recentBars = 0;
+    // "Chart activity" metrics. Volume tells you HOW MUCH traded; it cannot tell
+    // you whether the tape is alive. A shell can print 39K in three fat prints and
+    // flatline (AMBP: +10.0%, 1.0x RVol, 39K, no chart). activeBars = minutes that
+    // actually traded; recentBars = of the last 30 minutes, how many traded. These
+    // are LOG-ONLY for now — measured and printed, gating nothing, so the floor can
+    // be set from real observed numbers instead of a guess.
+    const cutoff = Date.now() - 30*60*1000;
     for(const b of r.results){
       if((b.h||0) > high) high = b.h;
       volume += (b.v||0);
+      if((b.v||0) > 0){
+        activeBars++;
+        if((b.t||0) >= cutoff) recentBars++;
+      }
     }
-    return {high, volume};
-  } catch(e){ return {high: 0, volume: 0}; }
+    return {high, volume, bars: r.results.length, activeBars, recentBars};
+  } catch(e){ return {high: 0, volume: 0, bars: 0, activeBars: 0, recentBars: 0}; }
 }
 
 // Seed state.high (true session high) and peakVol for a single ticker from
