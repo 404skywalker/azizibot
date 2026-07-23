@@ -1223,7 +1223,24 @@ async function fireNHOD(ticker,price){
       return;
     }
   } else if(!isWatchOnly){
-    console.log(`[NHOD] ${ticker} momentum gate N/A in ${tier.name} (day.l/day.c unset pre-open; tier gain % is the filter)`);
+    // PRE/AH quality gate. The MKT momentum gate (day chg + H/L range) cannot run
+    // here because Polygon leaves day.l/day.c at 0 before the open — that null was
+    // previously failing CLOSED and silently killing every pre-market NHOD (AMIX
+    // $8.32 +22%). Making the gate MKT-only fixed that, but removed the ONLY
+    // suppression on flat pre-market movers, which let AMBP through: +10.0% (exactly
+    // the tier floor) on 39K vol at 1.0x RVol — no conviction, no relative volume,
+    // no move. So enforce a real floor here using inputs that EXIST pre-open:
+    // conviction (gain %) and participation (RVol). A ticker must clear the tier
+    // minimum by a margin OR show genuine relative-volume interest.
+    const PRE_MIN_CHG  = 15;   // must be >15%, not scraping the 10% tier floor
+    const PRE_MIN_RVOL = 2;    // or show real relative volume
+    const qChg  = gapper.chgPct || 0;
+    const qRvol = gapper.rvol   || 0;
+    if(qChg < PRE_MIN_CHG && qRvol < PRE_MIN_RVOL){
+      console.log(`[NHOD] ${ticker} skip: ${tier.name} low conviction — chg ${qChg.toFixed(1)}%<${PRE_MIN_CHG}% AND rvol ${qRvol.toFixed(1)}x<${PRE_MIN_RVOL}x (flat mover, vol ${fmtN(checkVol)})`);
+      return;
+    }
+    console.log(`[NHOD] ${ticker} ${tier.name} quality OK — chg ${qChg.toFixed(1)}% rvol ${qRvol.toFixed(1)}x (momentum gate N/A pre-open)`);
   }
 
   if(tier.minVol>0){
