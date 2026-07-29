@@ -2371,7 +2371,17 @@ async function syncHighsAtTransition() {
         closePrice.set(ticker, cur);
         const s = state.tickers.get(ticker);
         if(s) {
-          state.tickers.set(ticker, {...s, high:cur, nhod:0, lastAlertPrice:0, lastAlertTime:0});
+          // DO NOT overwrite s.high here. s.high is the TRUE SESSION HIGH — seeded
+          // by pre-warm and only ever RAISED, never lowered. This handler used to
+          // set high:cur (the 4PM close), which WIPED the real high the instant AH
+          // began: DOGZ made its $1.09 HOD at 09:16, bled to $0.91, and at the AH
+          // transition its high was overwritten with $0.91 — so a $0.9x tick at
+          // 18:20 looked like a "new high" and false-fired an NHOD ~17% BELOW the
+          // actual session high. The close belongs in its own field (closePrice map,
+          // already set above); the session high must survive into AH untouched.
+          // (Resetting the nhod COUNT at the boundary is fine — it only affects the
+          // "· N" display counter. Only the high:cur overwrite was the bug.)
+          state.tickers.set(ticker, {...s, nhod:0, lastAlertPrice:0, lastAlertTime:0});
         }
         console.log(`[Transition] ${ticker} close=$${cur.toFixed(4)}`);
       }
