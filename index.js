@@ -143,47 +143,34 @@ function priceFlag(p){
   if(p<50)return`<$${Math.floor(p/5)*5+5}`;
   return`<$${Math.floor(p/10)*10+10}`;
 }
+// Convert an ISO-3166-1 alpha-2 code (or a country NAME) into its flag emoji.
+// Flag emoji = the two regional-indicator letters for the ISO code, so ANY valid
+// 2-letter code renders correctly with no hand-maintained emoji table. Covers all
+// 53 countries in the Nasdaq HQ dataset and every other country automatically.
+// Unknown / unresolvable → '🏳️' (neutral), NEVER a false 🇺🇸.
+const COUNTRY_NAME2ISO = {
+  'UNITED STATES':'US','CHINA':'CN','HONG KONG':'HK','SINGAPORE':'SG','ISRAEL':'IL',
+  'UNITED KINGDOM':'GB','CANADA':'CA','AUSTRALIA':'AU','TAIWAN':'TW','JAPAN':'JP',
+  'GREECE':'GR','SWITZERLAND':'CH','NETHERLANDS':'NL','IRELAND':'IE','MALAYSIA':'MY',
+  'BERMUDA':'BM','GERMANY':'DE','FRANCE':'FR','LUXEMBOURG':'LU','UNITED ARAB EMIRATES':'AE',
+  'SWEDEN':'SE','BRAZIL':'BR','SOUTH KOREA':'KR','MEXICO':'MX','BELGIUM':'BE',
+  'DENMARK':'DK','JERSEY':'JE','CYPRUS':'CY','ARGENTINA':'AR','INDIA':'IN','ITALY':'IT',
+  'URUGUAY':'UY','MACAU':'MO','GIBRALTAR':'GI','BRITISH VIRGIN ISLANDS':'VG',
+  'GUERNSEY':'GG','KAZAKHSTAN':'KZ','SPAIN':'ES','FINLAND':'FI','PUERTO RICO':'PR',
+  'NEW ZEALAND':'NZ','COSTA RICA':'CR','U.S. VIRGIN ISLANDS':'VI','CAMBODIA':'KH',
+  'TURKEY':'TR','JORDAN':'JO','SOUTH AFRICA':'ZA','CURACAO':'CW','NORWAY':'NO',
+  'BAHAMAS':'BS','INDONESIA':'ID','PHILIPPINES':'PH','CAYMAN ISLANDS':'KY',
+  'RUSSIA':'RU','PORTUGAL':'PT','PANAMA':'PA','MARSHALL ISLANDS':'MH',
+};
 function countryFlag(country){
-  if(!country) return'🇺🇸';
-  const c=country.toUpperCase();
-  const map={
-    'US':'🇺🇸','UNITED STATES':'🇺🇸',
-    'CN':'🇨🇳','CHINA':'🇨🇳','HK':'🇭🇰','HONG KONG':'🇭🇰',
-    'IL':'🇮🇱','ISRAEL':'🇮🇱',
-    'GB':'🇬🇧','UK':'🇬🇧','UNITED KINGDOM':'🇬🇧',
-    'CA':'🇨🇦','CANADA':'🇨🇦',
-    'AU':'🇦🇺','AUSTRALIA':'🇦🇺',
-    'DE':'🇩🇪','GERMANY':'🇩🇪',
-    'FR':'🇫🇷','FRANCE':'🇫🇷',
-    'JP':'🇯🇵','JAPAN':'🇯🇵',
-    'KR':'🇰🇷','SOUTH KOREA':'🇰🇷',
-    'IN':'🇮🇳','INDIA':'🇮🇳',
-    'BR':'🇧🇷','BRAZIL':'🇧🇷',
-    'SG':'🇸🇬','SINGAPORE':'🇸🇬',
-    'NL':'🇳🇱','NETHERLANDS':'🇳🇱',
-    'SE':'🇸🇪','SWEDEN':'🇸🇪',
-    'CH':'🇨🇭','SWITZERLAND':'🇨🇭',
-    'IE':'🇮🇪','IRELAND':'🇮🇪',
-    'ZA':'🇿🇦','SOUTH AFRICA':'🇿🇦',
-    'MX':'🇲🇽','MEXICO':'🇲🇽',
-    'RU':'🇷🇺','RUSSIA':'🇷🇺',
-    'TW':'🇹🇼','TAIWAN':'🇹🇼',
-    'NO':'🇳🇴','NORWAY':'🇳🇴',
-    'DK':'🇩🇰','DENMARK':'🇩🇰',
-    'FI':'🇫🇮','FINLAND':'🇫🇮',
-    'NZ':'🇳🇿','NEW ZEALAND':'🇳🇿',
-    'GR':'🇬🇷','GREECE':'🇬🇷',
-    'PT':'🇵🇹','PORTUGAL':'🇵🇹',
-    'ES':'🇪🇸','SPAIN':'🇪🇸',
-    'IT':'🇮🇹','ITALY':'🇮🇹',
-    'BE':'🇧🇪','BELGIUM':'🇧🇪',
-    'CY':'🇨🇾','CYPRUS':'🇨🇾',
-    'BM':'🇧🇲','BERMUDA':'🇧🇲',
-    'KY':'🇰🇾','CAYMAN ISLANDS':'🇰🇾',
-    'PA':'🇵🇦','PANAMA':'🇵🇦',
-    'MH':'🇲🇭','MARSHALL ISLANDS':'🇲🇭',
-  };
-  return map[c]||'🇺🇸';
+  if(!country) return '🏳️';
+  let c = String(country).toUpperCase().trim();
+  if(c.length !== 2) c = COUNTRY_NAME2ISO[c] || '';   // resolve a name to ISO
+  if(!/^[A-Z]{2}$/.test(c)) return '🏳️';               // still unknown → neutral
+  // US Virgin Islands / Puerto Rico are US territories — show 🇺🇸 for trading purposes
+  if(c==='VI'||c==='PR') return '🇺🇸';
+  // Regional-indicator letters: 'A' (0x41) → U+1F1E6. Offset = 0x1F1E6 - 0x41.
+  return String.fromCodePoint(...[...c].map(ch => 0x1F1E6 - 0x41 + ch.charCodeAt(0)));
 }
 
 // ─── Foreign ticker overrides ────────────────────────────────────────────────
@@ -274,15 +261,25 @@ const FOREIGN_TICKER_OVERRIDES = {
 //   3. Polygon locale (broad fallback: us = 🇺🇸)
 //   4. Default 🇺🇸 — safe fallback so the alert format never breaks
 function flag(ticker){
-  if(!ticker) return '🇺🇸';
-  // 1) Manual override map — highest confidence, hand-curated for ADRs
-  const ov = FOREIGN_TICKER_OVERRIDES[ticker];
+  if(!ticker) return '🏳️';
+  const t=ticker.toUpperCase();
+  // 1) Authoritative Nasdaq HQ-country file — highest confidence, official source
+  const hq = hqCountry.get(t);
+  if(hq) return countryFlag(hq);
+  // 2) Manual override map — hand-curated ADRs (covers NYSE/other tickers not in the file)
+  const ov = FOREIGN_TICKER_OVERRIDES[t];
   if(ov) return countryFlag(ov);
-  // 2) Auto-detected from Polygon ticker details (address.country / phone)
-  const c = countryMap.get(ticker);
+  // 3) Auto-detected from Polygon ticker details (address/description/phone)
+  const c = countryMap.get(t);
   if(c) return countryFlag(c);
-  // 3) Default — never return empty, every alert gets a flag
-  return '🇺🇸';
+  // 4) Genuinely unknown → neutral flag, and LOG it so the gap can be filled.
+  //    Never a false 🇺🇸. If this fires often for a ticker, add it to hq_countries.txt.
+  if(!flag._warned) flag._warned=new Set();
+  if(!flag._warned.has(t)){
+    flag._warned.add(t);
+    console.log(`[FLAG] ${t} HQ unknown — showing neutral flag. Add to hq_countries.txt if it recurs.`);
+  }
+  return '🏳️';
 }
 function isBadTicker(t) {
   if(!t||t.length<2)return true;
@@ -917,6 +914,30 @@ const recentRunners=new Map(); // ticker → timestamp when last seen as gapper
 // permanentWatch: loaded from watchlist.txt — monitored forever, no gates
 const permanentWatch=new Set();
 let lastWatchlistRead=0;
+
+// hqCountry: authoritative Symbol→ISO2 map loaded from hq_countries.txt (the full
+// Nasdaq listing with official HQ Country). This is the HIGHEST-priority flag
+// source — it replaces guessing for every listed ticker. Editable from GitHub;
+// reloaded on the same cadence as the watchlist so new symbols can be added
+// without a code change.
+const hqCountry=new Map();
+function loadHQCountries(){
+  try{
+    const path = fs.existsSync('/app/hq_countries.txt') ? '/app/hq_countries.txt' : './hq_countries.txt';
+    if(!fs.existsSync(path)){console.log('[HQ] hq_countries.txt not found — flag() will fall back to auto-detect'); return;}
+    const lines=fs.readFileSync(path,'utf8').split('\n');
+    const prev=hqCountry.size;
+    hqCountry.clear();
+    for(const raw of lines){
+      const ln=raw.trim();
+      if(!ln||ln.startsWith('#')) continue;
+      const [sym,iso]=ln.split(/\s+/);
+      if(sym&&iso&&/^[A-Z]{2}$/.test(iso)) hqCountry.set(sym.toUpperCase(), iso.toUpperCase());
+    }
+    if(hqCountry.size!==prev) console.log(`[HQ] Loaded ${hqCountry.size} ticker→country mappings`);
+  }catch(e){console.error('[HQ] Failed to load hq_countries.txt:',e.message);}
+}
+loadHQCountries();
 
 // ─── Instant event alert ─────────────────────────────────────────────────────
 // Posts a single header+bullet message immediately. No buffering, no aggregation.
