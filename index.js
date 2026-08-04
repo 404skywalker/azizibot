@@ -216,6 +216,7 @@ const FOREIGN_TICKER_OVERRIDES = {
   'AIFU':'CN','XHG':'CN','MFI':'CN','UTSI':'CN','HOLO':'CN','EPOW':'CN','ICCT':'CN',
   'YIBO':'CN','SISI':'CN','TROO':'CN','QYOU':'CN','WETG':'CN','SUGP':'CN','QUCY':'CN',
   'BRTX':'CN','TPST':'CN','MTC':'CN','SNAL':'CN','TGL':'CN','GFAI':'CN','BNRG':'CN',
+  'TNMG':'TW', // TNL Mediagene — Cayman-incorporated, HQ Taipei (No.88 Yanchang Rd); Polygon lists US agent addr so auto-detect misses it
   // Hong Kong
   'PNGAY':'HK','LFC':'HK','CHL':'HK',
   // Israel
@@ -232,7 +233,9 @@ const FOREIGN_TICKER_OVERRIDES = {
   'TRP':'CA','CNQ':'CA','CVE':'CA','SU':'CA','ABX':'CA','AEM':'CA','CNI':'CA',
   'WCN':'CA','MFC':'CA','GIB':'CA','OTEX':'CA','BCE':'CA','TRI':'CA',
   // Singapore
-  'SE':'SG','GRAB':'SG','ATAT':'SG','GHG':'SG',
+  'SE':'SG','GRAB':'SG', // NOTE: ATAT (Atour) and GHG (GreenTree) are CHINESE — they were
+                         // duplicated here as SG, which silently overrode their correct CN
+                         // entries above (last key wins in a JS object literal). Removed.
   // Brazil
   'VALE':'BR','ITUB':'BR','PBR':'BR','ABEV':'BR','BBD':'BR','GGB':'BR','ERJ':'BR',
   'NU':'BR','XP':'BR','PAGS':'BR','STNE':'BR',
