@@ -1437,9 +1437,14 @@ async function fireNHOD(ticker,price){
   // Spacing: blank line (zero-width space) between headline and stats so the
   // -# subline gets real air above it (Discord collapses a bare blank line
   // above small-text), plus a trailing line so consecutive alerts separate.
-  const line = headline + '\n' + metaLine + '\n​';
-
-  await post({content:line});
+  // EMBED: green side-rail gives real color; stats go in a FIELD, which Discord
+  // renders with its own built-in spacing above it — the small controlled gap
+  // that plain-text line breaks can't produce (they only do touching or full-blank).
+  await post({embeds:[{
+    color: 0x2DC770,
+    description: headline,
+    fields: [{ name: '\u200b', value: metaLine, inline: false }]
+  }]});
   console.log(`[ALERT] posted OK`);
 }
 
