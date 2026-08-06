@@ -1431,13 +1431,13 @@ async function fireNHOD(ticker,price){
   if(rsStr){ const rs = rsStr.replace(/[|`*]/g,'').trim(); if(rs) meta.push(rs); }
   meta.push(`#${nhod}`);
   meta.push(timeShort);
-  const FSEP = ' | ';  // en-space | en-space (non-collapsing) between fields
+  const FSEP = ' | ';  // en-space | en-space (non-collapsing) between fields
   let metaLine = `-# ${meta.join(FSEP)}`;
   if(prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url) metaLine += `${FSEP}[PR↗](<${prData2.url}>)`;
   // Spacing: blank line (zero-width space) between headline and stats so the
   // -# subline gets real air above it (Discord collapses a bare blank line
   // above small-text), plus a trailing line so consecutive alerts separate.
-  const line = headline + '\n' + metaLine + '\n​';
+  const line = headline + '\n-# ​\n' + metaLine + '\n​';
 
   await post({content:line});
   console.log(`[ALERT] posted OK`);
@@ -1507,7 +1507,7 @@ async function fireLunge(ticker, price, minuteVol){
   const lungeMeta = [`Vel ${velPerMin.toFixed(0)}%/min`];
   if(dayV>0) lungeMeta.push(`Vol ${fmtNS(dayV)}`);
   lungeMeta.push(timeShort);
-  const line = lungeHead + '\n-# ' + lungeMeta.join(' | ') + '\n​';
+  const line = lungeHead + '\n-# ​\n-# ' + lungeMeta.join(' | ') + '\n​';
 
   console.log(`[LUNGE] ${ticker} $${price.toFixed(4)} +${movePct.toFixed(0)}% in ${spanMin.toFixed(1)}min (${velPerMin.toFixed(0)}%/min) minVol=${fmtN(minuteVol||0)}`);
   await post({content:line});
@@ -2352,7 +2352,7 @@ function buildHaltLineRight(st, snap){
   if(resumeDisplay){
     parts.push(`Resume ${resumeDisplay} ET`);
   }
-  return parts.join(' | ');
+  return parts.join(' | ');
 }
 
 // Common posting routine. Caches chgPct on st so the matching resume mirrors
@@ -2366,7 +2366,7 @@ async function postHaltLine(st, snap, label){
   // after the YXT wrong-direction fix.
   const hdot = label.indexOf('DOWN')>=0 ? '🔴' : label.indexOf('UP')>=0 ? '🟢' : '⚪';
   const dirWord = label.indexOf('DOWN')>=0 ? 'HALTED ↓ DOWN' : label.indexOf('UP')>=0 ? 'HALTED ↑ UP' : 'HALTED';
-  const line    = `${hdot} **${ticker}**  ${flag(ticker)}  \`${dirWord}\`\n-# ${right}\n​`;
+  const line    = `${hdot} **${ticker}**  ${flag(ticker)}  \`${dirWord}\`\n-# ​\n-# ${right}\n​`;
 
   const chgPct  = (snap && typeof snap.chgPct === 'number') ? snap.chgPct : 0;
   st.chgPctAtHalt = chgPct;
