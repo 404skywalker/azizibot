@@ -1420,7 +1420,7 @@ async function fireNHOD(ticker,price){
   // line 2 = context (gray, via Discord -# small text). Same fields, same pills,
   // same order — just two visual weights instead of one flat stream. Plain text.
   const labelBare = labelStr.replace(/`/g, '');
-  const headline  = `🟢 ${tLink} ${flag(ticker)} ${priceFlag(price)}${pctCode} \`${labelBare}\`${afterStr}`;
+  const headline  = `🟢 ${tLink}  ${flag(ticker)}  ${priceFlag(price)}${pctCode}  \`${labelBare}\`${afterStr}`;
   const meta = [];
   if(liveRvol>0)   meta.push(`RVol ${fmtRVol(liveRvol)}`);
   if(liveVol>0)    meta.push(`Vol ${fmtNS(liveVol)}`);
@@ -1503,7 +1503,7 @@ async function fireLunge(ticker, price, minuteVol){
   // Distinct `LUNGE` pill so it reads differently from NHOD at a glance.
   // NEW LOOK: rocket leads, matches NHOD two-weight system. Distinct so a lunge
   // never reads like an NHOD at a glance.
-  const lungeHead = `🚀 **${ticker}** ${flag(ticker)} ${priceFlag(price)} \`+${movePct.toFixed(0)}%\` \`LUNGE\``;
+  const lungeHead = `🚀 **${ticker}**  ${flag(ticker)}  ${priceFlag(price)}  \`+${movePct.toFixed(0)}%\`  \`LUNGE\``;
   const lungeMeta = [`Vel ${velPerMin.toFixed(0)}%/min`];
   if(dayV>0) lungeMeta.push(`Vol ${fmtNS(dayV)}`);
   lungeMeta.push(timeShort);
@@ -2366,7 +2366,7 @@ async function postHaltLine(st, snap, label){
   // after the YXT wrong-direction fix.
   const hdot = label.indexOf('DOWN')>=0 ? '🔴' : label.indexOf('UP')>=0 ? '🟢' : '⚪';
   const dirWord = label.indexOf('DOWN')>=0 ? 'HALTED ↓ DOWN' : label.indexOf('UP')>=0 ? 'HALTED ↑ UP' : 'HALTED';
-  const line    = `${hdot} **${ticker}** ${flag(ticker)} \`${dirWord}\`\n​\n-# ${right}\n​`;
+  const line    = `${hdot} **${ticker}**  ${flag(ticker)}  \`${dirWord}\`\n​\n-# ${right}\n​`;
 
   const chgPct  = (snap && typeof snap.chgPct === 'number') ? snap.chgPct : 0;
   st.chgPctAtHalt = chgPct;
