@@ -1578,16 +1578,16 @@ async function fireNHOD(ticker,price){
   // line 2 = context (gray, via Discord -# small text). Same fields, same pills,
   // same order — just two visual weights instead of one flat stream. Plain text.
   const labelBare = labelStr.replace(/`/g, '');
-  const headline  = `🟢 ${tLink}  ${flag(ticker)}  ${priceFlag(price)}${pctCode}  \`${labelBare}\`${afterStr}`;
+  const headline  = `🟢 ${tLink}  ${flag(ticker)}  ↗ ${priceFlag(price)}${pctCode}  \`${labelBare}\`${afterStr}`;
   const meta = [];
-  if(liveRvol>0)   meta.push(`RVol ${fmtRVol(liveRvol)}`);
-  if(liveVol>0)    meta.push(`Vol ${fmtNS(liveVol)}`);
-  if(fv.si!=='--') meta.push(`SI ${fv.si}`);
-  if(greenBars.count>=2 && labelBare.indexOf('green')<0) meta.push(`${greenBars.count} green bars ${greenBars.timeframe}`);
-  if(isRegSHO(ticker)) meta.push('Reg SHO');
-  if(ctb && ctb.fee>=20) meta.push('High CTB');
-  if(rsStr){ const rs = rsStr.replace(/[|`*]/g,'').trim(); if(rs) meta.push(rs); }
-  meta.push(`#${nhod}`);
+  if(liveRvol>0)   meta.push(`${fmtRVol(liveRvol)} **RVol**`);
+  if(liveVol>0)    meta.push(`**Vol** ${fmtNS(liveVol)}`);
+  if(fv.si!=='--') meta.push(`**SI** ${fv.si}`);
+  if(greenBars.count>=2 && labelBare.indexOf('green')<0) meta.push(`${greenBars.count} **green bars** ${greenBars.timeframe}`);
+  if(isRegSHO(ticker)) meta.push('**Reg SHO**');
+  if(ctb && ctb.fee>=20) meta.push('**High CTB**');
+  if(rsStr){ const rs = rsStr.replace(/[|`*]/g,'').trim(); if(rs) meta.push(`**${rs}**`); }
+  meta.push(`**#**${nhod}`);
   meta.push(timeShort);
   const FSEP = ' | ';  // en-space | en-space (non-collapsing) between fields
   let metaLine = `-# ${meta.join(FSEP)}`;
