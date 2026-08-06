@@ -1593,16 +1593,9 @@ async function fireNHOD(ticker,price){
   let metaLine = `-# ${meta.join(FSEP)}`;
   if(prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url) metaLine += `${FSEP}[PR↗](<${prData2.url}>)`;
   // Spacing: blank line (zero-width space) between headline and stats so the
-  // -# subline gets real air above it (Discord collapses a bare blank line
-  // above small-text), plus a trailing line so consecutive alerts separate.
-  // EMBED: green side-rail gives real color; stats go in a FIELD, which Discord
-  // renders with its own built-in spacing above it — the small controlled gap
-  // that plain-text line breaks can't produce (they only do touching or full-blank).
-  await post({embeds:[{
-    color: 0x2DC770,
-    description: headline,
-    fields: [{ name: '\u200b', value: metaLine, inline: false }]
-  }]});
+  // Plain-text two-line message: bold headline + gray -# stats line directly under.
+  const line = headline + '\n' + metaLine + '\n\u200b';
+  await post({content:line});
   console.log(`[ALERT] posted OK`);
 }
 
