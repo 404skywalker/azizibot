@@ -1507,7 +1507,7 @@ async function fireLunge(ticker, price, minuteVol){
   const lungeMeta = [`Vel ${velPerMin.toFixed(0)}%/min`];
   if(dayV>0) lungeMeta.push(`Vol ${fmtNS(dayV)}`);
   lungeMeta.push(timeShort);
-  const line = lungeHead + '\n​\n-# ' + lungeMeta.join(' | ') + '\n⠀\n⠀';
+  const line = lungeHead + '\n​\n-# ' + lungeMeta.join(' | ') + '\n​';
 
   console.log(`[LUNGE] ${ticker} $${price.toFixed(4)} +${movePct.toFixed(0)}% in ${spanMin.toFixed(1)}min (${velPerMin.toFixed(0)}%/min) minVol=${fmtN(minuteVol||0)}`);
   await post({content:line});
@@ -2366,7 +2366,7 @@ async function postHaltLine(st, snap, label){
   // after the YXT wrong-direction fix.
   const hdot = label.indexOf('DOWN')>=0 ? '🔴' : label.indexOf('UP')>=0 ? '🟢' : '⚪';
   const dirWord = label.indexOf('DOWN')>=0 ? 'HALTED ↓ DOWN' : label.indexOf('UP')>=0 ? 'HALTED ↑ UP' : 'HALTED';
-  const line    = `${hdot} **${ticker}** ${flag(ticker)} \`${dirWord}\`\n​\n-# ${right}\n⠀\n⠀`;
+  const line    = `${hdot} **${ticker}** ${flag(ticker)} \`${dirWord}\`\n​\n-# ${right}\n​`;
 
   const chgPct  = (snap && typeof snap.chgPct === 'number') ? snap.chgPct : 0;
   st.chgPctAtHalt = chgPct;
