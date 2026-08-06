@@ -1416,8 +1416,24 @@ async function fireNHOD(ticker,price){
   // High CTB: borrow fee >= 20% per annum (industry rough threshold for "hard to borrow")
   const ctbStr    = (ctb && ctb.fee >= 20) ? ' | `High CTB`' : '';
   const prData2   = newsCache.get(ticker);
-  const prLink    = prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url ? ` | [\`PR\`↗](<${prData2.url}>)` : '';
-  const line = `\`${timeShort}\` ↗ ${tLink} ${priceFlag(price)}${pctCode} · ${nhod} ${labelStr}${afterStr} ~ ${flag(ticker)}${rvolStr}${volStr}${siStr}${regSHOStr}${ctbStr}${rsStr}${prLink}`;
+  // NEW LOOK: green dot leads (direction, in color). Line 1 = the trade (bold),
+  // line 2 = context (gray, via Discord -# small text). Same fields, same pills,
+  // same order — just two visual weights instead of one flat stream. Plain text.
+  const labelBare = labelStr.replace(/`/g, '');
+  const headline  = `🟢 ${tLink} ${flag(ticker)} ${priceFlag(price)}${pctCode} \`${labelBare}\`${afterStr}`;
+  const meta = [];
+  if(liveRvol>0)   meta.push(`RVol ${fmtRVol(liveRvol)}`);
+  if(liveVol>0)    meta.push(`Vol ${fmtNS(liveVol)}`);
+  if(fv.si!=='--') meta.push(`SI ${fv.si}`);
+  if(greenBars.count>=2 && labelBare.indexOf('green')<0) meta.push(`${greenBars.count} green bars ${greenBars.timeframe}`);
+  if(isRegSHO(ticker)) meta.push('Reg SHO');
+  if(ctb && ctb.fee>=20) meta.push('High CTB');
+  if(rsStr){ const rs = rsStr.replace(/[|`*]/g,'').trim(); if(rs) meta.push(rs); }
+  meta.push(`#${nhod}`);
+  meta.push(timeShort);
+  let metaLine = `-# ${meta.join(' · ')}`;
+  if(prData2&&(Date.now()-(prData2.ts||0))<24*60*60*1000&&prData2.url) metaLine += ` · [PR↗](<${prData2.url}>)`;
+  const line = headline + '\n' + metaLine;
 
   await post({content:line});
   console.log(`[ALERT] posted OK`);
@@ -1481,7 +1497,13 @@ async function fireLunge(ticker, price, minuteVol){
   const dayV = s.peakVol || 0;
   const volStr = dayV > 0 ? ` | **Vol:** ${fmtNS(dayV)}` : '';
   // Distinct `LUNGE` pill so it reads differently from NHOD at a glance.
-  const line = `\`${timeShort}\` 🚀 **${ticker}** ${priceFlag(price)} \`+${movePct.toFixed(0)}%\` · \`LUNGE\` ~ ${flag(ticker)} | **Vel:** ${velPerMin.toFixed(0)}%/min${volStr}`;
+  // NEW LOOK: rocket leads, matches NHOD two-weight system. Distinct so a lunge
+  // never reads like an NHOD at a glance.
+  const lungeHead = `🚀 **${ticker}** ${flag(ticker)} ${priceFlag(price)} \`+${movePct.toFixed(0)}%\` \`LUNGE\``;
+  const lungeMeta = [`Vel ${velPerMin.toFixed(0)}%/min`];
+  if(dayV>0) lungeMeta.push(`Vol ${fmtNS(dayV)}`);
+  lungeMeta.push(timeShort);
+  const line = lungeHead + '\n-# ' + lungeMeta.join(' · ');
 
   console.log(`[LUNGE] ${ticker} $${price.toFixed(4)} +${movePct.toFixed(0)}% in ${spanMin.toFixed(1)}min (${velPerMin.toFixed(0)}%/min) minVol=${fmtN(minuteVol||0)}`);
   await post({content:line});
@@ -2335,7 +2357,12 @@ async function postHaltLine(st, snap, label){
   const {ticker, code, haltTimeOriginal} = st;
   const timeStr = haltTimeOriginal || getET().timeStr;
   const right   = buildHaltLineRight(st, snap);
-  const line    = `\`${timeStr}\` **${ticker}** \`${label}\` ${flag(ticker)} | ${right}`;
+  // NEW LOOK: colored dot by direction (red=down, green=up, white=generic), two
+  // visual weights. Direction now reads in COLOR as well as the word — important
+  // after the YXT wrong-direction fix.
+  const hdot = label.indexOf('DOWN')>=0 ? '🔴' : label.indexOf('UP')>=0 ? '🟢' : '⚪';
+  const dirWord = label.indexOf('DOWN')>=0 ? 'HALTED ↓ DOWN' : label.indexOf('UP')>=0 ? 'HALTED ↑ UP' : 'HALTED';
+  const line    = `${hdot} **${ticker}** ${flag(ticker)} \`${dirWord}\`\n-# ${right}`;
 
   const chgPct  = (snap && typeof snap.chgPct === 'number') ? snap.chgPct : 0;
   st.chgPctAtHalt = chgPct;
