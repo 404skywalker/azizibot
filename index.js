@@ -2137,8 +2137,13 @@ async function detectHaltDirectionVerbose(ticker, haltedAtMs){
 
   // Pull a slightly wider window so we have multiple complete bars even if
   // the halt-minute bar itself is partial/missing at poll time.
+  // Window ENDS at the halt, not after it. The direction of an LULD halt is set
+  // by the move INTO the halt — never by what prints after. Including post-halt
+  // bars let the limit-band bounce / reference-price reset print a fresh high just
+  // after a DOWN halt, which made extreme-timing vote UP on a down halt (YXT:
+  // halted DOWN, alerted UP). End the window a hair before the halt trips.
   const fromMs = haltedAtMs - 6 * 60 * 1000;
-  const toMs   = haltedAtMs + 60 * 1000; // include the halt minute if present
+  const toMs   = haltedAtMs - 1;  // strictly BEFORE the halt — no post-halt bars
 
   const haltET = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false
@@ -2181,23 +2186,25 @@ async function detectHaltDirectionVerbose(ticker, haltedAtMs){
     const lastBar  = bars[bars.length - 1];
     const votes = [];
 
-    // Signal A: window trajectory (first open → last close). Robust to a
-    // single partial bar because it spans the whole approach to the halt.
+    // Signal A: window trajectory (first open → last close), the move INTO the
+    // halt. This is the AUTHORITATIVE signal — it spans the whole approach and is
+    // what actually defines halt direction. If it's clear, it decides, and no
+    // weaker signal may override it.
+    let trajVote = 0;
     if(firstBar.o > 0 && lastBar.c > 0){
       const m = (lastBar.c - firstBar.o) / firstBar.o * 100;
-      if(Math.abs(m) >= 0.5) votes.push({sig:'trajectory', v: m > 0 ? 1 : -1, n:`win O→C ${m.toFixed(2)}%`});
+      if(Math.abs(m) >= 0.5){ trajVote = m > 0 ? 1 : -1; votes.push({sig:'trajectory', v: trajVote, n:`win O→C ${m.toFixed(2)}%`, strong:true}); }
     }
 
-    // Signal B: where did the extreme print happen? An LULD-UP halt prints a
-    // fresh HIGH at the end; an LULD-DOWN halt prints a fresh LOW at the end.
-    // Compare the window's max-high bar index vs max-low bar index — whichever
-    // extreme is more recent indicates the halt direction.
+    // Signal B: extreme-timing. DEMOTED to weak — near a halt this is noise-prone
+    // (partial bars, band bounces), and it was the signal that flipped YXT. It may
+    // only CORROBORATE, never decide, and never override a clear trajectory.
     let hiIdx = 0, loIdx = 0, hiV = -Infinity, loV = Infinity;
     bars.forEach((b, i) => {
       if((b.h||0) > hiV){ hiV = b.h; hiIdx = i; }
       if((b.l||Infinity) < loV){ loV = b.l; loIdx = i; }
     });
-    if(hiIdx !== loIdx) votes.push({sig:'extreme-timing', v: hiIdx > loIdx ? 1 : -1, n:`hiIdx=${hiIdx} loIdx=${loIdx}`});
+    if(hiIdx !== loIdx) votes.push({sig:'extreme-timing', v: hiIdx > loIdx ? 1 : -1, n:`hiIdx=${hiIdx} loIdx=${loIdx}`, weak:true});
 
     // Signal C: day change sign (independent of bar data entirely). Weaker —
     // a stock can halt down while green on the day — so only counts when it
@@ -2216,15 +2223,20 @@ async function detectHaltDirectionVerbose(ticker, haltedAtMs){
     if(votes.length === 0)
       return {dir: null, method: 'no-signal', detail};
 
+    // Trajectory is authoritative. If the approach into the halt is clear, it
+    // decides — full stop. Weak signals (extreme-timing, day-chg) can no longer
+    // flip the label, which is the whole YXT failure mode.
+    if(trajVote > 0) return {dir: 'UP',   method: 'trajectory', detail};
+    if(trajVote < 0) return {dir: 'DOWN', method: 'trajectory', detail};
+
+    // No clear trajectory → fall back to the other signals, but require agreement
+    // among the STRONG ones and post generic "Halted" on any strong conflict.
     const net = votes.reduce((s,v)=>s+v.v, 0);
-    const strongVotes = votes.filter(v=>!v.weak);
+    const strongVotes = votes.filter(v=>v.strong);
     const hasUp   = strongVotes.some(v=>v.v > 0);
     const hasDown = strongVotes.some(v=>v.v < 0);
-
-    // Conflict between two STRONG signals → don't guess, post generic "Halted".
     if(hasUp && hasDown)
       return {dir: null, method: 'conflict', detail};
-
     if(net > 0) return {dir: 'UP',   method: 'vote', detail};
     if(net < 0) return {dir: 'DOWN', method: 'vote', detail};
     return {dir: null, method: 'tie', detail};
