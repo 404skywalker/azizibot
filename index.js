@@ -28,6 +28,164 @@ const PR_NEWS_WH     = process.env.PR_NEWS_WH || '';
 // movers (|chgPct| ≥ 30%) are additionally mirrored to MAIN_CHAT_WH so they
 // hit the primary feed without polluting main-chat with every illiquid halt.
 const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || '').split(',').map(s=>s.trim()).filter(Boolean);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ECONOMIC EVENTS  (FMP economic calendar → #econ-events)
+// Two message types:
+//   1. Morning digest (once, ~7:00 AM ET) — all of today's events, chronological
+//   2. Per-event pre-alert (~15 min before each event)
+// Source: FMP /api/v3/economic_calendar (free tier 250 req/day, updates 15min).
+// TUNABLE: ECON_MIN_IMPACT filters by impact. 'Low' = all, 'Medium' = med+high,
+//   'High' = high only. Default 'Low' (everything), per request.
+// ═══════════════════════════════════════════════════════════════════════════
+const ECON_EVENTS_WH = process.env.ECON_EVENTS_WH || '';
+const FMP_KEY        = process.env.FMP_KEY || '';
+const ECON_MIN_IMPACT = 'Low';              // 'Low' | 'Medium' | 'High'  (Low = show all)
+const ECON_PREALERT_MIN = 15;               // fire pre-alert this many minutes before
+const ECON_COUNTRIES = null;                // null = all countries; or ['US','EU',...]
+
+const IMPACT_RANK = { low:0, medium:1, high:2 };
+const IMPACT_EMOJI = { low:'⚪', medium:'🟡', high:'🔴' };
+function impactOK(imp){
+  const r = IMPACT_RANK[String(imp||'').toLowerCase()] ?? 0;
+  return r >= (IMPACT_RANK[ECON_MIN_IMPACT.toLowerCase()] ?? 0);
+}
+
+// In-memory guards so we alert each thing once per day.
+let econDigestSentFor = '';                 // 'YYYY-MM-DD' of last digest
+const econPreAlerted = new Set();           // keys of events already pre-alerted
+
+// Fetch today's events (ET calendar day). FMP returns UTC timestamps in `date`.
+async function fetchEconToday(){
+  if(!FMP_KEY){ return null; }
+  // Pull a 2-day window (today + tomorrow UTC) so late-ET events aren't cut by
+  // the UTC date boundary, then filter to the ET day.
+  const now = new Date();
+  const fmt = d => d.toISOString().slice(0,10);
+  const from = fmt(new Date(now.getTime() - 24*60*60*1000));
+  const to   = fmt(new Date(now.getTime() + 24*60*60*1000));
+  const url = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`;
+  const data = await jsonGet(url);
+  if(!Array.isArray(data)) return null;
+  return data;
+}
+
+// Convert an FMP event `date` (UTC "YYYY-MM-DD HH:mm:ss") to ET parts.
+function econEventET(ev){
+  // FMP timestamps are UTC. Append Z so Date parses as UTC.
+  const d = new Date((ev.date||'').replace(' ','T') + 'Z');
+  if(isNaN(d)) return null;
+  const p = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
+    year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(d);
+  const get = t => p.find(x=>x.type===t)?.value;
+  const hh = get('hour')==='24' ? '00' : get('hour');
+  return {
+    dateKey: `${get('year')}-${get('month')}-${get('day')}`,
+    hhmm: `${hh}:${get('minute')}`,
+    etMin: parseInt(hh)*60 + parseInt(get('minute')),
+    d
+  };
+}
+
+function todayETKey(){
+  const p = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
+    year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
+  const g=t=>p.find(x=>x.type===t)?.value;
+  return `${g('year')}-${g('month')}-${g('day')}`;
+}
+
+function fmt12(hhmm){
+  let [h,m]=hhmm.split(':').map(Number);
+  const ap = h>=12?'PM':'AM'; h=h%12||12;
+  return `${h}:${String(m).padStart(2,'0')} ${ap}`;
+}
+
+// ── Morning digest: all of today's (filtered) events, chronological ──────────
+async function postEconDigest(){
+  const today = todayETKey();
+  if(econDigestSentFor === today) return;      // already sent today
+  const all = await fetchEconToday();
+  if(!all){ console.log('[Econ] digest skipped — no data (FMP_KEY set?)'); return; }
+
+  const todays = all
+    .map(ev => ({ev, et: econEventET(ev)}))
+    .filter(x => x.et && x.et.dateKey === today && impactOK(x.ev.impact)
+              && (!ECON_COUNTRIES || ECON_COUNTRIES.includes(ev.country)))
+    .sort((a,b) => a.et.etMin - b.et.etMin);
+
+  const dateLabel = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
+    weekday:'long', day:'2-digit', month:'long'}).format(new Date());
+
+  let body;
+  if(todays.length === 0){
+    body = '_No scheduled events today._';
+  } else {
+    body = todays.map(({ev,et}) => {
+      const em = IMPACT_EMOJI[String(ev.impact||'').toLowerCase()] || '⚪';
+      const cc = ev.country ? `${ev.country} · ` : '';
+      return `${em} \`${fmt12(et.hhmm)}\`  ${cc}${ev.event}`;
+    }).join('\n');
+  }
+
+  const payload = { embeds:[{
+    title: `📅 ${dateLabel} — Economic Events`,
+    description: body,
+    color: 0x5865F2,
+    footer:{ text:`AziziBot · ${todays.length} events${ECON_MIN_IMPACT!=='Low'?` · ${ECON_MIN_IMPACT}+`:''}` },
+    timestamp: new Date().toISOString()
+  }]};
+
+  const target = ECON_EVENTS_WH || MAIN_CHAT_WH;
+  if(!target){ console.log('[Econ] digest suppressed — no ECON_EVENTS_WH/MAIN_CHAT_WH'); return; }
+  await postToWebhook(target, {username:'AziziBot', ...payload});
+  econDigestSentFor = today;
+  console.log(`[Econ] digest posted → ${ECON_EVENTS_WH?'#econ-events':'#main-chat (fallback)'} (${todays.length} events)`);
+}
+
+// ── Per-event pre-alert: fire ~ECON_PREALERT_MIN before each event ───────────
+async function checkEconPreAlerts(){
+  const all = await fetchEconToday();
+  if(!all) return;
+  const today = todayETKey();
+  const nowMin = getET().etMin;
+
+  for(const ev of all){
+    if(!impactOK(ev.impact)) continue;
+    if(ECON_COUNTRIES && !ECON_COUNTRIES.includes(ev.country)) continue;
+    const et = econEventET(ev);
+    if(!et || et.dateKey !== today) continue;
+
+    const lead = et.etMin - nowMin;              // minutes until event
+    // Fire once when we're within the pre-alert window (0..ECON_PREALERT_MIN).
+    if(lead > ECON_PREALERT_MIN || lead < 0) continue;
+
+    const key = `${today}|${et.hhmm}|${ev.country}|${ev.event}`;
+    if(econPreAlerted.has(key)) continue;
+    econPreAlerted.add(key);
+
+    const imp = String(ev.impact||'').toLowerCase();
+    const em  = IMPACT_EMOJI[imp] || '⚪';
+    const railColor = imp==='high'?0xE24B4A : imp==='medium'?0xEF9F27 : 0x888780;
+    const cc = ev.country ? `${ev.country}  ` : '';
+    const impLabel = ev.impact ? `${ev.impact} Impact` : '';
+
+    // Optional est/prev context if present.
+    const ctx = [];
+    if(ev.estimate!=null && ev.estimate!=='') ctx.push(`est ${ev.estimate}`);
+    if(ev.previous!=null && ev.previous!=='') ctx.push(`prev ${ev.previous}`);
+
+    const payload = { embeds:[{
+      color: railColor,
+      description: `${em}  **${ev.event}**\n-# ${cc}\`${fmt12(et.hhmm)}\`  ${impLabel}${ctx.length?`  ·  ${ctx.join(' · ')}`:''}`
+    }]};
+
+    const target = ECON_EVENTS_WH || MAIN_CHAT_WH;
+    if(!target) continue;
+    await postToWebhook(target, {username:'AziziBot', ...payload});
+    console.log(`[Econ] pre-alert (${lead}m) → ${ev.event} @ ${et.hhmm} ET [${ev.impact}]`);
+  }
+}
+
 const BIG_MOVER_HALT_THRESHOLD = 30; // % — mirror halts to main-chat when |chgPct| >= this
 
 // ─── Session tiers ────────────────────────────────────────────────────────────
@@ -2986,6 +3144,8 @@ async function main(){
   console.log(`[Webhooks] PR_NEWS_WH:      ${PR_NEWS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → PR/SEC fall back to MAIN_CHAT_WH' : 'MISSING → PR/SEC alerts SUPPRESSED')}`);
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
+  console.log(`[Webhooks] ECON_EVENTS_WH:   ${ECON_EVENTS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → econ falls back to MAIN_CHAT_WH' : 'MISSING → econ SUPPRESSED')}`);
+  console.log(`[Econ] FMP_KEY: ${FMP_KEY ? 'set' : 'MISSING → economic events disabled'} · impact filter: ${ECON_MIN_IMPACT}+ · pre-alert: ${ECON_PREALERT_MIN}min`);
   console.log(`[Pollers]  news: 5s · halts: 5s · filings: 30s · main loop: 20s`);
 
   // Check Discord session_start_limit before connecting
@@ -3067,6 +3227,12 @@ async function main(){
       console.log(`[Daily] recentRunners: ${recentRunners.size} tickers kept`);console.log('[Daily] Reset');}
     await checkMorningSnapshot();
     await checkBellAlerts();
+    // Economic events: digest fires once at 7:00 AM ET; pre-alerts checked every minute.
+    try {
+      const _et = getET();
+      if(_et.hh===7 && _et.m===0) await postEconDigest();
+      await checkEconPreAlerts();
+    } catch(e){ console.error('[Econ] loop error:', e.message); }
     await syncHighsAtTransition();
     await refreshRegSHO(); // self-rate-limits to 23h, safe to call every minute
   },60*1000);
