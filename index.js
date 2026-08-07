@@ -1729,6 +1729,40 @@ const SPIKE_RE=/collaboration|agreement|partnership|FDA|approval|cleared|grant|a
 // dormant. Different from shouldAlertHalt (halts need movement context;
 // news doesn't).
 const newsQualCache = new Map(); // ticker → {result, ts} — 1-min cache
+// STRICT gate for EDGAR filings ONLY. User rule: instant filings should fire
+// ONLY for hot names — top % gainers of the day (the real 5-10 runners) plus the
+// watchlist — and priced UNDER $15. The general isQualifyingForNews() below is
+// too loose for this (it passes anything $0.01–$100 with "alive" volume, which
+// let $50/$100 non-runners through). This gate does NOT use that fallback.
+const EDGAR_MAX_PRICE = 15;   // filings alerts only for stocks under this price
+async function isQualifyingForFiling(ticker){
+  if(isBadTicker(ticker) || isEtf(ticker)) return false;
+  // Must be a genuinely HOT name: today's gappers, recent runners, or watchlist.
+  const isHot = topGappers.some(g => g.ticker === ticker) ||
+                recentRunners.has(ticker) ||
+                dayWatchlist.has(ticker) ||
+                permanentWatch.has(ticker);
+  if(!isHot) return false;
+  // Permanent watchlist is user-curated — allow regardless of price.
+  if(permanentWatch.has(ticker)) return true;
+  // For gappers/runners/day-watch: enforce the under-$15 price cap.
+  // Prefer the price already tracked in state (no extra API call); fall back to a snapshot.
+  let price = 0;
+  const st = state.tickers.get(ticker);
+  if(st && st.lastPrice) price = st.lastPrice;
+  const g = topGappers.find(x => x.ticker === ticker);
+  if(!price && g && g.price) price = g.price;
+  if(!price){
+    try{
+      const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+      const td = snap && snap.ticker;
+      price = (td && ((td.lastTrade&&td.lastTrade.p)||(td.day&&td.day.c)||(td.prevDay&&td.prevDay.c))) || 0;
+    }catch(e){}
+  }
+  if(!price) return false;                 // unknown price → don't alert
+  return price > 0 && price < EDGAR_MAX_PRICE;
+}
+
 async function isQualifyingForNews(ticker){
   // Tracked tickers always qualify — no API call needed
   if(topGappers.some(g => g.ticker === ticker) ||
@@ -1958,7 +1992,7 @@ async function pollAllFilings(){
       let fired = false;
       for(const ticker of tickers){
         if(fired) break;
-        const qualifying = await isQualifyingForNews(ticker);
+        const qualifying = await isQualifyingForFiling(ticker);   // STRICT: hot names, under $15
         if(!qualifying) continue;
         state.sentFilings.add(id);
         await postEventAlert(ticker, {
@@ -2073,7 +2107,7 @@ async function pollEdgarFilings(){
       if(firstEdgarPoll){ state.sentFilings.add(id); baselined++; continue; }
       if(!FILINGS_FORM_TYPES.has(formType)) continue;
 
-      const qualifying = await isQualifyingForNews(ticker);
+      const qualifying = await isQualifyingForFiling(ticker);   // STRICT: hot names, under $15
       if(!qualifying) continue;
 
       state.sentFilings.add(id);
