@@ -3133,6 +3133,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
+  console.log('[BUILD] econ-selftest-v2 · 2026-08-07');
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
   console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/bell alerts SUPPRESSED'}`);
@@ -3141,6 +3142,22 @@ async function main(){
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
   console.log(`[Webhooks] ECON_EVENTS_WH:   ${ECON_EVENTS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → econ falls back to MAIN_CHAT_WH' : 'MISSING → econ SUPPRESSED')}`);
   console.log(`[Econ] FMP_KEY: ${FMP_KEY ? 'set' : 'MISSING → economic events disabled'} · impact filter: ${ECON_MIN_IMPACT}+ · pre-alert: ${ECON_PREALERT_MIN}min`);
+  // BOOT SELF-TEST: fetch FMP once on startup so we know immediately whether the
+  // key works and data flows — instead of waiting for the 7AM digest window. If
+  // it returns data, post today's digest right now (once).
+  if(FMP_KEY){
+    try{
+      const testData = await fetchEconToday();
+      if(!Array.isArray(testData)){
+        console.log('[Econ] SELF-TEST FAILED — FMP returned no array. Check key validity / plan. Raw:', JSON.stringify(testData).slice(0,200));
+      } else {
+        const todayCount = testData.filter(ev=>{const e=econEventET(ev);return e&&e.dateKey===todayETKey();}).length;
+        console.log(`[Econ] SELF-TEST OK — FMP returned ${testData.length} events (${todayCount} today). Sample: ${testData[0]?JSON.stringify({event:testData[0].event,country:testData[0].country,impact:testData[0].impact,date:testData[0].date}):'none'}`);
+        console.log('[Econ] posting today\'s digest now (boot test)...');
+        await postEconDigest();
+      }
+    }catch(e){ console.error('[Econ] SELF-TEST ERROR:', e.message); }
+  }
   console.log(`[Pollers]  news: 5s · halts: 5s · filings: 30s · main loop: 20s`);
 
   // Check Discord session_start_limit before connecting
