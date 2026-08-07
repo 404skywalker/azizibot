@@ -1993,6 +1993,113 @@ async function pollAllFilings(){
   }
 }
 
+// ─── SEC EDGAR direct (INSTANT filings) ────────────────────────────────────────
+// Polygon's /vX/reference/filings is a reseller feed with minutes of ingestion
+// lag. EDGAR's own getcurrent Atom feed publishes the instant SEC accepts a
+// filing — no key, truly real-time. We poll it fast (~15s) and run every filing
+// through the SAME isQualifyingForNews() gate, so ONLY hot runners + watchlist
+// alert — never the whole market. Shared sentFilings dedup means whichever source
+// (EDGAR or Polygon) sees it first wins; the other skips.
+// EDGAR gives CIK, not ticker — we resolve CIK→ticker via SEC's free, keyless
+// company_tickers.json, loaded once at boot and cached.
+// REQUIRES: www.sec.gov on Railway's egress allowlist + a real contact in the UA.
+const EDGAR_UA = process.env.EDGAR_CONTACT || 'AziziBot filings@azizibot.local';
+const cikToTicker = new Map();   // "0000789019" (padded) → "MSFT"
+
+async function loadCikMap(){
+  try{
+    const raw = await rawGet('https://www.sec.gov/files/company_tickers.json', { 'User-Agent': EDGAR_UA });
+    const data = JSON.parse(raw);
+    // Format: { "0": {cik_str:789019, ticker:"MSFT", title:"MICROSOFT CORP"}, ... }
+    let n = 0;
+    for(const k in data){
+      const row = data[k];
+      if(row && row.cik_str && row.ticker){
+        const padded = String(row.cik_str).padStart(10, '0');
+        cikToTicker.set(padded, String(row.ticker).toUpperCase());
+        n++;
+      }
+    }
+    console.log(`[EDGAR] CIK→ticker map loaded: ${n} companies`);
+  }catch(e){
+    console.error('[EDGAR] failed to load company_tickers.json:', e.message, '— add www.sec.gov to allowlist; EDGAR filings disabled until then');
+  }
+}
+
+let pollEdgarInProgress = false;
+let lastEdgarPoll = 0;
+let firstEdgarPoll = true;
+
+async function pollEdgarFilings(){
+  if(!cikToTicker.size) return;          // map not loaded (blocked/failed) → skip
+  if(pollEdgarInProgress) return;
+  if(Date.now() - lastEdgarPoll < 15_000) return;
+  pollEdgarInProgress = true;
+  lastEdgarPoll = Date.now();
+  try{
+    const url = 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&company=&dateb=&owner=include&count=100&output=atom';
+    const xml = await rawGet(url, { 'User-Agent': EDGAR_UA, 'Accept': 'application/atom+xml' });
+    if(!xml || xml.indexOf('<entry>') < 0){
+      if(String(xml).match(/403|forbidden|denied|declared automated/i))
+        console.log('[EDGAR] request BLOCKED — check www.sec.gov allowlist + EDGAR_CONTACT.');
+      return;
+    }
+
+    const entries = xml.split('<entry>').slice(1);
+    let processed = 0, baselined = 0;
+
+    for(const e of entries){
+      const grab = (re) => { const m = e.match(re); return m ? m[1].trim() : ''; };
+      const title   = grab(/<title>([\s\S]*?)<\/title>/);
+      const link    = grab(/<link[^>]*href="([^"]+)"/);
+      const updated = grab(/<updated>([\s\S]*?)<\/updated>/);
+      const formCat = grab(/<category[^>]*term="([^"]+)"/);
+      const id      = (link || title).slice(0, 90);
+      if(!id) continue;
+
+      // CIK is in the filing URL: .../data/789019/000... or in a <cik> style field.
+      // getcurrent links look like /cgi-bin/browse-edgar?...&CIK=0000789019... or
+      // the entry contains the CIK in the link path. Grab a 10-digit (or raw) CIK.
+      let cik = '';
+      const cikM = e.match(/CIK=(\d{1,10})/) || link.match(/\/data\/(\d{1,10})\//) || e.match(/>\s*(\d{10})\s*</);
+      if(cikM) cik = String(cikM[1]).padStart(10, '0');
+      if(!cik) continue;
+
+      const ticker = cikToTicker.get(cik);
+      if(!ticker || isBadTicker(ticker)) continue;
+
+      let formType = (formCat || (title.split(' - ')[0] || '')).toUpperCase().trim();
+      if(state.sentFilings.has(id)) continue;
+      if(firstEdgarPoll){ state.sentFilings.add(id); baselined++; continue; }
+      if(!FILINGS_FORM_TYPES.has(formType)) continue;
+
+      const qualifying = await isQualifyingForNews(ticker);
+      if(!qualifying) continue;
+
+      state.sentFilings.add(id);
+      await postEventAlert(ticker, {
+        type: 'SEC',
+        title: `Form ${formType}`,
+        url: link,
+        publishedTime: updated,
+        isDrop: false,
+      }).catch(err => console.error(`[EDGAR] postEventAlert ${ticker}:`, err.message));
+      processed++;
+    }
+
+    if(firstEdgarPoll){
+      console.log(`[EDGAR] connected ✓ baseline: ${baselined} pre-existing filing(s) skipped`);
+      firstEdgarPoll = false;
+    } else if(processed > 0){
+      console.log(`[EDGAR] ${processed} instant filing alert(s)`);
+    }
+  } catch(e){
+    console.error('[EDGAR] error:', e.message);
+  } finally {
+    pollEdgarInProgress = false;
+  }
+}
+
 // ─── Halt alerts (NASDAQ RSS) ─────────────────────────────────────────────────
 // NASDAQ Trader publishes a free, real-time RSS feed of all US equity trade
 // halts. Polled every 5s (own setInterval, decoupled from main loop).
@@ -3182,7 +3289,8 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] econ-selftest-v2 · 2026-08-07');
+  console.log('[BUILD] edgar-filings-v1 · 2026-08-07');
+  await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
   console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/bell alerts SUPPRESSED'}`);
@@ -3278,6 +3386,12 @@ async function main(){
   setInterval(async()=>{
     try { await pollAllFilings(); } catch(e){ console.error('[Filings] loop error:', e.message); }
   }, 30*1000);
+
+  // SEC EDGAR direct — the INSTANT fast path, polled every 15s. Runs the same
+  // hot+watchlist qualifier as Polygon; shared dedup so no double alerts.
+  setInterval(async()=>{
+    try { await pollEdgarFilings(); } catch(e){ console.error('[EDGAR] loop error:', e.message); }
+  }, 15*1000);
 
   setInterval(async()=>{
     const {hh,m}=getET();
