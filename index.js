@@ -1118,6 +1118,61 @@ const closePrice=new Map(); // ticker → price at 4PM close
 // Used to expand news coverage beyond just today's movers
 const recentRunners=new Map(); // ticker → timestamp when last seen as gapper
 
+// recentRunners is critical for filings scope (a stock that ran in the last few
+// days qualifies even if red today — XHLD class). But a plain in-memory Map is
+// WIPED on every restart/deploy, so its "5-day memory" was really "memory since
+// last deploy" — with frequent deploys, often just hours. XHLD ran hundreds of %
+// yesterday but its entry vanished on a deploy, so its filings didn't alert.
+// FIX (both): (1) persist to a runtime file so soft restarts/crashes don't lose
+// it, and (2) REBUILD from Polygon grouped daily bars on startup so it's
+// deploy-proof — reconstructed from real data every boot regardless of the file.
+const RUNNERS_FILE = './recent-runners.json';
+
+function saveRecentRunners(){
+  try{ fs.writeFileSync(RUNNERS_FILE, JSON.stringify(Object.fromEntries(recentRunners))); }
+  catch(e){ console.error('[Runners] save failed:', e.message); }
+}
+function loadRecentRunners(){
+  try{
+    if(fs.existsSync(RUNNERS_FILE)){
+      const saved = JSON.parse(fs.readFileSync(RUNNERS_FILE,'utf-8'));
+      let n=0; for(const [t,ts] of Object.entries(saved)){ recentRunners.set(t, ts); n++; }
+      if(n) console.log(`[Runners] restored ${n} from disk`);
+    }
+  }catch(e){ console.error('[Runners] load failed:', e.message); }
+}
+
+// Rebuild recentRunners from the last N trading days of Polygon grouped daily
+// bars. One call per day returns every US stock's OHLCV; we flag any that moved
+// >= RUNNER_MIN_PCT with real volume as a recent runner. Deploy-proof.
+const RUNNER_LOOKBACK_DAYS = 5;
+const RUNNER_MIN_PCT = 50;        // >= 50% day move = a "runner"
+const RUNNER_MIN_VOL = 500_000;   // with real volume
+async function rebuildRecentRunners(){
+  let added = 0;
+  const now = new Date();
+  for(let back=1; back<=7 && added<9999; back++){   // scan back up to 7 cal days to get ~5 trading days
+    const d = new Date(now.getTime() - back*24*60*60*1000);
+    const dow = d.getUTCDay();
+    if(dow===0 || dow===6) continue;                // skip weekends
+    const ds = d.toISOString().slice(0,10);
+    try{
+      const r = await polyGet(`/v2/aggs/grouped/locale/us/market/stocks/${ds}?adjusted=true`);
+      const results = (r && r.results) || [];
+      for(const bar of results){
+        const t = bar.T, o = bar.o, c = bar.c, v = bar.v;
+        if(!t || !o || !c || !v) continue;
+        const pct = (c - o) / o * 100;
+        if(pct >= RUNNER_MIN_PCT && v >= RUNNER_MIN_VOL && !isBadTicker(t)){
+          if(!recentRunners.has(t)){ recentRunners.set(t, d.getTime()); added++; }
+        }
+      }
+    }catch(e){ /* skip a day that errors */ }
+  }
+  console.log(`[Runners] rebuilt from Polygon: +${added} runners (last ${RUNNER_LOOKBACK_DAYS} trading days, >=${RUNNER_MIN_PCT}% & ${fmtN(RUNNER_MIN_VOL)} vol)`);
+  saveRecentRunners();
+}
+
 // permanentWatch: loaded from watchlist.txt — monitored forever, no gates
 const permanentWatch=new Set();
 let lastWatchlistRead=0;
@@ -1290,6 +1345,7 @@ async function refreshGappers(){
           dayWatchlist.set(g.ticker,{ticker:g.ticker,chgPct:g.chgPct,volume:g.volume,
             rvol:g.rvol,price:g.price,high:g.high,lockedAt:name});
           recentRunners.set(g.ticker, Date.now());
+          saveRecentRunners();
           console.log(`[Watch] +${g.ticker} +${g.chgPct.toFixed(1)}% vol:${fmtN(g.volume)} [${name}]`);
         }
       }
@@ -1927,6 +1983,10 @@ const FILINGS_FORM_TYPES = new Set([
   '6-K', '20-F', '40-F',
   'SC 13D', 'SC 13G', 'SC 13D/A', 'SC 13G/A',
   '425', 'DEF 14A',
+  // Offering / dilution / effectiveness forms (XHLD class — a registration going
+  // effective or a new shelf is a real catalyst for a recent runner).
+  'EFFECT', '424B7', '424B8', 'S-3ASR', 'S-1MEF', 'S-3MEF',
+  'FWP', '8-A12B', 'CERT', 'POS AM', 'RW', 'AW',
 ]);
 
 // Check recent filings for a single ticker. Shared between the news-triggered
@@ -3339,6 +3399,8 @@ async function main(){
   console.log('🤖 AziziBot v8 starting...');
   console.log('[BUILD] edgar-filings-v1 · 2026-08-07');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
+  loadRecentRunners();  // restore persisted runners (survives soft restarts)
+  await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
   console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/bell alerts SUPPRESSED'}`);
