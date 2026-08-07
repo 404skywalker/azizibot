@@ -1156,27 +1156,41 @@ async function postEventAlert(ticker, event) {
   const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
   if (price < 0.10) { console.log(`[Alert] ${ticker} skip: price ${price}`); return; }
 
-  const [det, fv] = await Promise.all([
-    getTickerDetails(ticker), getFinvizStats(ticker),
-  ]);
-  const mc = det.market_cap || 0;
+  const chgPct = (td && td.todaysChangePerc) || 0;
+  const fv = await getFinvizStats(ticker);
   const { timeStr } = getET();
   const timeShort = timeStr.slice(0, 5);
 
-  const ioStr = fv.io !== '--' ? ` | **IO:** ${fv.io}` : '';
-  const mcStr = mc > 0 ? ` | **MC:** ${fmtNS(mc)}` : '';
-  const siStr = fv.si !== '--' ? ` | **SI:** ${fv.si}` : '';
-  const header = `\`${timeShort}\` ↗ **${ticker}** ${priceFlag(price)} ~ ${flag(ticker)}${ioStr}${mcStr}${siStr}`;
+  // Header matches the trading-alert look: dot, $ticker, flag, arrow, price, %.
+  const dot = chgPct >= 0 ? '🟢' : '🔴';
+  const EN=' ', TH=' ', G=EN+TH;
+  const header = `${dot} **$${ticker}**${G}${flag(ticker)}${G}↗ ${priceFlag(price)} ${chgPct.toFixed(0)}%`;
+  const sub = [];
+  if(fv.si!=='--') sub.push(`**SI** ${fv.si}`);
+  if(fv.io!=='--') sub.push(`**IO** ${fv.io}`);
+  sub.push(timeShort);
+  const subLine = `-# ${sub.join(EN+'|'+EN)}`;
 
+  // Event bullet — matches the mockup: > • [time ago] [TYPE] Title - Link
   const ageMs = Date.now() - new Date(event.publishedTime || Date.now()).getTime();
   const ageStr = fmtAge(Math.max(ageMs, 0));
-  const typePill = `\`${event.type}\``; // `PR` or `SEC`
+  const typePill = `\`${event.type}\``;
   const titlePart = event.title || '';
   const linkPart = event.url ? ` - [Link](<${event.url}>)` : '';
   const bullet = `> • \`${ageStr}\` ${typePill} ${titlePart}${linkPart}`;
 
-  await postPRNews({ content: `${header}\n${bullet}` });
-  console.log(`[Alert] ${ticker} ${event.type} posted to PR/news channel`);
+  const msg = `${header}\n${subLine}\n${bullet}`;
+
+  // Route: always PR/news channel; ALSO mirror to Main chat for top gainers +
+  // watchlist runners (user rule).
+  const isTopName = permanentWatch.has(ticker) || dayWatchlist.has(ticker) ||
+                    topGappers.slice(0,10).some(g=>g.ticker===ticker) ||
+                    recentRunners.has(ticker);
+  await postPRNews({ content: msg });
+  if(isTopName && MAIN_CHAT_WH){
+    await postToWebhook(MAIN_CHAT_WH, { content: msg }).catch(()=>{});
+  }
+  console.log(`[Alert] ${ticker} ${event.type} posted${isTopName?' (+ main-chat mirror)':''}`);
 }
 
 function loadPermanentWatchlist(){
