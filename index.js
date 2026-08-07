@@ -1659,9 +1659,11 @@ async function fireLunge(ticker, price, minuteVol){
   // Distinct `LUNGE` pill so it reads differently from NHOD at a glance.
   // NEW LOOK: rocket leads, matches NHOD two-weight system. Distinct so a lunge
   // never reads like an NHOD at a glance.
-  const lungeHead = `🚀 **${ticker}**  ${flag(ticker)}  ${priceFlag(price)}  \`+${movePct.toFixed(0)}%\`  \`LUNGE\``;
-  const lungeMeta = [`Vel ${velPerMin.toFixed(0)}%/min`];
-  if(dayV>0) lungeMeta.push(`Vol ${fmtNS(dayV)}`);
+  // Option C: price ARC ($low→$now) shows where the move came from; NO flag; SPIKE label.
+  const priceArc = `$${windowLow.toFixed(2)} → $${price.toFixed(2)}`;
+  const lungeHead = `🚀 **$${ticker}**  **${priceArc}** +${movePct.toFixed(0)}%  \`SPIKE\``;
+  const lungeMeta = [`${velPerMin.toFixed(0)}%/min **Vel**`];
+  if(dayV>0) lungeMeta.push(`**Vol** ${fmtNS(dayV)}`);
   lungeMeta.push(timeShort);
   const line = lungeHead + '\n-# ' + lungeMeta.join(' | ');
 
