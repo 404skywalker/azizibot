@@ -40,6 +40,7 @@ const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || '').split(',').map(s=>s.tr
 // ═══════════════════════════════════════════════════════════════════════════
 const ECON_EVENTS_WH = process.env.ECON_EVENTS_WH || '';
 const FMP_KEY        = process.env.FMP_KEY || '';
+const FINNHUB_KEY    = process.env.FINNHUB_KEY || '';
 const ECON_MIN_IMPACT = 'Low';              // 'Low' | 'Medium' | 'High'  (Low = show all)
 const ECON_PREALERT_MIN = 15;               // fire pre-alert this many minutes before
 const ECON_COUNTRIES = null;                // null = all countries; or ['US','EU',...]
@@ -55,19 +56,67 @@ function impactOK(imp){
 let econDigestSentFor = '';                 // 'YYYY-MM-DD' of last digest
 const econPreAlerted = new Set();           // keys of events already pre-alerted
 
-// Fetch today's events (ET calendar day). FMP returns UTC timestamps in `date`.
+// Fetch today's events (ET calendar day). FMP moved economic calendar from the
+// legacy /api/v3/economic_calendar to the new /stable/economics-calendar. Legacy
+// returns null for newer accounts. Try stable first, fall back to legacy, and log
+// the raw shape of each so failures are diagnosable (premium-gate vs empty vs 403).
 async function fetchEconToday(){
-  if(!FMP_KEY){ return null; }
-  // Pull a 2-day window (today + tomorrow UTC) so late-ET events aren't cut by
-  // the UTC date boundary, then filter to the ET day.
   const now = new Date();
   const fmt = d => d.toISOString().slice(0,10);
   const from = fmt(new Date(now.getTime() - 24*60*60*1000));
   const to   = fmt(new Date(now.getTime() + 24*60*60*1000));
-  const url = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`;
-  const data = await jsonGet(url);
-  if(!Array.isArray(data)) return null;
-  return data;
+
+  // ── Finnhub (primary) ──────────────────────────────────────────────────────
+  // Returns {economicCalendar:[{event,country,impact,time,actual,estimate,prev}]}.
+  // impact is 'low'|'medium'|'high'. time is "YYYY-MM-DD HH:mm:ss" (UTC).
+  if(FINNHUB_KEY){
+    try{
+      const url = `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${FINNHUB_KEY}`;
+      const data = await jsonGet(url);
+      const rows = data && Array.isArray(data.economicCalendar) ? data.economicCalendar : null;
+      if(rows && rows.length){
+        console.log(`[Econ] fetch OK via Finnhub (${rows.length} rows)`);
+        return rows.map(r => ({
+          event:    r.event || '',
+          country:  r.country || '',
+          impact:   r.impact || '',
+          date:     r.time || '',                          // "YYYY-MM-DD HH:mm:ss" UTC
+          estimate: (r.estimate != null ? r.estimate : null),
+          previous: (r.prev != null ? r.prev : null),
+          actual:   (r.actual != null ? r.actual : null),
+        }));
+      }
+      console.log(`[Econ] Finnhub returned no usable data: ${JSON.stringify(data).slice(0,180)}`);
+    }catch(e){ console.log(`[Econ] Finnhub fetch error: ${e.message}`); }
+  }
+
+  // ── FMP (fallback, if key present) ─────────────────────────────────────────
+  if(FMP_KEY){
+    const endpoints = [
+      `https://financialmodelingprep.com/stable/economics-calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`,
+      `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`,
+    ];
+    for(const url of endpoints){
+      try{
+        const data = await jsonGet(url);
+        const tag = url.includes('/stable/') ? 'FMP-stable' : 'FMP-legacy';
+        if(Array.isArray(data) && data.length){
+          console.log(`[Econ] fetch OK via ${tag} (${data.length} rows)`);
+          return data.map(r => ({
+            event:    r.event || r.name || r.indicator || '',
+            country:  r.country || r.currency || '',
+            impact:   r.impact || r.importance || '',
+            date:     r.date || r.dateTime || r.time || '',
+            estimate: (r.estimate != null ? r.estimate : (r.consensus != null ? r.consensus : r.forecast)),
+            previous: r.previous,
+            actual:   r.actual,
+          }));
+        }
+        console.log(`[Econ] ${tag} returned no usable data: ${JSON.stringify(data).slice(0,150)}`);
+      }catch(e){ console.log(`[Econ] ${url.includes('/stable/')?'FMP-stable':'FMP-legacy'} error: ${e.message}`); }
+    }
+  }
+  return null;
 }
 
 // Convert an FMP event `date` (UTC "YYYY-MM-DD HH:mm:ss") to ET parts.
@@ -3141,11 +3190,11 @@ async function main(){
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
   console.log(`[Webhooks] ECON_EVENTS_WH:   ${ECON_EVENTS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → econ falls back to MAIN_CHAT_WH' : 'MISSING → econ SUPPRESSED')}`);
-  console.log(`[Econ] FMP_KEY: ${FMP_KEY ? 'set' : 'MISSING → economic events disabled'} · impact filter: ${ECON_MIN_IMPACT}+ · pre-alert: ${ECON_PREALERT_MIN}min`);
+  console.log(`[Econ] FINNHUB_KEY: ${FINNHUB_KEY ? 'set' : 'not set'} · FMP_KEY: ${FMP_KEY ? 'set (fallback)' : 'not set'} · ${(FINNHUB_KEY||FMP_KEY)?'':'⚠ NO SOURCE → econ disabled'} · filter: ${ECON_MIN_IMPACT}+ · pre-alert: ${ECON_PREALERT_MIN}min`);
   // BOOT SELF-TEST: fetch FMP once on startup so we know immediately whether the
   // key works and data flows — instead of waiting for the 7AM digest window. If
   // it returns data, post today's digest right now (once).
-  if(FMP_KEY){
+  if(FINNHUB_KEY || FMP_KEY){
     try{
       const testData = await fetchEconToday();
       if(!Array.isArray(testData)){
