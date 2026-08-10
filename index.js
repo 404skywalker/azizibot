@@ -1314,18 +1314,27 @@ function loadRecentRunners(){
 }
 
 // Rebuild recentRunners from the last N trading days of Polygon grouped daily
-// bars. One call per day returns every US stock's OHLCV; we flag any that moved
-// >= RUNNER_MIN_PCT with real volume as a recent runner. Deploy-proof.
-const RUNNER_LOOKBACK_DAYS = 5;
-const RUNNER_MIN_PCT = 50;        // >= 50% day move = a "runner"
-const RUNNER_MIN_VOL = 500_000;   // with real volume
+// bars — but STRICTLY, so only genuine big runners (XHLD class: sub-$1 to $5)
+// qualify, never marginal one-day blips (OCG class). Three gates:
+//   1. Big move: >= RUNNER_MIN_PCT (100%) open→close on the run day
+//   2. Real volume: >= RUNNER_MIN_VOL (1M)
+//   3. STILL ELEVATED: current price still >= RUNNER_HOLD_MULT × the run day's
+//      OPEN — i.e. it hasn't round-tripped back down. A stock that popped 100%
+//      then faded to nothing fails this and is NOT treated as a runner.
+const RUNNER_LOOKBACK_DAYS = 3;   // only the last few days count as "recent"
+const RUNNER_MIN_PCT = 100;       // >= 100% day move — a REAL runner, not a blip
+const RUNNER_MIN_VOL = 1_000_000; // with heavy volume
+const RUNNER_HOLD_MULT = 1.5;     // still trading >= 1.5x the run day's open
 async function rebuildRecentRunners(){
-  let added = 0;
+  let added = 0, checked = 0;
   const now = new Date();
-  for(let back=1; back<=7 && added<9999; back++){   // scan back up to 7 cal days to get ~5 trading days
+  const candidates = [];   // {ticker, runOpen, ts}
+  let tradingDays = 0;
+  for(let back=1; back<=6 && tradingDays<RUNNER_LOOKBACK_DAYS; back++){
     const d = new Date(now.getTime() - back*24*60*60*1000);
     const dow = d.getUTCDay();
     if(dow===0 || dow===6) continue;                // skip weekends
+    tradingDays++;
     const ds = d.toISOString().slice(0,10);
     try{
       const r = await polyGet(`/v2/aggs/grouped/locale/us/market/stocks/${ds}?adjusted=true`);
@@ -1335,12 +1344,28 @@ async function rebuildRecentRunners(){
         if(!t || !o || !c || !v) continue;
         const pct = (c - o) / o * 100;
         if(pct >= RUNNER_MIN_PCT && v >= RUNNER_MIN_VOL && !isBadTicker(t)){
-          if(!recentRunners.has(t)){ recentRunners.set(t, d.getTime()); added++; }
+          candidates.push({ ticker: t, runOpen: o, ts: d.getTime() });
         }
       }
     }catch(e){ /* skip a day that errors */ }
   }
-  console.log(`[Runners] rebuilt from Polygon: +${added} runners (last ${RUNNER_LOOKBACK_DAYS} trading days, >=${RUNNER_MIN_PCT}% & ${fmtN(RUNNER_MIN_VOL)} vol)`);
+  // Gate 3: only keep candidates STILL elevated vs their run-day open.
+  for(const c of candidates){
+    if(recentRunners.has(c.ticker)) continue;
+    checked++;
+    let cur = 0;
+    try{
+      const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${c.ticker}`);
+      const td = snap && snap.ticker;
+      cur = (td && ((td.lastTrade&&td.lastTrade.p)||(td.day&&td.day.c)||(td.prevDay&&td.prevDay.c))) || 0;
+    }catch(e){}
+    if(cur > 0 && cur >= c.runOpen * RUNNER_HOLD_MULT){
+      recentRunners.set(c.ticker, c.ts);
+      added++;
+    }
+    // else: popped and faded (OCG class) → NOT a runner, skip.
+  }
+  console.log(`[Runners] rebuilt: ${candidates.length} big movers found, ${added} still-elevated runners kept (>=${RUNNER_MIN_PCT}% & ${fmtN(RUNNER_MIN_VOL)} vol, still >=${RUNNER_HOLD_MULT}x, last ${RUNNER_LOOKBACK_DAYS}d)`);
   saveRecentRunners();
 }
 
@@ -2007,7 +2032,27 @@ async function isQualifyingForFiling(ticker){
     }catch(e){}
   }
   if(!price) return false;                 // unknown price → don't alert
-  return price > 0 && price < EDGAR_MAX_PRICE;
+  if(!(price > 0 && price < EDGAR_MAX_PRICE)) return false;
+  // Final guard against OCG-class leaks: a name in recentRunners that has since
+  // faded is NOT worth a filing alert. Require it to still be moving OR still
+  // near its recent highs. If it's dead flat and off its highs, skip.
+  //  - today's gappers/day-watch are inherently live → allowed
+  //  - a recentRunner must show it's still active: today's % change is non-trivial
+  //    OR price is within reach of the day high (not fully round-tripped).
+  const liveToday = topGappers.some(g => g.ticker === ticker) || dayWatchlist.has(ticker);
+  if(liveToday) return true;
+  // recentRunners-only path: verify it's still elevated/active via snapshot.
+  try{
+    const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    const td = snap && snap.ticker;
+    const chg = (td && Math.abs(td.todaysChangePerc||0)) || 0;
+    const hi  = (td && td.day && td.day.h) || 0;
+    const cur = (td && ((td.lastTrade&&td.lastTrade.p)||(td.day&&td.day.c))) || price;
+    // Still active if: moving >=10% today, OR trading within 25% of today's high.
+    const nearHigh = hi>0 && cur >= hi*0.75;
+    if(chg >= 10 || nearHigh) return true;
+    return false;   // faded, flat, off highs → OCG class → no alert
+  }catch(e){ return false; }
 }
 
 async function isQualifyingForNews(ticker){
