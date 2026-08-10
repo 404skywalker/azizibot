@@ -1402,8 +1402,14 @@ async function postEventAlert(ticker, event) {
   const ageStr = fmtAge(Math.max(ageMs, 0));
   const typePill = `\`${event.type}\``;
   const titlePart = event.title || '';
+  // Dilution tag: shelf/offering/prospectus/effectiveness forms mean the company
+  // is registering or selling shares. Flag these so they stand out from routine 8-Ks.
+  const DILUTION_FORMS = ['S-1','S-3','F-1','F-3','424B','EFFECT','S-3ASR','POS AM','FWP','S-1MEF','S-3MEF','RW','AW','425'];
+  const upperTitle = titlePart.toUpperCase();
+  const isDilution = DILUTION_FORMS.some(f => upperTitle.includes(f));
+  const dilutionTag = isDilution ? ' `💧 DILUTION`' : '';
   const linkPart = event.url ? ` - [Link](<${event.url}>)` : '';
-  const bullet = `> • \`${ageStr}\` ${typePill} ${titlePart}${linkPart}`;
+  const bullet = `> • \`${ageStr}\` ${typePill} ${titlePart}${dilutionTag}${linkPart}`;
 
   const msg = `${header}\n${subLine}\n${bullet}`;
 
@@ -3568,7 +3574,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] edgar-filings-v1 · 2026-08-07');
+  console.log('[BUILD] dilution-tag-v1 · 2026-08-10');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   loadRecentRunners();  // restore persisted runners (survives soft restarts)
   await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
