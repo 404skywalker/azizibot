@@ -41,6 +41,164 @@ const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || '').split(',').map(s=>s.tr
 const ECON_EVENTS_WH = process.env.ECON_EVENTS_WH || '';
 const FMP_KEY        = process.env.FMP_KEY || '';
 const FINNHUB_KEY    = process.env.FINNHUB_KEY || '';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BLS — Bureau of Labor Statistics (official primary source for CPI/PPI/jobs)
+// → posts to the economics channel (ECON_EVENTS_WH).
+// Two things:
+//   1. NUMBERS: poll the BLS v2 API for key series. When a series shows a NEW
+//      data point (a fresh month/quarter that wasn't there before), the release
+//      just dropped → post the actual value + prior + YoY.
+//   2. SCHEDULE: heads-up the morning of a scheduled release ("CPI drops today").
+// BLS gives actual + prior, NOT consensus estimate (a free calendar can add that
+// later). v2 API needs a free key (BLS_KEY); falls back to keyless v1.
+// ═══════════════════════════════════════════════════════════════════════════
+const BLS_KEY = process.env.BLS_KEY || '';
+
+// Key series → human label. Verified BLS v2 series IDs.
+const BLS_SERIES = {
+  'CUSR0000SA0':     'CPI (Headline, MoM SA)',
+  'CUSR0000SA0L1E':  'Core CPI (ex food/energy)',
+  'WPUFD49207':      'PPI (Final Demand)',
+  'WPUFD49104':      'Core PPI (ex food/energy)',
+  'CES0000000001':   'Nonfarm Payrolls (total jobs)',
+  'LNS14000000':     'Unemployment Rate',
+  'CES0500000003':   'Avg Hourly Earnings',
+  'JTS000000000000000JOL': 'JOLTS Job Openings',
+};
+
+// Remember the latest period we've seen per series, so we only alert on NEW prints.
+const blsLastPeriod = new Map();   // seriesId → "2026M01" (or "2026Q01")
+let blsBaselined = false;
+
+function blsPeriodLabel(p){
+  // p like "M01".."M12", "Q01".."Q04", "A01"
+  if(/^M\d\d$/.test(p)){
+    const months=['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return months[parseInt(p.slice(1))] || p;
+  }
+  if(/^Q0[1-4]$/.test(p)) return p.replace('Q0','Q');
+  return p;
+}
+
+// Fetch latest 2 data points for all series in one POST (v2 allows batching).
+async function blsFetchLatest(){
+  const body = JSON.stringify({
+    seriesid: Object.keys(BLS_SERIES),
+    latest: true,
+    ...(BLS_KEY ? { registrationkey: BLS_KEY } : {}),
+  });
+  try{
+    const url = BLS_KEY
+      ? 'https://api.bls.gov/publicAPI/v2/timeseries/data/'
+      : 'https://api.bls.gov/publicAPI/v1/timeseries/data/';
+    const raw = await postJson(url, body);   // helper defined in index.js
+    const data = JSON.parse(raw);
+    if(data.status !== 'REQUEST_SUCCEEDED' || !data.Results || !data.Results.series){
+      console.log(`[BLS] fetch not OK: ${JSON.stringify(data).slice(0,160)}`);
+      return null;
+    }
+    return data.Results.series;
+  }catch(e){ console.log(`[BLS] fetch error: ${e.message}`); return null; }
+}
+
+// Poll: detect NEW prints. Called on an interval from the main loop.
+async function pollBlsReleases(){
+  if(!ECON_EVENTS_WH){ return; }
+  const series = await blsFetchLatest();
+  if(!series) return;
+  const target = ECON_EVENTS_WH;
+
+  for(const s of series){
+    const id = s.seriesID;
+    const label = BLS_SERIES[id] || id;
+    const pts = s.data || [];
+    if(!pts.length) continue;
+    const latest = pts[0];                         // most recent point
+    const periodKey = `${latest.year}${latest.period}`;
+    const prev = pts[1];                           // prior point (for delta)
+
+    // First run: record current latest as baseline, don't alert (avoids dumping
+    // last month's prints on every restart).
+    if(!blsBaselined){ blsLastPeriod.set(id, periodKey); continue; }
+
+    const seen = blsLastPeriod.get(id);
+    if(seen === periodKey) continue;               // no new print
+    blsLastPeriod.set(id, periodKey);              // new print → remember + alert
+
+    const val = parseFloat(latest.value);
+    const pv  = prev ? parseFloat(prev.value) : null;
+    const per = `${blsPeriodLabel(latest.period)} ${latest.year}`;
+
+    // Delta vs prior print + YoY if we can find same period last year.
+    let deltaStr = '';
+    if(pv != null && !isNaN(pv)){
+      const d = val - pv;
+      deltaStr = ` (prev ${prev.value}, ${d>=0?'+':''}${d.toFixed(1)})`;
+    }
+    const yrAgo = pts.find(p => parseInt(p.year) === parseInt(latest.year)-1 && p.period === latest.period);
+    let yoyStr = '';
+    if(yrAgo){ const y = ((val - parseFloat(yrAgo.value))/parseFloat(yrAgo.value)*100); yoyStr = ` · YoY ${y>=0?'+':''}${y.toFixed(1)}%`; }
+
+    const msg = `🏛️ **BLS Release** — ${label}\n-# ${per}: **${latest.value}**${deltaStr}${yoyStr}`;
+    await postToWebhook(target, { username:'AziziBot', content: msg }).catch(()=>{});
+    console.log(`[BLS] NEW print → ${label} ${per}: ${latest.value}`);
+  }
+
+  if(!blsBaselined){
+    blsBaselined = true;
+    console.log(`[BLS] baseline set for ${series.length} series (numbers watch armed)`);
+  }
+}
+
+// ── Schedule heads-up ────────────────────────────────────────────────────────
+// BLS publishes the release schedule as a web page, not clean JSON. We fetch the
+// current-year schedule page and parse the "Release Name … Date … Time" lines,
+// then fire a morning-of heads-up. Robust to reschedules because we re-fetch.
+const blsScheduleUrl = 'https://www.bls.gov/schedule/news_release/current_year_schedule.htm';
+let blsScheduleCache = [];          // [{name, dateKey:'YYYY-MM-DD', time}]
+let blsScheduleFetchedFor = '';
+let blsHeadsUpSentFor = new Set();  // keys already announced
+
+async function refreshBlsSchedule(){
+  const today = todayETKey();
+  if(blsScheduleFetchedFor === today && blsScheduleCache.length) return;   // once/day
+  try{
+    const html = await rawGet(blsScheduleUrl, { 'User-Agent': 'AziziBot filings@azizibot.local' });
+    // Rows look like: <td>Consumer Price Index</td> ... <td>08:30 AM</td> with a date.
+    // The page is table-based; we do a light regex sweep for release rows.
+    const rows = [];
+    const re = /(Consumer Price Index|Producer Price Index|Employment Situation|Job Openings and Labor Turnover|Employment Cost Index|Productivity and Costs|Real Earnings|U\.S\. Import and Export Price Indexes)[\s\S]{0,400?}?(\d{2}\/\d{2}\/\d{4}|\w+\s+\d{1,2},\s+\d{4})[\s\S]{0,120?}?(\d{1,2}:\d{2}\s*[AP]M)/gi;
+    let m;
+    while((m = re.exec(html)) !== null){
+      const name = m[1].trim();
+      const dRaw = m[2];
+      const time = m[3];
+      const d = new Date(dRaw);
+      if(isNaN(d)) continue;
+      const p = new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(d);
+      rows.push({ name, dateKey: p, time });
+    }
+    if(rows.length){ blsScheduleCache = rows; blsScheduleFetchedFor = today; console.log(`[BLS] schedule loaded: ${rows.length} upcoming releases`); }
+    else console.log('[BLS] schedule parse found 0 rows (page format may have changed)');
+  }catch(e){ console.log(`[BLS] schedule fetch error: ${e.message}`); }
+}
+
+async function checkBlsScheduleHeadsUp(){
+  if(!ECON_EVENTS_WH) return;
+  await refreshBlsSchedule();
+  const today = todayETKey();
+  for(const r of blsScheduleCache){
+    if(r.dateKey !== today) continue;
+    const key = `${r.dateKey}|${r.name}`;
+    if(blsHeadsUpSentFor.has(key)) continue;
+    blsHeadsUpSentFor.add(key);
+    const msg = `📅 **Today** — ${r.name} releases at \`${r.time} ET\``;
+    await postToWebhook(ECON_EVENTS_WH, { username:'AziziBot', content: msg }).catch(()=>{});
+    console.log(`[BLS] heads-up → ${r.name} @ ${r.time}`);
+  }
+}
+
 const ECON_MIN_IMPACT = 'Low';              // 'Low' | 'Medium' | 'High'  (Low = show all)
 const ECON_PREALERT_MIN = 15;               // fire pre-alert this many minutes before
 const ECON_COUNTRIES = null;                // null = all countries; or ['US','EU',...]
@@ -512,6 +670,19 @@ async function jsonGet(url){try{return JSON.parse(await rawGet(url));}catch(e){r
 function polyGet(path){
   const sep=path.includes('?')?'&':'?';
   return jsonGet(`https://api.polygon.io${path}${sep}apiKey=${POLY_KEY}`);
+}
+
+async function postJson(url, body){
+  return new Promise((resolve,reject)=>{
+    const u=new URL(url);
+    const req=https.request({
+      hostname:u.hostname, path:u.pathname+u.search, method:'POST',
+      headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}
+    },res=>{ let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(d)); });
+    req.on('error',reject);
+    req.setTimeout(9000,()=>{req.destroy();reject(new Error('timeout'));});
+    req.write(body); req.end();
+  });
 }
 
 async function postToWebhook(url,payload){
@@ -3408,6 +3579,7 @@ async function main(){
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
   console.log(`[Webhooks] ECON_EVENTS_WH:   ${ECON_EVENTS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → econ falls back to MAIN_CHAT_WH' : 'MISSING → econ SUPPRESSED')}`);
+  console.log(`[BLS] BLS_KEY: ${BLS_KEY?'set (v2)':'not set → keyless v1, lower limits'} · series: ${Object.keys(BLS_SERIES).length} · → econ channel`);
   console.log(`[Econ] FINNHUB_KEY: ${FINNHUB_KEY ? 'set' : 'not set'} · FMP_KEY: ${FMP_KEY ? 'set (fallback)' : 'not set'} · ${(FINNHUB_KEY||FMP_KEY)?'':'⚠ NO SOURCE → econ disabled'} · filter: ${ECON_MIN_IMPACT}+ · pre-alert: ${ECON_PREALERT_MIN}min`);
   // BOOT SELF-TEST: fetch FMP once on startup so we know immediately whether the
   // key works and data flows — instead of waiting for the 7AM digest window. If
@@ -3517,6 +3689,9 @@ async function main(){
       const _et = getET();
       if(_et.hh===7 && _et.m===0) await postEconDigest();
       await checkEconPreAlerts();
+      // BLS: schedule heads-up (morning) + numbers watch (every minute).
+      if(_et.hh===7 && _et.m===30) await checkBlsScheduleHeadsUp();
+      await pollBlsReleases();
     } catch(e){ console.error('[Econ] loop error:', e.message); }
     await syncHighsAtTransition();
     await refreshRegSHO(); // self-rate-limits to 23h, safe to call every minute
