@@ -24,6 +24,7 @@ const APP_ID        = '1493671812247322624';
 const TOP_GAPPERS_WH = process.env.TOP_GAPPERS_WH || '';
 const MAIN_CHAT_WH   = process.env.MAIN_CHAT_WH || '';
 const PR_NEWS_WH     = process.env.PR_NEWS_WH || '';
+const SEC_FILINGS_WH = process.env.SEC_FILINGS_WH || '';  // dedicated filings channel
 // Halt alerts fan out to every URL in HALT_ALERT_WHS in parallel. Big
 // movers (|chgPct| ≥ 30%) are additionally mirrored to MAIN_CHAT_WH so they
 // hit the primary feed without polluting main-chat with every illiquid halt.
@@ -1438,16 +1439,33 @@ async function postEventAlert(ticker, event) {
 
   const msg = `${header}\n${subLine}\n${bullet}`;
 
-  // Route: always PR/news channel; ALSO mirror to Main chat for top gainers +
-  // watchlist runners (user rule).
-  const isTopName = permanentWatch.has(ticker) || dayWatchlist.has(ticker) ||
-                    topGappers.slice(0,10).some(g=>g.ticker===ticker) ||
-                    recentRunners.has(ticker);
-  await postPRNews({ content: msg });
-  if(isTopName && MAIN_CHAT_WH){
-    await postToWebhook(MAIN_CHAT_WH, { content: msg }).catch(()=>{});
+  // ── Routing ────────────────────────────────────────────────────────────────
+  // Filings (SEC) → dedicated SEC_FILINGS_WH channel. PR/news → PR_NEWS_WH.
+  // BOTH additionally MIRROR to Main chat for the day's real runners: the top
+  // 10-15 percent-gainers by volume, plus any watchlist name.
+  const isFiling = event.type === 'SEC';
+  // Top gainers ranked BY VOLUME (liquidity behind the move), capped at 15.
+  const topByVol = [...topGappers]
+    .filter(g => g && g.volume)
+    .sort((a,b) => (b.volume||0) - (a.volume||0))
+    .slice(0, 15)
+    .map(g => g.ticker);
+  const isRunner = topByVol.includes(ticker);
+  const isWatch  = permanentWatch.has(ticker) || dayWatchlist.has(ticker) || recentRunners.has(ticker);
+  const mirrorToMain = isRunner || isWatch;
+
+  // Primary destination.
+  if(isFiling){
+    const filingTarget = SEC_FILINGS_WH || PR_NEWS_WH || MAIN_CHAT_WH;
+    if(filingTarget) await postToWebhook(filingTarget, { username:'AziziBot', content: msg }).catch(()=>{});
+  } else {
+    await postPRNews({ content: msg });   // PR/news → PR_NEWS_WH (its own routing)
   }
-  console.log(`[Alert] ${ticker} ${event.type} posted${isTopName?' (+ main-chat mirror)':''}`);
+  // Main-chat mirror for runners + watchlist.
+  if(mirrorToMain && MAIN_CHAT_WH){
+    await postToWebhook(MAIN_CHAT_WH, { username:'AziziBot', content: msg }).catch(()=>{});
+  }
+  console.log(`[Alert] ${ticker} ${event.type} → ${isFiling?'sec-filings':'pr-news'}${mirrorToMain?' (+ main mirror)':''}`);
 }
 
 function loadPermanentWatchlist(){
@@ -3627,6 +3645,7 @@ async function main(){
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
   console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/bell alerts SUPPRESSED'}`);
   console.log(`[Webhooks] PR_NEWS_WH:      ${PR_NEWS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → PR/SEC fall back to MAIN_CHAT_WH' : 'MISSING → PR/SEC alerts SUPPRESSED')}`);
+  console.log(`[Webhooks] SEC_FILINGS_WH:   ${SEC_FILINGS_WH ? 'set' : (PR_NEWS_WH ? 'not set → filings fall back to PR_NEWS_WH' : 'not set → filings fall back to MAIN_CHAT_WH')}`);
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
   console.log(`[Webhooks] ECON_EVENTS_WH:   ${ECON_EVENTS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → econ falls back to MAIN_CHAT_WH' : 'MISSING → econ SUPPRESSED')}`);
