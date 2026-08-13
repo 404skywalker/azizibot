@@ -1456,13 +1456,18 @@ async function postEventAlert(ticker, event) {
 
   // Primary destination.
   if(isFiling){
-    const filingTarget = SEC_FILINGS_WH || PR_NEWS_WH || MAIN_CHAT_WH;
+    // Filings NEVER fall back to PR_NEWS — the press-releases channel must only
+    // ever contain press releases. Filings go to sec-filings, or (only if that's
+    // unset) to Main chat — but never to PR_NEWS.
+    const filingTarget = SEC_FILINGS_WH || MAIN_CHAT_WH;
     if(filingTarget) await postToWebhook(filingTarget, { username:'AziziBot', content: msg }).catch(()=>{});
+    else console.log(`[Alert] ${ticker} SEC filing suppressed — no SEC_FILINGS_WH/MAIN_CHAT_WH`);
   } else {
-    await postPRNews({ content: msg });   // PR/news → PR_NEWS_WH (its own routing)
+    await postPRNews({ content: msg });   // PR/news → PR_NEWS_WH only
   }
-  // Main-chat mirror for runners + watchlist.
-  if(mirrorToMain && MAIN_CHAT_WH){
+  // Main-chat mirror for runners + watchlist — FILINGS ONLY. Press releases must
+  // only ever appear in the press-releases channel, so PRs are never mirrored.
+  if(isFiling && mirrorToMain && MAIN_CHAT_WH){
     await postToWebhook(MAIN_CHAT_WH, { username:'AziziBot', content: msg }).catch(()=>{});
   }
   console.log(`[Alert] ${ticker} ${event.type} → ${isFiling?'sec-filings':'pr-news'}${mirrorToMain?' (+ main mirror)':''}`);
