@@ -1502,9 +1502,20 @@ async function refreshGappers(){
       polyGet('/v2/snapshot/locale/us/markets/stocks/tickers?sort=changePercent&direction=desc&limit=250'),
       polyGet('/v2/snapshot/locale/us/markets/stocks/tickers?sort=volume&direction=desc&limit=250'),
     ]);
-    const c1=g1?.tickers?.length||0,c2=g2?.tickers?.length||0,c3=g3?.tickers?.length||0;
-    console.log(`[Poly] gainers:${c1} pct:${c2} vol:${c3}`);
-    if(c1===0&&c2===0&&c3===0){console.error('[Poly] ALL EMPTY — check POLY_KEY');return;}
+    // PRE-MARKET GAP FIX: the ranked feeds above sort by day-change, which is
+    // unreliable pre-open (many stocks read 0%/stale until 9:30), so a real
+    // pre-market runner like EVAX (+40% at 07:05) can rank below the top-250
+    // cutoff and be invisible → never scanned → no alert. During PRE, pull a
+    // WIDE full-market snapshot and let build()/filter compute change from
+    // prevClose→lastTrade (which DOES include pre-market prints).
+    let g4 = null;
+    if(tier.name === 'PRE'){
+      try{ g4 = await polyGet('/v2/snapshot/locale/us/markets/stocks/tickers'); }
+      catch(e){ /* wide snapshot optional; ranked feeds still apply */ }
+    }
+    const c1=g1?.tickers?.length||0,c2=g2?.tickers?.length||0,c3=g3?.tickers?.length||0,c4=g4?.tickers?.length||0;
+    console.log(`[Poly] gainers:${c1} pct:${c2} vol:${c3}${tier.name==='PRE'?` full:${c4}`:''}`);
+    if(c1===0&&c2===0&&c3===0&&c4===0){console.error('[Poly] ALL EMPTY — check POLY_KEY');return;}
 
     const build=t=>{
       // Use lastTrade.p (real-time last trade, includes pre-market) for price.
@@ -1526,7 +1537,7 @@ async function refreshGappers(){
     };
 
     const merge=new Map();
-    for(const src of [g1,g2,g3])
+    for(const src of [g1,g2,g3,g4])
       for(const t of ((src&&src.tickers)||[]))
         if(t.ticker&&!merge.has(t.ticker)) merge.set(t.ticker,build(t));
 
@@ -1811,9 +1822,21 @@ async function fireNHOD(ticker,price){
   // Require ≥5% above 4PM close to confirm a real AH move.
   // If close price not captured yet, block entirely — too early to judge.
   if(tier.name==='AH'){
-    const cp=closePrice.get(ticker)||0;
+    let cp=closePrice.get(ticker)||0;
+    // If we never captured a 4PM close (stock wasn't tracked during the day, e.g.
+    // AUUD popping fresh in AH), fall back to the snapshot's prevDay/day close so
+    // a genuinely fresh AH runner can still alert instead of being blocked forever.
     if(cp===0){
-      console.log(`[NHOD] ${ticker} skip: AH close price not captured yet`);return;
+      // Fetch prevDay close directly (stock wasn't tracked at 4PM so no captured close).
+      try{
+        const snapAH = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+        const tdAH = snapAH && snapAH.ticker;
+        cp = (tdAH && ((tdAH.prevDay&&tdAH.prevDay.c)||(tdAH.day&&tdAH.day.c))) || 0;
+        if(cp>0) console.log(`[NHOD] ${ticker} AH: no captured close, using prevDay $${cp.toFixed(4)}`);
+      }catch(e){}
+    }
+    if(cp===0){
+      console.log(`[NHOD] ${ticker} skip: AH close price not captured & no prevDay fallback`);return;
     }
     const ahMove=((price-cp)/cp)*100;
     if(ahMove<5){
