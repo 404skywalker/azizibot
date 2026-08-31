@@ -2079,26 +2079,32 @@ async function isQualifyingForFiling(ticker){
   }
   if(!price) return false;                 // unknown price → don't alert
   if(!(price > 0 && price < EDGAR_MAX_PRICE)) return false;
-  // Final guard against OCG-class leaks: a name in recentRunners that has since
-  // faded is NOT worth a filing alert. Require it to still be moving OR still
-  // near its recent highs. If it's dead flat and off its highs, skip.
-  //  - today's gappers/day-watch are inherently live → allowed
-  //  - a recentRunner must show it's still active: today's % change is non-trivial
-  //    OR price is within reach of the day high (not fully round-tripped).
-  const liveToday = topGappers.some(g => g.ticker === ticker) || dayWatchlist.has(ticker);
-  if(liveToday) return true;
-  // recentRunners-only path: verify it's still elevated/active via snapshot.
+
+  // A stock qualifying for a filing alert must be GENUINELY ACTIVE right now —
+  // not just "was in the gapper list once today." BLRX slipped through at +5% on
+  // no volume because being in topGappers/dayWatchlist gave a free pass. Now EVERY
+  // path (except user-curated permanentWatch) must clear a real move + volume bar
+  // via a live snapshot. This is the single gate that kills inactive names.
+  const FILING_MIN_CHG = 20;         // must be up >=20% today (a real % gainer)
+  const FILING_MIN_VOL = 1_000_000;  // with real volume
   try{
     const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
     const td = snap && snap.ticker;
-    const chg = (td && Math.abs(td.todaysChangePerc||0)) || 0;
+    const chg = (td && (td.todaysChangePerc||0)) || 0;
+    const vol = (td && td.day && td.day.v) || 0;
     const hi  = (td && td.day && td.day.h) || 0;
     const cur = (td && ((td.lastTrade&&td.lastTrade.p)||(td.day&&td.day.c))) || price;
-    // Still active if: moving >=10% today, OR trading within 25% of today's high.
-    const nearHigh = hi>0 && cur >= hi*0.75;
-    if(chg >= 10 || nearHigh) return true;
-    return false;   // faded, flat, off highs → OCG class → no alert
-  }catch(e){ return false; }
+    const nearHigh = hi>0 && cur >= hi*0.80;
+    // Active = a real gainer today (>=20%) with real volume (>=1M), OR still
+    // pinned near its high on real volume (a runner consolidating, not faded).
+    const active = (chg >= FILING_MIN_CHG && vol >= FILING_MIN_VOL) ||
+                   (nearHigh && chg >= 10 && vol >= FILING_MIN_VOL);
+    if(!active){
+      console.log(`[Filing] ${ticker} skip: inactive (chg ${chg.toFixed(1)}%, vol ${fmtN(vol)}) — not a live gainer`);
+      return false;
+    }
+    return true;
+  }catch(e){ return false; }   // no snapshot → can't confirm active → don't alert
 }
 
 async function isQualifyingForNews(ticker){
