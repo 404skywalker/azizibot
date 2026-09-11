@@ -1285,6 +1285,12 @@ const dayWatchlist=new Map();
 const state={tickers:new Map(),dailyCounts:new Map(),sentNews:new Set(),sentFilings:new Set(),sentPR:new Set(),morningPosted:new Set(),bellPosted:new Set()};
 const wsDebounce=new Map();
 const lungeDebounce=new Map(); // ticker → last explosive-move alert time (ms)
+// Gross phantom screen at WS ingress. % a raw trade may run above the most
+// recent snapshot price before it's discarded as a suspect print. Loose on
+// purpose — this catches garbage only; fireNHOD does the precise check.
+const WS_MAX_DIVERGENCE_PCT = 20;
+const wsDivergeWarn=new Map();   // ticker → last discard-log time (ms)
+const PHANTOM_BLOCK_MS = 5*60*1000; // rejected print stays blocked this long
 const closePrice=new Map(); // ticker → price at 4PM close
 // recentRunners: tickers that qualified as gappers in the last 5 days
 // Used to expand news coverage beyond just today's movers
@@ -1644,8 +1650,27 @@ async function fireNHOD(ticker,price){
   // and reconcile. If the verified high is at/above the alert price, this is
   // NOT a new high — suppress. This makes NHOD self-correcting regardless of
   // how s.high was seeded.
+  //
+  // ── PHANTOM-PRINT GUARD (VSME 2026-09-11) ─────────────────────────────────
+  // The NHOD trigger fires off the raw WebSocket TRADE stream, which carries
+  // odd-lot and irregular-condition prints that never reach the consolidated
+  // tape, the minute aggregates, or the user's chart. VSME: the trade stream
+  // reported $1.4500 while snapshot lastTrade, day.c and the minute aggs all
+  // said ~$1.15 — a 26% phantom that posted as a new high while the stock was
+  // fading 11% BELOW its real high of day.
+  //
+  // The old verifier could not catch this BY CONSTRUCTION: it compared the
+  // trigger price against aggregate-derived highs, and a price that exists
+  // only in the raw trade stream always clears an aggregate-derived high.
+  //
+  // Rule now: a real new high must be CORROBORATED by at least one independent
+  // source. If the trigger runs more than PHANTOM_TOL_PCT above every one of
+  // them, it isn't a price — it's a bad print. Reject it and remember it.
+  const PHANTOM_TOL_PCT = 3;          // % above corroborated tape before rejection
+  const PHANTOM_MEMO_MS = 5*60*1000;  // how long a rejected print stays blocked
   let dayOpen=0, dayLow=0, dayHighV=0, dayChgV=null; // for the momentum gate below
   let actBars=null, actRecent=null;                   // chart-activity (log-only)
+  let vfHigh=0, vfCorrob=0, vfRegClose=0, vfSessOk=false; // for the fire-time log
   try {
     const [sess, snapV] = await Promise.all([
       getSessionData(ticker),
@@ -1660,7 +1685,32 @@ async function fireNHOD(ticker,price){
     dayLow   = (tdV && tdV.day && tdV.day.l) || 0;
     dayHighV = Math.max(dayHV, sess.high||0);
     dayChgV  = (tdV && typeof tdV.todaysChangePerc==='number') ? tdV.todaysChangePerc : null;
+
+    // Independent corroboration sources. NOTE: s.high is deliberately EXCLUDED —
+    // it is WS-derived and is exactly what a previous phantom poisons.
+    const lastTrdP  = (tdV && tdV.lastTrade && tdV.lastTrade.p) || 0;
+    const dayCloseP = (tdV && tdV.day && tdV.day.c) || 0;
+    const corroborated = Math.max(lastTrdP, dayCloseP, dayHV, sess.high||0);
+    vfCorrob = corroborated; vfRegClose = sess.regularClose||0; vfSessOk = !!sess.ok;
+
+    if(corroborated > 0 && price > corroborated * (1 + PHANTOM_TOL_PCT/100)){
+      const div = ((price - corroborated)/corroborated)*100;
+      console.log(`[NHOD] ${ticker} skip: UNCONFIRMED PRINT $${price.toFixed(4)} — ${div.toFixed(1)}% above corroborated tape $${corroborated.toFixed(4)} (last=$${lastTrdP.toFixed(4)} dayH=$${dayHV.toFixed(4)} dayC=$${dayCloseP.toFixed(4)} sessH=$${(sess.high||0).toFixed(4)}${sess.ok?'':' UNVERIFIED'})`);
+      s.phantomHigh = price; s.phantomAt = Date.now();
+      state.tickers.set(ticker,{...s});
+      return;
+    }
+    // Un-stick a baseline a previous phantom ratcheted up. s.high is set to the
+    // alert price on every fire, so one bad print poisons it for the session
+    // (VSME sat at $1.40 while the real tape was $1.15). Only clamp when the
+    // aggregates are known-good, so a fetch failure can never wipe a real high.
+    if(sess.ok && corroborated > 0 && (s.high||0) > corroborated * (1 + PHANTOM_TOL_PCT/100)){
+      console.log(`[NHOD] ${ticker} baseline healed DOWN $${(s.high||0).toFixed(4)} → $${corroborated.toFixed(4)} (inflated by an unconfirmed print)`);
+      s.high = corroborated;
+    }
+
     const verifiedHigh = Math.max(s.high||0, sess.high||0, dayHV);
+    vfHigh = verifiedHigh;
     if(verifiedHigh > (s.high||0)) s.high = verifiedHigh; // heal the baseline
     // The triggering price must clear the VERIFIED high, not just the
     // possibly-stale running one. Small epsilon so equal-to-high isn't "new".
@@ -1670,8 +1720,16 @@ async function fireNHOD(ticker,price){
       return;
     }
   } catch(e){
-    // Verification fetch failed — fall back to the incremental guard rather
-    // than posting blind. Better to occasionally miss than to false-fire.
+    // Verification fetch failed. The old code fell through to the stale running
+    // high — which is precisely how an unverifiable price got posted. In AH the
+    // snapshot's day.* fields CANNOT backstop a high set after 16:00, so there
+    // is no safe fallback there at all: fail closed. The comment always said
+    // "better to miss than to false-fire"; now the code actually does that.
+    console.log(`[NHOD] ${ticker} verify FAILED (${e.message})`);
+    const {etMin:emin} = getET();
+    if(emin >= 960){
+      console.log(`[NHOD] ${ticker} skip: AH + verification unavailable — failing closed`);return;
+    }
     if(price<=s.high+0.001){console.log(`[NHOD] ${ticker} skip: verify failed + $${price.toFixed(4)} not above high $${s.high.toFixed(4)}`);return;}
   }
   if(price<=s.high+0.001) {console.log(`[NHOD] ${ticker} skip: $${price.toFixed(4)} not above high $${s.high.toFixed(4)}`);return;}
@@ -1823,9 +1881,20 @@ async function fireNHOD(ticker,price){
   // If close price not captured yet, block entirely — too early to judge.
   if(tier.name==='AH'){
     let cp=closePrice.get(ticker)||0;
-    // If we never captured a 4PM close (stock wasn't tracked during the day, e.g.
-    // AUUD popping fresh in AH), fall back to the snapshot's prevDay/day close so
-    // a genuinely fresh AH runner can still alert instead of being blocked forever.
+    // No captured close? The verification pass above already pulled today's
+    // minute bars — the last bar before 16:00 ET IS the true 4PM close. Use it
+    // before reaching for prevDay, and cache it so the rest of the session and
+    // the transition sweep agree on one number. This is what was missing when
+    // VSME logged "no captured close, using prevDay" for an entire hour while
+    // sitting on a perfectly good $1.1598 regular-session close.
+    if(cp===0 && vfRegClose>0){
+      cp = vfRegClose;
+      closePrice.set(ticker, cp);
+      console.log(`[NHOD] ${ticker} AH: derived 4PM close $${cp.toFixed(4)} from minute bars`);
+    }
+    // If the stock wasn't trading during the regular session at all (e.g. AUUD
+    // popping fresh in AH), fall back to the snapshot's prevDay/day close so a
+    // genuinely fresh AH runner can still alert instead of being blocked forever.
     if(cp===0){
       // Fetch prevDay close directly (stock wasn't tracked at 4PM so no captured close).
       try{
@@ -1890,6 +1959,10 @@ async function fireNHOD(ticker,price){
   state.tickers.set(ticker,{...s,high:price,nhod,lastAlertPrice:price,lastAlertTime:Date.now(),priceHistory:s.priceHistory||[]});
   state.dailyCounts.set(ticker,(state.dailyCounts.get(ticker)||0)+1);
   console.log(`[ALERT] ↗ ${ticker} $${price.toFixed(4)} x${nhod}${isPermW?' [PERM]':isWatchOnly?' [watch]':''}`);
+  // Forensics: there was previously NO log on a successful verification, only on
+  // skips — so when a bad alert went out you couldn't see what it had been
+  // checked against. Print the corroboration set on every fire.
+  console.log(`[ALERT] ${ticker} verified: trigger=$${price.toFixed(4)} vs high=$${vfHigh.toFixed(4)} corroborated=$${vfCorrob.toFixed(4)} regClose=$${vfRegClose.toFixed(4)} sess=${vfSessOk?'OK':'UNVERIFIED'}`);
 
   // Fresh snapshot for live vol/rvol/chgPct
   const snap=await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
@@ -3113,27 +3186,57 @@ async function fireHaltAlert(st){
 // At 4PM (MKT→AH), capture the closing price for every tracked ticker.
 // AH alerts only fire if price is ≥5% above the 4PM close price.
 // This ensures only genuine AH movers fire, not stocks that ran during the day.
+// TIMING FIX (VSME 2026-09-11): this used to run on a 60-MINUTE throttle and
+// take whatever the live price happened to be at that moment as "the close".
+// It first ran at 17:00 ET and stored a 5PM price of $1.1598 as VSME's 4PM
+// close — while for the whole preceding hour every AH alert logged "no captured
+// close, using prevDay". Three separate faults:
+//   1. hourly cadence → a ticker entering the feed at 16:01 waits ~59 minutes
+//   2. live snapshot price → the value depends on WHEN the sweep ran
+//   3. unconditional overwrite → each hourly run clobbered the previous capture
+// Now: 5-minute cadence, close derived from the last minute bar before 16:00 ET
+// (deterministic regardless of run time), and an existing capture is never
+// overwritten. Only tickers still missing a close are fetched, so the tighter
+// cadence costs nothing after the first pass.
 let lastTransitionSync = 0;
+let transitionCountersReset = '';
+const TRANSITION_SWEEP_MS = 5*60*1000;
 async function syncHighsAtTransition() {
   const {etMin} = getET();
   const inAH = etMin >= 960 && etMin < 1200;
   if(!inAH) return;
-  if(Date.now() - lastTransitionSync < 60*60*1000) return;
+  if(Date.now() - lastTransitionSync < TRANSITION_SWEEP_MS) return;
   lastTransitionSync = Date.now();
 
-  const tickers = [...new Set([...topGappers.map(g=>g.ticker), ...dayWatchlist.keys()])];
-  if(!tickers.length) return;
-  console.log(`[Transition] MKT→AH: capturing close prices for ${tickers.length} tickers...`);
+  const today = new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+  const firstSweep = transitionCountersReset !== today;
+
+  const tickers = [...new Set([...topGappers.map(g=>g.ticker), ...dayWatchlist.keys()])]
+    .filter(t => !closePrice.has(t));   // never re-capture; first value wins
+  if(!tickers.length){
+    if(firstSweep) transitionCountersReset = today;
+    return;
+  }
+  console.log(`[Transition] MKT→AH: deriving 4PM close for ${tickers.length} ticker(s) missing one...`);
 
   for(const ticker of tickers) {
     try {
-      const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-      const td   = snap&&snap.ticker;
-      const cur  = (td&&td.lastTrade&&td.lastTrade.p)||(td&&td.day&&td.day.c)||0;
+      const sess = await getSessionData(ticker);
+      let cur = sess.regularClose || 0;
+      if(cur === 0){
+        // No regular-session bars at all (never traded before 16:00). Fall back
+        // to prevDay so a fresh AH popper isn't blocked forever.
+        const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+        const td   = snap&&snap.ticker;
+        cur = (td&&td.prevDay&&td.prevDay.c)||0;
+        if(cur>0) console.log(`[Transition] ${ticker} no regular-session bars — using prevDay $${cur.toFixed(4)}`);
+      }
       if(cur > 0) {
         closePrice.set(ticker, cur);
         const s = state.tickers.get(ticker);
-        if(s) {
+        // Cooldown counters reset ONCE per session at the boundary, not on every
+        // sweep — resetting them hourly re-opened the alert floodgates each hour.
+        if(s && firstSweep) {
           // DO NOT overwrite s.high here. s.high is the TRUE SESSION HIGH — seeded
           // by pre-warm and only ever RAISED, never lowered. This handler used to
           // set high:cur (the 4PM close), which WIPED the real high the instant AH
@@ -3146,13 +3249,16 @@ async function syncHighsAtTransition() {
           // "· N" display counter. Only the high:cur overwrite was the bug.)
           state.tickers.set(ticker, {...s, nhod:0, lastAlertPrice:0, lastAlertTime:0});
         }
-        console.log(`[Transition] ${ticker} close=$${cur.toFixed(4)}`);
+        console.log(`[Transition] ${ticker} close=$${cur.toFixed(4)}${sess.regularClose?' (16:00 bar)':''}`);
       }
     } catch(e) {}
     await sleep(100);
   }
-  state.dailyCounts.clear();
-  console.log(`[Transition] Done — AH baseline captured`);
+  if(firstSweep){
+    state.dailyCounts.clear();
+    transitionCountersReset = today;
+  }
+  console.log(`[Transition] Done — ${closePrice.size} AH baseline(s) captured`);
 }
 async function checkMorningSnapshot(){
   if(!isMarketDay()) return;
@@ -3303,6 +3409,24 @@ function connectPriceWS(){
           const nhodGated = !!(liveG && (liveG.price>10 || liveG.chgPct<5));
           const s=state.tickers.get(ticker);
           if(!s) continue;
+          // ── Gross phantom screen (WS ingress) ─────────────────────────────
+          // The raw trade stream carries odd-lot and irregular-condition prints
+          // that never reach the consolidated tape, the minute aggregates, or a
+          // broker chart. One of them ($1.45 on a $1.15 stock) posted a false
+          // NHOD — and it also poisons priceHistory, which drives the SPIKE
+          // detector. Screening HERE, once, protects both paths. Reference is
+          // the most recent snapshot price (≤30s old). A genuine fast mover
+          // that trips this is delayed by one refresh, not lost.
+          const refPrice = (liveG&&liveG.price)||(watchG&&watchG.price)||0;
+          if(refPrice>0 && price > refPrice*(1+WS_MAX_DIVERGENCE_PCT/100)){
+            const dv=((price-refPrice)/refPrice)*100;
+            const lastWarn=wsDivergeWarn.get(ticker)||0;
+            if(Date.now()-lastWarn>60000){
+              console.log(`[PriceWS] ${ticker} DISCARD $${price.toFixed(4)} — ${dv.toFixed(0)}% above snapshot ref $${refPrice.toFixed(4)} (suspect print)`);
+              wsDivergeWarn.set(ticker,Date.now());
+            }
+            continue;
+          }
           // Pull volume + minute high from A (per-minute aggregate) events.
           // av = accumulated daily volume (includes pre-market). h = current
           // minute's high; we accumulate the SESSION high here — any minute
@@ -3339,7 +3463,11 @@ function connectPriceWS(){
             continue;
           }
           const prevHigh=s.high;
-          if(!nhodGated && price>prevHigh+0.001){
+          // A print already rejected as unconfirmed must not re-arm the trigger
+          // every 10s — it burns two API calls per retry and the answer won't
+          // change until the tape catches up. (VSME re-fired five times.)
+          const phantomBlocked = !!(s.phantomHigh && Date.now()-(s.phantomAt||0) < PHANTOM_BLOCK_MS && price <= s.phantomHigh + 0.001);
+          if(!nhodGated && !phantomBlocked && price>prevHigh+0.001){
             const last=wsDebounce.get(ticker)||0;
             if(Date.now()-last>10000){
               console.log(`[PriceWS] ${ticker} NEW HIGH $${price.toFixed(4)} (was $${prevHigh.toFixed(4)}) peakVol=${fmtN(s.peakVol||0)}`);
@@ -3366,11 +3494,29 @@ function connectPriceWS(){
 // market for many tickers. Without this, the bot would false-NHOD on any
 // tick above the current minute's high AND wave through illiquid tickers
 // at the volume gate (the INBS case).
+// ET wall-clock → epoch ms, DST-safe. Tries EDT then EST and keeps whichever
+// round-trips back to the requested wall-clock time. Used to find the 16:00 ET
+// boundary inside a day of minute bars without formatting every bar.
+const _etHM = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour12:false,hour:'2-digit',minute:'2-digit'});
+function etBoundaryMs(dateStr, hh, mm){
+  for(const off of ['-04:00','-05:00']){
+    const ms = Date.parse(`${dateStr}T${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:00${off}`);
+    if(!ms) continue;
+    const [bh,bm] = _etHM.format(new Date(ms)).split(':').map(Number);
+    if(bh===hh && bm===mm) return ms;
+  }
+  return 0;
+}
+
 async function getSessionData(ticker){
   const today = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York',
     year: 'numeric', month: '2-digit', day: '2-digit'
   }).format(new Date());
+  // ok:false means "we could not verify" — distinct from "verified, nothing
+  // there". Callers MUST treat these differently: a failed fetch silently
+  // returning high:0 is how an unverifiable alert got posted.
+  const EMPTY = {ok:false, high:0, volume:0, bars:0, activeBars:0, recentBars:0, regularHigh:0, regularClose:0};
   try {
     // CRITICAL: a full session runs 04:00–20:00 ET = 960 one-minute bars.
     // With limit=500 + sort=desc, late in the day the query would only reach
@@ -3380,7 +3526,12 @@ async function getSessionData(ticker){
     // and request the whole day (limit 1500 > 960) so the morning high is
     // always included regardless of what time the query runs.
     const r = await polyGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}?adjusted=true&sort=asc&limit=1500`);
-    if(!r || !r.results || !r.results.length) return {high: 0, volume: 0, bars: 0, activeBars: 0, recentBars: 0};
+    if(!r || !r.results || !r.results.length){
+      console.log(`[Session] ${ticker} no minute bars returned — UNVERIFIED`);
+      return EMPTY;
+    }
+    const close16 = etBoundaryMs(today, 16, 0);
+    let regularHigh = 0, regularClose = 0;
     let high = 0, volume = 0, activeBars = 0, recentBars = 0;
     // "Chart activity" metrics. Volume tells you HOW MUCH traded; it cannot tell
     // you whether the tape is alive. A shell can print 39K in three fat prints and
@@ -3396,9 +3547,19 @@ async function getSessionData(ticker){
         activeBars++;
         if((b.t||0) >= cutoff) recentBars++;
       }
+      // Regular session = bars starting before 16:00 ET. The LAST such bar's
+      // close is the true 4PM close. This is what the AH baseline must use —
+      // not a live snapshot pulled whenever the sweep happens to run.
+      if(close16 && (b.t||0) < close16){
+        if((b.h||0) > regularHigh) regularHigh = b.h;
+        if(b.c) regularClose = b.c;
+      }
     }
-    return {high, volume, bars: r.results.length, activeBars, recentBars};
-  } catch(e){ return {high: 0, volume: 0, bars: 0, activeBars: 0, recentBars: 0}; }
+    return {ok:true, high, volume, bars: r.results.length, activeBars, recentBars, regularHigh, regularClose};
+  } catch(e){
+    console.log(`[Session] ${ticker} minute-agg fetch FAILED (${e.message}) — UNVERIFIED`);
+    return EMPTY;
+  }
 }
 
 // Seed state.high (true session high) and peakVol for a single ticker from
@@ -3419,6 +3580,20 @@ function prewarmTicker(t){
     const trueVol  = Math.max(s.peakVol||0, dayV, sess.volume||0);
     if(trueHigh > (s.high||0)) s.high = trueHigh;
     if(trueVol > (s.peakVol||0)) s.peakVol = trueVol;
+    // Free win: the session fetch already knows the last bar before 16:00 ET,
+    // so every pre-warmed ticker gets its true 4PM close immediately instead of
+    // waiting on the transition sweep. First capture wins.
+    if(sess.regularClose > 0 && !closePrice.has(t)) closePrice.set(t, sess.regularClose);
+    // Do NOT bless a pre-warm that came back empty. Marking preWarmed=true on
+    // zero data hands NHOD a baseline of $0 and calls it authoritative — every
+    // subsequent tick then looks like a new high. Leave it false so a later
+    // tick retries with real data.
+    if(!sess.ok && dayH === 0){
+      console.log(`[Prewarm] ${t} no usable high (sess UNVERIFIED, day.h=0) — staying cold, will retry`);
+      s.preWarmPending = false;
+      state.tickers.set(t, s);
+      return;
+    }
     s.preWarmed = true; // mark ready for NHOD evaluation
     s.preWarmPending = false;
     state.tickers.set(t, s);
@@ -3671,15 +3846,15 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] dilution-tag-v1 · 2026-08-10');
+  console.log('[BUILD] phantom-print-guard-v1 · 2026-09-11');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   loadRecentRunners();  // restore persisted runners (survives soft restarts)
   await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
   console.log('[Tiers] PRE 4-9:30AM ≥10%/100K | MKT ≥10%/5M | AH ≥10%/500K(fresh only)');
   console.log(`[Polygon] key: ${POLY_KEY.slice(0,8)}...`);
   console.log(`[Webhooks] MAIN_CHAT_WH:    ${MAIN_CHAT_WH ? 'set' : 'MISSING → NHOD/bell alerts SUPPRESSED'}`);
-  console.log(`[Webhooks] PR_NEWS_WH:      ${PR_NEWS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → PR/SEC fall back to MAIN_CHAT_WH' : 'MISSING → PR/SEC alerts SUPPRESSED')}`);
-  console.log(`[Webhooks] SEC_FILINGS_WH:   ${SEC_FILINGS_WH ? 'set' : (PR_NEWS_WH ? 'not set → filings fall back to PR_NEWS_WH' : 'not set → filings fall back to MAIN_CHAT_WH')}`);
+  console.log(`[Webhooks] PR_NEWS_WH:      ${PR_NEWS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → PR/news falls back to MAIN_CHAT_WH' : 'MISSING → PR/news alerts SUPPRESSED')}`);
+  console.log(`[Webhooks] SEC_FILINGS_WH:   ${SEC_FILINGS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → filings fall back to MAIN_CHAT_WH (never PR_NEWS)' : 'MISSING → filings SUPPRESSED')}`);
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
   console.log(`[Webhooks] ECON_EVENTS_WH:   ${ECON_EVENTS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → econ falls back to MAIN_CHAT_WH' : 'MISSING → econ SUPPRESSED')}`);
