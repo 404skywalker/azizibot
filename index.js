@@ -3084,31 +3084,39 @@ async function detectHaltDirectionVerbose(ticker, haltedAtMs){
     if(votes.length === 0)
       return {dir: null, method: 'no-signal', detail};
 
-    // The halt print decides first — it is the price that tripped the band.
-    // Then the near approach, then range position. Any disagreement among these
-    // three means the approach was genuinely ambiguous: post a generic "Halted"
-    // with no arrow rather than gamble. A wrong arrow is worse than no arrow.
+    // ── DEFAULT INVERTED (2026-09-16) ───────────────────────────────────────
+    // Every version of this detector has defaulted to PRODUCING a direction and
+    // only fell back to a bare "HALTED" on explicit conflict. So one lone signal
+    // could put a green ↑ UP on a stock that just went limit-down — YXT, RETO,
+    // ZTG, three different root causes, same failure shape. That default is
+    // backwards for what the mistake costs: a plain "HALTED" is mildly annoying,
+    // a wrong arrow puts you on the wrong side of a trade.
+    //
+    // An arrow now has to be EARNED: at least TWO of the three strong signals
+    // (halt-print, near-traj, range-pos) must vote, and every signal that votes
+    // must agree. One signal alone never decides. Any dissent never decides.
+    // Weak signals (window-arc, extreme-timing, day-chg, opening-gap) stay in
+    // the log for diagnosis but can no longer produce a direction at all — a
+    // weak signal deciding on its own is the original YXT bug.
+    //
+    // This does not depend on knowing WHY a given direction was wrong. It makes
+    // the detector refuse to guess when the evidence is thin, which is the one
+    // property every previous fix lacked.
     const strong3 = [printVote, nearVote, posVote].filter(v => v !== 0);
-    if(strong3.length > 1 && strong3.some(v=>v>0) && strong3.some(v=>v<0))
-      return {dir: null, method: 'approach-conflict', detail};
-    if(printVote > 0) return {dir: 'UP',   method: 'halt-print', detail};
-    if(printVote < 0) return {dir: 'DOWN', method: 'halt-print', detail};
-    if(nearVote  > 0) return {dir: 'UP',   method: 'near-traj',  detail};
-    if(nearVote  < 0) return {dir: 'DOWN', method: 'near-traj',  detail};
-    if(posVote   > 0) return {dir: 'UP',   method: 'range-pos',  detail};
-    if(posVote   < 0) return {dir: 'DOWN', method: 'range-pos',  detail};
-
-    // No clear trajectory → fall back to the other signals, but require agreement
-    // among the STRONG ones and post generic "Halted" on any strong conflict.
-    const net = votes.reduce((s,v)=>s+v.v, 0);
-    const strongVotes = votes.filter(v=>v.strong);
-    const hasUp   = strongVotes.some(v=>v.v > 0);
-    const hasDown = strongVotes.some(v=>v.v < 0);
-    if(hasUp && hasDown)
-      return {dir: null, method: 'conflict', detail};
-    if(net > 0) return {dir: 'UP',   method: 'vote', detail};
-    if(net < 0) return {dir: 'DOWN', method: 'vote', detail};
-    return {dir: null, method: 'tie', detail};
+    const agreed  = strong3.length >= 2 && strong3.every(v => v === strong3[0]);
+    if(!agreed){
+      const why = strong3.length < 2
+        ? `only ${strong3.length} strong signal(s) — need 2`
+        : 'strong signals disagree';
+      console.log(`[Halt] ${ticker} NO ARROW — ${why} (print=${printVote} near=${nearVote} pos=${posVote}) | ${detail}`);
+      return {dir: null, method: strong3.length < 2 ? 'insufficient-signal' : 'signal-conflict', detail};
+    }
+    const agreeing = [
+      printVote ? 'halt-print' : null,
+      nearVote  ? 'near-traj'  : null,
+      posVote   ? 'range-pos'  : null,
+    ].filter(Boolean).join('+');
+    return {dir: strong3[0] > 0 ? 'UP' : 'DOWN', method: `${agreeing} (${strong3.length}/3 agree)`, detail};
   } catch(e){
     console.error(`[Halt] direction detect failed for ${ticker}: ${e.message}`);
     return {dir: null, method: 'error', detail: e.message};
@@ -3920,7 +3928,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] halt-print-v3 · 2026-09-16');
+  console.log('[BUILD] halt-earned-arrow-v4 · 2026-09-16');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   loadRecentRunners();  // restore persisted runners (survives soft restarts)
   await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
