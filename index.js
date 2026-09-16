@@ -2977,18 +2977,84 @@ async function detectHaltDirectionVerbose(ticker, haltedAtMs){
     // Each signal votes UP (+1) / DOWN (-1) / abstain (0). We only emit a
     // confident dir when the net vote is clear AND no strong signal opposes
     // it. A single partial bar can no longer flip the label on its own.
-    const firstBar = bars[0];
-    const lastBar  = bars[bars.length - 1];
+    // Use only bars that actually traded — an empty bar carries no direction and
+    // must not be mistaken for "the last bar before the halt".
+    const live = bars.filter(b => (b.v||0) > 0 && b.o > 0 && b.c > 0);
+    const useBars = live.length ? live : bars;
+    const firstBar = useBars[0];
+    const lastBar  = useBars[useBars.length - 1];
     const votes = [];
 
-    // Signal A: window trajectory (first open → last close), the move INTO the
-    // halt. This is the AUTHORITATIVE signal — it spans the whole approach and is
-    // what actually defines halt direction. If it's clear, it decides, and no
-    // weaker signal may override it.
+    // ── LAG FIX (ZTG 2026-09-16) ────────────────────────────────────────────
+    // Every bar-derived signal shares one blind spot: minute aggregates lag.
+    // An LULD halt trips 15s outside the band and we detect within ~5s, so a
+    // fast flush can happen entirely inside the halt minute — whose bar isn't
+    // published yet. The whole window is then up-leg, and every bar signal
+    // reads UP on a down halt (ZTG: halted DOWN at $2.14, alerted UP).
+    // Narrowing the horizon made this worse, not better.
+    //
+    // The halt print itself is immune: it IS the price that tripped the band,
+    // and we already fetch it (and already display it in the alert) — it was
+    // just never used to decide. Anchor everything on it.
+    //
+    // Trust guard: only while the halt should still be in force. LULD halts run
+    // 5 minutes; past that lastTrade may be a post-resumption bounce, which is
+    // the YXT failure mode in a different costume.
+    const sinceHaltMs  = Date.now() - haltedAtMs;
+    const printTrusted = lastPrice > 0 && sinceHaltMs >= 0 && sinceHaltMs < 4.5*60*1000;
+    const refPx        = printTrusted ? lastPrice : lastBar.c;
+    const barAgeSec    = Math.round((haltedAtMs - (lastBar.t||haltedAtMs))/1000);
+    if(barAgeSec > 90)
+      console.log(`[Halt] ${ticker} WARNING: newest bar is ${barAgeSec}s before the halt — aggregates lagging, leaning on halt print`);
+
+    // Signal A0: the halt print vs the last completed bar. Freshest signal
+    // available and the only one that cannot be blinded by aggregate lag.
+    let printVote = 0;
+    if(printTrusted && lastBar.c > 0){
+      const pm = (lastPrice - lastBar.c) / lastBar.c * 100;
+      if(Math.abs(pm) >= 1){ printVote = pm > 0 ? 1 : -1; votes.push({sig:'halt-print', v: printVote, n:`halt $${lastPrice.toFixed(3)} vs bar close $${lastBar.c.toFixed(3)} ${pm.toFixed(2)}%`, strong:true}); }
+    }
+
+    // ── HORIZON FIX (RETO 2026-09-15) ───────────────────────────────────────
+    // The old Signal A took first-open → last-close across the WHOLE 6-minute
+    // window and was declared authoritative. That is the wrong horizon for an
+    // LULD halt. A runner that rips for four minutes then craters into a
+    // limit-DOWN halt still has a POSITIVE 6-minute O→C, so the window voted UP
+    // on a down halt (RETO: halted DOWN at $3.41 on 191.7M shares → alerted UP).
+    // The YXT fix promoted this signal to absolute; that overcorrected. LULD
+    // direction is set by the FINAL approach against the reference band, not by
+    // the whole arc.
+    //
+    // Near-trajectory (last 2 traded bars) is authoritative now. The full-window
+    // arc is demoted to a corroborator that can no longer decide on its own.
+    const nearBars = useBars.slice(-2);
+    let nearVote = 0;
+    if(nearBars.length && nearBars[0].o > 0 && refPx > 0){
+      const nm = (refPx - nearBars[0].o) / nearBars[0].o * 100;
+      if(Math.abs(nm) >= 0.5){ nearVote = nm > 0 ? 1 : -1; votes.push({sig:'near-traj', v: nearVote, n:`last${nearBars.length} O→${printTrusted?'print':'C'} ${nm.toFixed(2)}%`, strong:true}); }
+    }
+
+    // Signal A2: where the halt price sits inside the recent range. A limit-down
+    // halt prints at or near the low of its approach, a limit-up halt near the
+    // high. Independent of the arc, so it catches spike-then-dump directly.
+    const rangeBars = useBars.slice(-3);
+    let posVote = 0;
+    const rHi = Math.max(...rangeBars.map(b=>b.h||0));
+    const rLo = Math.min(...rangeBars.map(b=>(b.l>0?b.l:Infinity)));
+    if(isFinite(rLo) && rHi > rLo && refPx > 0){
+      // Clamp: a halt print BELOW the window low scores 0 (hard DOWN) and one
+      // above the high scores 1 (hard UP) — exactly the lag case we need to catch.
+      const pos = Math.max(0, Math.min(1, (refPx - rLo) / (rHi - rLo)));
+      if(pos <= 0.25){ posVote = -1; votes.push({sig:'range-pos', v:-1, n:`${printTrusted?'print':'close'} ${(pos*100).toFixed(0)}% of last${rangeBars.length} range`, strong:true}); }
+      else if(pos >= 0.75){ posVote = 1; votes.push({sig:'range-pos', v: 1, n:`${printTrusted?'print':'close'} ${(pos*100).toFixed(0)}% of last${rangeBars.length} range`, strong:true}); }
+    }
+
+    // Signal A3: full-window arc — DEMOTED to corroborator. This is the signal
+    // that mislabelled RETO; it may no longer decide anything by itself.
     let trajVote = 0;
     if(firstBar.o > 0 && lastBar.c > 0){
       const m = (lastBar.c - firstBar.o) / firstBar.o * 100;
-      if(Math.abs(m) >= 0.5){ trajVote = m > 0 ? 1 : -1; votes.push({sig:'trajectory', v: trajVote, n:`win O→C ${m.toFixed(2)}%`, strong:true}); }
+      if(Math.abs(m) >= 0.5){ trajVote = m > 0 ? 1 : -1; votes.push({sig:'window-arc', v: trajVote, n:`win O→C ${m.toFixed(2)}%`, weak:true}); }
     }
 
     // Signal B: extreme-timing. DEMOTED to weak — near a halt this is noise-prone
@@ -3018,11 +3084,19 @@ async function detectHaltDirectionVerbose(ticker, haltedAtMs){
     if(votes.length === 0)
       return {dir: null, method: 'no-signal', detail};
 
-    // Trajectory is authoritative. If the approach into the halt is clear, it
-    // decides — full stop. Weak signals (extreme-timing, day-chg) can no longer
-    // flip the label, which is the whole YXT failure mode.
-    if(trajVote > 0) return {dir: 'UP',   method: 'trajectory', detail};
-    if(trajVote < 0) return {dir: 'DOWN', method: 'trajectory', detail};
+    // The halt print decides first — it is the price that tripped the band.
+    // Then the near approach, then range position. Any disagreement among these
+    // three means the approach was genuinely ambiguous: post a generic "Halted"
+    // with no arrow rather than gamble. A wrong arrow is worse than no arrow.
+    const strong3 = [printVote, nearVote, posVote].filter(v => v !== 0);
+    if(strong3.length > 1 && strong3.some(v=>v>0) && strong3.some(v=>v<0))
+      return {dir: null, method: 'approach-conflict', detail};
+    if(printVote > 0) return {dir: 'UP',   method: 'halt-print', detail};
+    if(printVote < 0) return {dir: 'DOWN', method: 'halt-print', detail};
+    if(nearVote  > 0) return {dir: 'UP',   method: 'near-traj',  detail};
+    if(nearVote  < 0) return {dir: 'DOWN', method: 'near-traj',  detail};
+    if(posVote   > 0) return {dir: 'UP',   method: 'range-pos',  detail};
+    if(posVote   < 0) return {dir: 'DOWN', method: 'range-pos',  detail};
 
     // No clear trajectory → fall back to the other signals, but require agreement
     // among the STRONG ones and post generic "Halted" on any strong conflict.
@@ -3846,7 +3920,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] phantom-print-guard-v1 · 2026-09-11');
+  console.log('[BUILD] halt-print-v3 · 2026-09-16');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   loadRecentRunners();  // restore persisted runners (survives soft restarts)
   await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
