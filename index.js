@@ -318,7 +318,7 @@ async function postEconDigest(){
   const todays = all
     .map(ev => ({ev, et: econEventET(ev)}))
     .filter(x => x.et && x.et.dateKey === today && impactOK(x.ev.impact)
-              && (!ECON_COUNTRIES || ECON_COUNTRIES.includes(ev.country)))
+              && (!ECON_COUNTRIES || ECON_COUNTRIES.includes(x.ev.country)))
     .sort((a,b) => a.et.etMin - b.et.etMin);
 
   const dateLabel = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
@@ -3928,7 +3928,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] halt-earned-arrow-v4 · 2026-09-16');
+  console.log('[BUILD] halt-earned-arrow-v4b · 2026-10-08');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   loadRecentRunners();  // restore persisted runners (survives soft restarts)
   await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
