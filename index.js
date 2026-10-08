@@ -40,6 +40,27 @@ const HALT_ALERT_WHS = (process.env.HALT_ALERTS_WH || '').split(',').map(s=>s.tr
 //   'High' = high only. Default 'Low' (everything), per request.
 // ═══════════════════════════════════════════════════════════════════════════
 const ECON_EVENTS_WH = process.env.ECON_EVENTS_WH || '';
+
+// ── LICENCE-SAFE ROUTING (2026-10-08) ──────────────────────────────────────
+// Exchange market-data licences permit DISPLAY to the licence holder. Showing
+// prices, volume or anything derived from them to other people is a separate
+// right that an individual plan does not grant. Massive flagged this account
+// for exactly that reason.
+//
+// Not everything this bot posts is exchange data, though:
+//   PUBLIC  — NASDAQ trading-halt notices (public RSS), SEC filings (EDGAR,
+//             public domain), BLS economic prints (public domain)
+//   LICENSED— every price, volume, RVol, % change and anything computed from
+//             them: NHOD, SPIKE, the gapper digest, the price header on filing
+//             alerts, the price/volume tail on halt alerts
+//
+// Set PRIVATE_WH to a webhook for a channel only you can read and safe mode
+// turns on: licensed content routes there alone, while the public-source
+// alerts keep flowing to the shared channels with their price fields stripped.
+// Unset PRIVATE_WH (or set LICENSE_SAFE_MODE=0) to restore the old behaviour
+// once a redistribution licence is in place.
+const PRIVATE_WH   = process.env.PRIVATE_WH || '';
+const LICENSE_SAFE = PRIVATE_WH !== '' && process.env.LICENSE_SAFE_MODE !== '0';
 const FMP_KEY        = process.env.FMP_KEY || '';
 const FINNHUB_KEY    = process.env.FINNHUB_KEY || '';
 
@@ -613,7 +634,10 @@ const FOREIGN_TICKER_OVERRIDES = {
   // Sweden
   'ERIC':'SE','SPOT':'SE','VOLV':'SE',
   // Australia
-  'BHP':'AU','RIO':'AU','TLS':'AU',
+  // RIO removed here — it was a duplicate key. 'RIO':'GB' is declared above in
+  // the UK block, and a later duplicate silently overwrote it, flagging Rio
+  // Tinto 🇦🇺. The NYSE-listed RIO is Rio Tinto plc, headquartered in London.
+  'BHP':'AU','TLS':'AU',
   // Mexico
   'AMX':'MX','FMX':'MX','KOF':'MX',
   // Argentina
@@ -706,13 +730,16 @@ async function postToWebhook(url,payload){
     req.write(body); req.end();
   });
 }
+// NHOD and SPIKE. Both are pure licensed content — price, volume, RVol, % move
+// — so in safe mode they go to the private channel only.
 async function post(payload){
-  if(!MAIN_CHAT_WH){
-    console.log('[post] suppressed (MAIN_CHAT_WH env var not set)');
+  const target = LICENSE_SAFE ? PRIVATE_WH : MAIN_CHAT_WH;
+  if(!target){
+    console.log(`[post] suppressed (${LICENSE_SAFE?'PRIVATE_WH':'MAIN_CHAT_WH'} env var not set)`);
     return;
   }
   payload.username='AziziBot';
-  await postToWebhook(MAIN_CHAT_WH,payload);
+  await postToWebhook(target,payload);
 }
 // PR + SEC filing alerts go to their own dedicated channel via PR_NEWS_WH.
 // Keeps press releases out of the main trading feed. Falls back to
@@ -1412,7 +1439,12 @@ async function postEventAlert(ticker, event) {
   const snap = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
   const td = snap && snap.ticker;
   const price = (td && td.lastTrade && td.lastTrade.p) || (td && td.day && td.day.c) || 0;
-  if (price < 0.10) { console.log(`[Alert] ${ticker} skip: price ${price}`); return; }
+  // Only apply the sub-$0.10 junk filter when we actually HAVE a price. With the
+  // real-time entitlement suspended the snapshot comes back empty and price is
+  // 0, which used to block every filing alert — including EDGAR ones that need
+  // no licence at all. A missing price is "unknown", not "worthless".
+  const havePrice = price > 0;
+  if (havePrice && price < 0.10) { console.log(`[Alert] ${ticker} skip: price ${price}`); return; }
 
   const chgPct = (td && td.todaysChangePerc) || 0;
   const fv = await getFinvizStats(ticker);
@@ -1445,6 +1477,13 @@ async function postEventAlert(ticker, event) {
 
   const msg = `${header}\n${subLine}\n${bullet}`;
 
+  // Licence-safe variant of the same alert. The EDGAR filing itself — form type,
+  // title, link, timestamp — is public domain and needs no licence. What makes
+  // the full alert licensed is only the HEADER: price tier, % change, and the
+  // Finviz SI/IO line. Strip those and the filing bullet stands on its own.
+  const publicHeader = `⚪ **$${ticker}**  ${flag(ticker)}`;
+  const publicMsg    = `${publicHeader}\n-# ${timeShort}\n${bullet}`;
+
   // ── Routing ────────────────────────────────────────────────────────────────
   // Filings (SEC) → dedicated SEC_FILINGS_WH channel. PR/news → PR_NEWS_WH.
   // BOTH additionally MIRROR to Main chat for the day's real runners: the top
@@ -1459,6 +1498,22 @@ async function postEventAlert(ticker, event) {
   const isRunner = topByVol.includes(ticker);
   const isWatch  = permanentWatch.has(ticker) || dayWatchlist.has(ticker) || recentRunners.has(ticker);
   const mirrorToMain = isRunner || isWatch;
+
+  // ── Licence-safe routing ───────────────────────────────────────────────────
+  // SEC filings are EDGAR, public domain — they keep going to the shared
+  // sec-filings channel, with the price header stripped. PR/news comes through
+  // Massive's news product and is governed by THEIR redistribution terms, not
+  // by anything public, so it goes private until a news licence says otherwise.
+  // The full price-headed version of both lands in the private channel.
+  if(LICENSE_SAFE){
+    if(isFiling){
+      const filingTarget = SEC_FILINGS_WH || null;   // never MAIN_CHAT in safe mode
+      if(filingTarget) await postToWebhook(filingTarget, { username:'AziziBot', content: publicMsg }).catch(()=>{});
+    }
+    await postToWebhook(PRIVATE_WH, { username:'AziziBot', content: msg }).catch(()=>{});
+    console.log(`[Alert] ${ticker} ${event.type} → ${isFiling?'sec-filings (public form)':'private only'} + private full`);
+    return;
+  }
 
   // Primary destination.
   if(isFiling){
@@ -3219,9 +3274,28 @@ async function postHaltLine(st, snap, label){
   const dirWord = label.indexOf('DOWN')>=0 ? 'HALTED ↓ DOWN' : label.indexOf('UP')>=0 ? 'HALTED ↑ UP' : 'HALTED';
   const line    = `${hdot} **${ticker}**  ${flag(ticker)}  \`${dirWord}\`\n-# ${right}\n⠀`;
 
+  // Licence-safe variant. The halt NOTICE is public — it comes from NASDAQ's
+  // trading-halts RSS feed: ticker, reason code, resume time. What is NOT public
+  // is the price/volume tail (Polygon snapshot) and the direction arrow (derived
+  // from Polygon minute aggregates). Passing snap=null makes buildHaltLineRight
+  // emit reason + resume only, and the arrow drops to a plain HALTED.
+  //    = en-space + thin-space, matching the headline spacing above.
+  const publicRight = buildHaltLineRight(st, null);
+  const publicLine  = `⚪ **${ticker}**  ${flag(ticker)}  \`HALTED\`\n-# ${publicRight}\n⠀`;
+
   const chgPct  = (snap && typeof snap.chgPct === 'number') ? snap.chgPct : 0;
   st.chgPctAtHalt = chgPct;
   const bigMover = Math.abs(chgPct) >= BIG_MOVER_HALT_THRESHOLD;
+
+  if(LICENSE_SAFE){
+    // Shared channels get the public notice only. No main-chat mirror either —
+    // that mirror exists to surface big MOVERS, and "big mover" is itself a fact
+    // derived from licensed price data.
+    await postHalt({content: publicLine}, false);
+    await postToWebhook(PRIVATE_WH, {username:'AziziBot', content: line});
+    console.log(`[Halt] ${ticker} ${code} ${label} @ ${timeStr} → public notice (shared) + full line (private)`);
+    return bigMover;
+  }
 
   await postHalt({content: line}, bigMover);
   console.log(`[Halt] 🛑 ${ticker} ${code} ${label} @ ${timeStr} chg=${chgPct.toFixed(1)}%${bigMover ? ' (→ main-chat mirror)' : ''}`);
@@ -3359,13 +3433,15 @@ async function checkMorningSnapshot(){
   // every 6/7AM digest landed in #main-chat. Fall back to MAIN_CHAT_WH only if
   // TOP_GAPPERS_WH is unset, so the digest can never silently vanish.
   const digestPayload={embeds:[{title:`${hh===6?'🌅 6AM':'☀️ 7AM'} Pre-Market Gappers`,description:rows||'No data',color:0x00d4ff,footer:{text:`AziziBot · ${getET().timeStr} ET`},timestamp:new Date().toISOString()}]};
-  const digestTarget=TOP_GAPPERS_WH||MAIN_CHAT_WH;
+  // The digest is a table of prices, % moves and volume — licensed throughout,
+  // nothing to strip. Private channel only in safe mode.
+  const digestTarget = LICENSE_SAFE ? PRIVATE_WH : (TOP_GAPPERS_WH||MAIN_CHAT_WH);
   if(!digestTarget){
-    console.log('[Gappers] digest suppressed (neither TOP_GAPPERS_WH nor MAIN_CHAT_WH set)');
+    console.log('[Gappers] digest suppressed (no destination webhook set)');
   } else {
-    if(!TOP_GAPPERS_WH) console.log('[Gappers] TOP_GAPPERS_WH unset — digest falling back to #main-chat');
+    if(!LICENSE_SAFE && !TOP_GAPPERS_WH) console.log('[Gappers] TOP_GAPPERS_WH unset — digest falling back to #main-chat');
     await postToWebhook(digestTarget, digestPayload);
-    console.log(`[${getET().timeStr}] Morning snapshot posted → ${TOP_GAPPERS_WH?'#top-gappers':'#main-chat (fallback)'}`);
+    console.log(`[${getET().timeStr}] Morning snapshot posted → ${LICENSE_SAFE?'#private (licence-safe)':TOP_GAPPERS_WH?'#top-gappers':'#main-chat (fallback)'}`);
   }
 }
 
@@ -3928,7 +4004,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] halt-earned-arrow-v4b · 2026-10-08');
+  console.log('[BUILD] licence-split-v5b · 2026-10-08');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   loadRecentRunners();  // restore persisted runners (survives soft restarts)
   await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
@@ -3940,6 +4016,14 @@ async function main(){
   console.log(`[Webhooks] TOP_GAPPERS_WH:  ${TOP_GAPPERS_WH ? 'set' : 'not set (gapper digest unused)'}`);
   console.log(`[Webhooks] HALT_ALERTS_WH:  ${HALT_ALERT_WHS.length ? `${HALT_ALERT_WHS.length} channel(s)` : 'MISSING → halt alerts SUPPRESSED'}`);
   console.log(`[Webhooks] ECON_EVENTS_WH:   ${ECON_EVENTS_WH ? 'set' : (MAIN_CHAT_WH ? 'not set → econ falls back to MAIN_CHAT_WH' : 'MISSING → econ SUPPRESSED')}`);
+  console.log(`[Webhooks] PRIVATE_WH:       ${PRIVATE_WH ? 'set' : 'not set'}`);
+  if(LICENSE_SAFE){
+    console.log('[Licence] SAFE MODE ON — licensed content → private channel only');
+    console.log('[Licence]   private : NHOD · SPIKE · gapper digest · PR/news · full halt + filing lines');
+    console.log('[Licence]   shared  : halt notices (no price/direction) · SEC filings (no price header) · BLS');
+  } else {
+    console.log(`[Licence] safe mode OFF — all alerts route normally${PRIVATE_WH ? ' (LICENSE_SAFE_MODE=0)' : ' (set PRIVATE_WH to enable)'}`);
+  }
   console.log(`[BLS] BLS_KEY: ${BLS_KEY?'set (v2)':'not set → keyless v1, lower limits'} · series: ${Object.keys(BLS_SERIES).length} · → econ channel`);
   console.log(`[Econ] FINNHUB_KEY: ${FINNHUB_KEY ? 'set' : 'not set'} · FMP_KEY: ${FMP_KEY ? 'set (fallback)' : 'not set'} · ${(FINNHUB_KEY||FMP_KEY)?'':'⚠ NO SOURCE → econ disabled'} · filter: ${ECON_MIN_IMPACT}+ · pre-alert: ${ECON_PREALERT_MIN}min`);
   // BOOT SELF-TEST: fetch FMP once on startup so we know immediately whether the
