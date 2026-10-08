@@ -2028,11 +2028,39 @@ async function fireNHOD(ticker,price){
   const livePct  = (()=>{const p=livePrice;const pv=(td&&td.prevDay&&td.prevDay.c)||0;return p&&pv?((p-pv)/pv)*100:gapper.chgPct;})();
   const liveRvol = livePrev>0?(liveVol*390)/(Math.max(etMin-240,1)*livePrev):gapper.rvol||0;
 
-  // Parallel-fetch all enrichment data.
+  // ── LATENCY FIX (QNME 2026-10-08) ─────────────────────────────────────────
+  // These six run in parallel, but Promise.all waits for the SLOWEST, and
+  // rawGet's socket timeout is 8s. Two of them hit third-party sites — finviz
+  // and iborrowdesk — that stall or hang regularly ([CTB] socket hang up).
+  // getFinvizStats is worse: it awaits getPolySI and THEN scrapes finviz, so
+  // its worst case is two 8s timeouts back to back. A slow scrape was holding
+  // the whole alert for seconds while the move was already over.
+  //
+  // The alert's core — ticker, price, %, RVol, volume — is known before any of
+  // this runs. Everything here is garnish: SI, float, IO, borrow fee, news
+  // link, market cap, split note. So give the whole phase a hard deadline and
+  // post with whatever arrived. A missing SI figure costs nothing; a late NHOD
+  // costs the trade.
+  const ENRICH_DEADLINE_MS = 1500;
+  const soft = (p, fallback) => {
+    let t;
+    return Promise.race([
+      Promise.resolve(p).catch(() => fallback),
+      new Promise(res => { t = setTimeout(() => res(fallback), ENRICH_DEADLINE_MS); }),
+    ]).then(v => { clearTimeout(t); return v === undefined ? fallback : v; });
+  };
+  const enrichT0 = Date.now();
   const [newsUrl,rs,det,fv,greenBars,ctb]=await Promise.all([
-    getNewsUrl(ticker),getRecentSplit(ticker),getTickerDetails(ticker),
-    getFinvizStats(ticker),getGreenBars(ticker),getCTB(ticker),
+    soft(getNewsUrl(ticker),       null),
+    soft(getRecentSplit(ticker),   null),
+    soft(getTickerDetails(ticker), {}),
+    soft(getFinvizStats(ticker),   {si:'--', float:'--', io:'--'}),
+    soft(getGreenBars(ticker),     {count:0, timeframe:'1m'}),
+    soft(getCTB(ticker),           {fee:0, available:0, date:''}),
   ]);
+  const enrichMs = Date.now() - enrichT0;
+  if(enrichMs >= ENRICH_DEADLINE_MS)
+    console.log(`[ALERT] ${ticker} enrichment hit the ${ENRICH_DEADLINE_MS}ms deadline (${enrichMs}ms) — posting with partial data`);
 
   const mc=det.market_cap||0;
   const rsStr=rs?` | ${rs}`:'';
@@ -4004,7 +4032,7 @@ async function main(){
   if(!POLY_KEY)      {console.error('FATAL: POLY_KEY missing');process.exit(1);}
   if(!DISCORD_TOKEN) {console.error('FATAL: DISCORD_TOKEN missing');process.exit(1);}
   console.log('🤖 AziziBot v8 starting...');
-  console.log('[BUILD] licence-split-v5b · 2026-10-08');
+  console.log('[BUILD] alert-latency-v6 · 2026-10-08');
   await loadCikMap();   // EDGAR CIK→ticker map (needed for instant filings)
   loadRecentRunners();  // restore persisted runners (survives soft restarts)
   await rebuildRecentRunners();  // rebuild from Polygon (deploy-proof)
